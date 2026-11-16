@@ -1,0 +1,536 @@
+module tests
+
+// Batches: statements sent together and their results read back in order; a failure part-way in an
+// atomic and in an independent batch; an empty batch; batches of thousands of statements, large both
+// ways; batches in transactions, on a pool from many threads, and cancelled; and the statement cache
+// across a batch's statements.
+
+import avin.threads.{scope, withTimeout}
+import avin.time.{millis, monotonic, seconds}
+import dev.avinlang.pg
+
+import dev.avinlang.pg.{
+  Atomic, BadColumn, Batch, BatchResults, Closed, Config, Connection, FromRow, Independent, NoMoreResults, PgError,
+  PgPool, RolledBack, Skipped
+}
+
+data BatchUser(id: int, name: string) derives FromRow
+
+// A connection and a fresh table of its own, `name`, which other connections see.
+private batchTable(name: string, columns: string = "n int") -> Option[Result[Connection, PgError]] =
+  testConnection().map(r ->
+    val c = r?
+    c.simpleQuery(s"drop table if exists $name; create table $name ($columns)")?
+    Ok(c))
+
+private countOf(c: Connection, table: string) -> Result[long, PgError] = c.queryValue[long](
+  s"select count(*) from $table"
+)
+
+// The SQLSTATE of the result at `index`, or `None` where it succeeded or failed on this side.
+private codeAt(results: BatchResults, index: int) -> Option[string] = results.get(index).err.flatMap(e -> e.code)
+
+@test("a batch runs its statements in order and answers each one's result, read as it asks")
+happyPath() -> Result[unit, PgError]
+  val c = batchTable("batch_happy", "id int primary key, name text") match
+    Some(r) -> r?
+    None -> return Ok(())
+  val batch = Batch()
+    .queue("insert into batch_happy values ($1, $2)", 1, "ada")
+    .queue("insert into batch_happy values ($1, $2), ($3, $4)", 2, "grace", 3, "edsger")
+    .queue("select id, name from batch_happy order by id")
+    .queue("select count(*) from batch_happy where id > $1", 1)
+    .queue("update batch_happy set name = upper(name) where id <= $1", 2)
+    .queue("select name from batch_happy where id = $1", 1)
+  assertEq(batch.length, 6)
+  val results = c.sendBatch(batch)?
+  assertEq(results.length, 6)
+  assertEq(results.failure, None)
+  val r = results.reader()
+  assertEq(r.remaining, 6)
+  assertEq(r.execute(), Ok(long(1)))
+  assertEq(r.execute(), Ok(long(2)))
+  assertEq(r.queryAs[BatchUser](), Ok([BatchUser(1, "ada"), BatchUser(2, "grace"), BatchUser(3, "edsger")]))
+  assertEq(r.queryValue[long](), Ok(long(2)))
+  assertEq(r.execute(), Ok(long(2)))
+  assertEq(r.queryOne()?.map(row -> row.get[string]("name")), Some(Ok("ADA")))
+  assertEq(r.remaining, 0)
+  // Past the last result every read says so.
+  assertEq(r.next().err, Some(NoMoreResults))
+  assertEq(r.execute().err, Some(NoMoreResults))
+  assertEq(results.get(6).err, Some(NoMoreResults))
+  assertEq(results.get(-1).err, Some(NoMoreResults))
+  assertEq(results.get(0)?.tag, "INSERT 0 1")
+  // What the batch did is kept, seen by another connection.
+  assertEq(countOf(testConnection().get?, "batch_happy"), Ok(long(3)))
+  assert(!c.inTransaction)
+  c.simpleQuery("drop table batch_happy")?
+  c.close()
+
+@test("a batch mixes statement kinds: DDL, DML with RETURNING, an empty statement, a prepared one, NULLs")
+mixedKinds() -> Result[unit, PgError]
+  val c = testConnection() match
+    Some(r) -> r?
+    None -> return Ok(())
+  val doubled = c.prepare("select $1::int * 2")?
+  val results = c.sendBatch(
+    Batch().queue("create temporary table batch_mixed (n int, label text)").queue(
+        "insert into batch_mixed values ($1, $2), ($3, $4) returning n",
+        1,
+        "one",
+        2,
+        None: Option[string]
+    ).queue("").queue(doubled, 21).queue("select label from batch_mixed order by n").queue(
+      "delete from batch_mixed where label is null"
+    ).queue(doubled, -4).queue("select $1::text, $2::bool, $3::float8", "x", true, 1.5).queue("drop table batch_mixed")
+  )?
+  assertEq(results.failure, None)
+  val r = results.reader()
+  assertEq(r.next()?.tag, "CREATE TABLE")
+  assertEq(r.query()?.map(row -> row.get[int]("n")), [Ok(1), Ok(2)])
+  // An empty statement has an empty tag and no rows.
+  val empty = r.next()?
+  assertEq((empty.tag, empty.rows.length, empty.affected), ("", 0, long(0)))
+  assertEq(r.queryValue[int](), Ok(42))
+  assertEq(r.query()?.map(row -> row.get[Option[string]](0)), [Ok(Some("one")), Ok(None)])
+  assertEq(r.execute(), Ok(long(1)))
+  assertEq(r.queryValue[int](), Ok(-8))
+  val row = r.queryOne()?.get
+  assertEq((row.get[string](0), row.get[bool](1), row.get[real](2)), (Ok("x"), Ok(true), Ok(1.5)))
+  assertEq(r.next()?.tag, "DROP TABLE")
+  // A statement that returns no row read as a value is a column error, and the reader moves on.
+  val none = c.sendBatch(Batch().queue("select 1 where false").queue("select 2"))?.reader()
+  assertEq(none.queryValue[int]().err, Some(BadColumn("#0", "the statement returned no rows")))
+  assertEq(none.queryValue[int](), Ok(2))
+  c.close()
+
+@test("an atomic batch stops at a failure: that statement's error, Skipped after it, nothing kept")
+atomicFailure() -> Result[unit, PgError]
+  val c = batchTable("batch_atomic") match
+    Some(r) -> r?
+    None -> return Ok(())
+  val results = c.sendBatch(
+    Batch().queue(
+      "insert into batch_atomic values (1)"
+    ).queue("select n from batch_atomic").queue("select 1 / $1", 0).queue(
+      "insert into batch_atomic values (2)"
+    ).queue("select 3")
+  )?
+  assertEq(results.length, 5)
+  assertEq(results.get(0)?.affected, long(1))
+  // The statements before the failure ran, and answer what they read.
+  assertEq(results.get(1)?.rows.length, 1)
+  assertEq(codeAt(results, 2), Some("22012"))
+  assertEq(results.failure.flatMap(e -> e.code), Some("22012"))
+  assertEq(results.get(3).err, Some(Skipped))
+  assertEq(results.get(4).err, Some(Skipped))
+  // The batch was one transaction: the insert before the failure was rolled back.
+  assertEq(countOf(c, "batch_atomic"), Ok(long(0)))
+  assert(!c.inTransaction)
+  assert(!c.isBroken)
+  // A failure in the first statement, and in the last.
+  val first = c.sendBatch(Batch().queue("select 1 / 0").queue("insert into batch_atomic values (3)"))?
+  assertEq((codeAt(first, 0), first.get(1).err), (Some("22012"), Some(Skipped)))
+  val last = c.sendBatch(Batch().queue("insert into batch_atomic values (4)").queue("select 1 / 0"))?
+  assertEq((last.get(0)?.affected, codeAt(last, 1)), (long(1), Some("22012")))
+  assertEq(countOf(c, "batch_atomic"), Ok(long(0)))
+  assertEq(c.queryValue[int]("select 5"), Ok(5))
+  c.simpleQuery("drop table batch_atomic")?
+  c.close()
+
+@test("a statement the server cannot prepare fails where it stands; one that cannot be bound runs nothing")
+atomicRefused() -> Result[unit, PgError]
+  val c = batchTable("batch_refused") match
+    Some(r) -> r?
+    None -> return Ok(())
+  // A statement the server refuses to prepare is sent unprepared, and fails in its place.
+  val unprepared = c.sendBatch(
+    Batch().queue(
+      "insert into batch_refused values (1)"
+    ).queue("select * from no_such_table").queue("insert into batch_refused values (2)")
+  )?
+  assertEq(unprepared.get(0)?.affected, long(1))
+  assertEq(codeAt(unprepared, 1), Some("42P01"))
+  assertEq(unprepared.get(2).err, Some(Skipped))
+  assertEq(countOf(c, "batch_refused"), Ok(long(0)))
+  // The same with a syntax error, after statements the cache already holds.
+  c.execute("insert into batch_refused values (1)")?
+  val syntax = c.sendBatch(Batch().queue("insert into batch_refused values (1)").queue("selec 1"))?
+  assertEq((syntax.get(0)?.affected, codeAt(syntax, 1)), (long(1), Some("42601")))
+  // An unprepared statement's parameters are sent as text, and its rows read as text, NULLs and all.
+  val typed = c.sendBatch(
+    Batch().queue("create temporary table batch_later (n int, t text, b bool)").queue(
+        "insert into batch_later values ($1, $2, $3), ($4, $5, $6)",
+        7,
+        "seven",
+        true,
+        8,
+        None: Option[string],
+        false
+    ).queue("select n, t, b from batch_later order by n")
+  )?
+  val rows = typed.get(2)?.rows
+  assertEq(
+    rows.map(r -> (r.get[int]("n"), r.get[Option[string]]("t"), r.get[bool]("b"))),
+    [
+      (Ok(7), Ok(Some("seven")), Ok(true)),
+      (Ok(8), Ok(None), Ok(false))
+    ]
+  )
+  // Parameters that do not fit a prepared statement: a `Config` error, found before anything is
+  // sent, so nothing runs.
+  val insert = c.prepare("insert into batch_refused values ($1)")?
+  val unbound = c.sendBatch(
+    Batch().queue(
+      "insert into batch_refused values ($1)",
+      7
+    ).queue(insert, 1, 2).queue("insert into batch_refused values ($1)", 8)
+  )?
+  assertEq(unbound.get(0).err, Some(Skipped))
+  assertEq(unbound.get(1).err, Some(Config("the statement has 1 parameters and 2 were given")))
+  assertEq(unbound.get(2).err, Some(Skipped))
+  assertEq(countOf(c, "batch_refused"), Ok(long(1)))
+  assert(!c.inTransaction)
+  assertEq(c.queryValue[int]("select 6"), Ok(6))
+  c.simpleQuery("drop table batch_refused")?
+  c.close()
+
+@test("an independent batch runs every statement it can: a failure is that statement's alone")
+independentFailure() -> Result[unit, PgError]
+  val c = batchTable("batch_independent") match
+    Some(r) -> r?
+    None -> return Ok(())
+  val insert = c.prepare("insert into batch_independent values ($1)")?
+  val results = c.sendBatch(
+    Batch().queue(
+      "insert into batch_independent values (1)"
+    ).queue("select 1 / $1", 0).queue(
+      "insert into batch_independent values (2)"
+    ).queue("select * from no_such_table").queue(insert, 1, 2).queue(
+      "insert into batch_independent values (3)"
+    ).queue("select count(*) from batch_independent"),
+    Independent
+  )?
+  assertEq(results.get(0)?.affected, long(1))
+  assertEq(codeAt(results, 1), Some("22012"))
+  assertEq(results.get(2)?.affected, long(1))
+  assertEq(codeAt(results, 3), Some("42P01"))
+  assertEq(results.get(4).err, Some(Config("the statement has 1 parameters and 2 were given")))
+  assertEq(results.get(5)?.affected, long(1))
+  // Each statement committed as it ran, so the count sees the three inserts.
+  assertEq(results.get(6)?.rows(0).get[long](0), Ok(long(3)))
+  assertEq(countOf(testConnection().get?, "batch_independent"), Ok(long(3)))
+  assert(!c.inTransaction)
+  c.simpleQuery("drop table batch_independent")?
+  c.close()
+
+@test("a statement on a table an earlier statement of its batch makes runs, in either mode and in a transaction")
+dependsOnEarlier() -> Result[unit, PgError]
+  val c = testConnection() match
+    Some(r) -> r?
+    None -> return Ok(())
+  for mode in [Atomic, Independent]
+    val r = c.sendBatch(
+      Batch().queue("create temporary table batch_made (n int)").queue(
+        "insert into batch_made values ($1), ($2)",
+        1,
+        2
+      ).queue("select sum(n) from batch_made").queue("drop table batch_made"),
+      mode
+    )?
+    assertEq(r.failure, None)
+    assertEq(r.get(2)?.rows(0).get[long](0), Ok(long(3)))
+  // Inside a transaction the refused preparing is undone by a savepoint, so the transaction goes on,
+  // and the statements the batch did prepare stay prepared after the transaction ends.
+  val base = c.cachedStatements
+  val answer = c.transaction(tx ->
+    val r = tx.sendBatch(
+      Batch().queue("select $1::int + 100", 1).queue(
+        "create temporary table batch_tx_made (n int)"
+      ).queue("insert into batch_tx_made values ($1)", 5).queue("select n from batch_tx_made")
+    )?
+    assertEq(r.failure, None)
+    assert(tx.inTransaction)
+    Ok(r.get(3)?.rows(0).get[int](0)?))
+  assertEq(answer, Ok(5))
+  // The sum and the create were prepared and kept; the two on the new table were sent unprepared.
+  assertEq(c.cachedStatements, base + 2)
+  assertEq(c.queryValue[int]("select $1::int + 100", 2), Ok(102))
+  assertEq(c.cachedStatements, base + 2)
+  assertEq(c.queryValue[long]("select count(*) from pg_prepared_statements"), Ok(long(base + 3)))
+  c.close()
+
+@test("an empty batch answers no results and sends nothing")
+emptyBatch() -> Result[unit, PgError]
+  val c = testConnection() match
+    Some(r) -> r?
+    None -> return Ok(())
+  assert(Batch().isEmpty)
+  val results = c.sendBatch(Batch())?
+  assertEq(results.length, 0)
+  assertEq(results.failure, None)
+  assertEq(results.reader().remaining, 0)
+  assertEq(results.reader().query().err, Some(NoMoreResults))
+  assertEq(c.sendBatch(Batch(), Independent)?.length, 0)
+  assertEq(c.queryValue[int]("select 1"), Ok(1))
+  // A closed connection refuses a batch, an empty one included.
+  c.close()?
+  assertEq(c.sendBatch(Batch()).err, Some(Closed))
+  assertEq(c.sendBatch(Batch().queue("select 1")).err, Some(Closed))
+  Ok(())
+
+// A batch of `n` inserts of a text of `width` bytes, each followed by a query whose answer is `rows`
+// rows of that text: megabytes each way, which neither end's socket buffers can hold.
+private heavy(n: int, width: int, rows: int) -> Batch
+  var b = Batch()
+  for i in 0 ..< n
+    b = b.queue("insert into batch_large values ($1, $2)", i, "x".repeat(width))
+    b = b.queue("select repeat('y', $1) from generate_series(1, $2)", width, rows)
+  b
+
+@test("batches of thousands of statements, megabytes sent and answered, complete without deadlock")
+largeBatches() -> Result[unit, PgError]
+  val c = batchTable("batch_large", "n int, body text") match
+    Some(r) -> r?
+    None -> return Ok(())
+  for mode in [Atomic, Independent]
+    c.execute("truncate batch_large")?
+    val done = withTimeout(seconds(120), _ -> c.sendBatch(heavy(2000, 2000, 20), mode))
+    val results = done.get?
+    assertEq(results.length, 4000)
+    assertEq(results.failure, None)
+    var i = 0
+    while i < 4000
+      assertEq(results.get(i)?.affected, long(1))
+      val rows = results.get(i + 1)?.rows
+      assertEq(rows.length, 20)
+      assertEq(rows(19).get[string](0).map(s -> s.byteLength), Ok(2000))
+      i += 2
+    assertEq(countOf(c, "batch_large"), Ok(long(2000)))
+    assertEq(c.queryValue[long]("select sum(length(body)) from batch_large"), Ok(long(4000000)))
+  // Ten thousand small statements, and a failure at the very end of them undoing them all.
+  var small = Batch()
+  for i in 0 ..< 10000
+    small = small.queue("insert into batch_large values ($1, null)", i)
+  c.execute("truncate batch_large")?
+  assertEq(c.sendBatch(small)?.failure, None)
+  assertEq(countOf(c, "batch_large"), Ok(long(10000)))
+  val failing = c.sendBatch(small.queue("select 1 / 0"))?
+  assertEq((failing.get(9999)?.affected, codeAt(failing, 10000)), (long(1), Some("22012")))
+  assertEq(countOf(c, "batch_large"), Ok(long(10000)))
+  // A failure early in a batch of many windows: none after it runs, and none is answered but Skipped.
+  val early = c.sendBatch(Batch(Batch().queue("select 1 / 0").items ++ small.items))?
+  assertEq(codeAt(early, 0), Some("22012"))
+  assertEq(early.get(10000).err, Some(Skipped))
+  assertEq(countOf(c, "batch_large"), Ok(long(10000)))
+  assert(!c.isBroken)
+  c.simpleQuery("drop table batch_large")?
+  c.close()
+
+@test("a batch inside a transaction belongs to it: committed with it, and a failure fails it")
+inTransaction() -> Result[unit, PgError]
+  val c = batchTable("batch_tx") match
+    Some(r) -> r?
+    None -> return Ok(())
+  val answer = c.transaction(tx ->
+    tx.execute("insert into batch_tx values (1)")?
+    val r = tx.sendBatch(Batch().queue("insert into batch_tx values (2)").queue("select count(*) from batch_tx"))?
+    assert(tx.inTransaction)
+    r.reader().next()?
+    r.reader().execute())
+  assertEq(answer, Ok(long(1)))
+  assertEq(countOf(testConnection().get?, "batch_tx"), Ok(long(2)))
+  // A failing statement in the batch aborts the transaction, which is rolled back.
+  val failed = c.transaction(tx ->
+    tx.execute("insert into batch_tx values (3)")?
+    tx.sendBatch(Batch().queue("insert into batch_tx values (4)").queue("select 1 / 0"))?.failure match
+      Some(e) -> Err(e)
+      None -> Ok(()))
+  assertEq(failed.err.flatMap(e -> e.code), Some("22012"))
+  assertEq(countOf(c, "batch_tx"), Ok(long(2)))
+  // A body that answers Ok after its batch failed is rolled back as RolledBack, in either mode.
+  for mode in [Atomic, Independent]
+    val swallowed = c.transaction(tx ->
+      _ = tx.sendBatch(Batch().queue("insert into batch_tx values (5)").queue("select 1 / 0"), mode)?
+      Ok(()))
+    assertEq(swallowed, Err(RolledBack))
+  // In an independent batch inside a transaction, the statements after a failure fail as the
+  // transaction does.
+  val inside = c.transaction(tx ->
+    val r = tx.sendBatch(Batch().queue("select 1 / 0").queue("select 2"), Independent)?
+    assertEq((codeAt(r, 0), codeAt(r, 1)), (Some("22012"), Some("25P02")))
+    Ok(()))
+  assertEq(inside, Err(RolledBack))
+  // A batch in a savepoint: the inner failure undoes only the inner work.
+  val nested = c.transaction(outer ->
+    outer.execute("insert into batch_tx values (6)")?
+    val inner = outer.transaction(tx -> tx.sendBatch(Batch().queue("insert into batch_tx values (7)").queue("select 1 / 0"))?.failure match
+      Some(e) -> Err(e)
+      None -> Ok(()))
+    assertEq(inner.err.flatMap(e -> e.code), Some("22012"))
+    outer.queryValue[long]("select count(*) from batch_tx"))
+  assertEq(nested, Ok(long(3)))
+  assertEq(countOf(c, "batch_tx"), Ok(long(3)))
+  assert(!c.inTransaction)
+  c.simpleQuery("drop table batch_tx")?
+  c.close()
+
+// `rounds` batches on connections from `db`, each inserting `per` rows for thread `t` and counting
+// them; answers the counts.
+private batchRounds(db: PgPool, t: int, rounds: int, per: int) -> Result[Vector[long], PgError]
+  var counts: Vector[long] = []
+  for round in 0 ..< rounds
+    var b = Batch()
+    for i in 0 ..< per
+      b = b.queue("insert into batch_pool values ($1, $2)", t, round * per + i)
+    b = b.queue("select count(*) from batch_pool where t = $1", t)
+    val results = db.sendBatch(b)?
+    assertEq(results.length, per + 1)
+    counts = counts :+ results.get(per)?.rows(0).get[long](0)?
+  Ok(counts)
+
+@test("many threads each send batches on a small pool: every batch answered, every row kept")
+pooledBatches() -> Result[unit, PgError]
+  val url = testUrl() match
+    Some(u) -> u
+    None -> return Ok(())
+  val db = PgPool.open(url, maxSize = 4, acquireTimeout = Some(seconds(60)))?
+  db.execute("drop table if exists batch_pool")?
+  db.execute("create table batch_pool (t int, n int)")?
+  val threads = 24
+  val rounds = 5
+  val per = 50
+  val answers = scope(s ->
+    val started = (0 ..< threads).map(t -> s.spawn(() -> batchRounds(db, t, rounds, per)))
+    started.map(th -> th.join()))
+  for a in answers
+    // Each thread's rows are its own, so its counts go up by `per` a round whatever the others do.
+    assertEq(a?, (1 .. rounds).map(k -> long(k * per)).toVector)
+  assertEq(db.use(c -> c.queryValue[long]("select count(*) from batch_pool")), Ok(long(threads * rounds * per)))
+  // A batch in a pooled transaction, and one that fails, after which the connection is lent again.
+  assertEq(
+    db.transaction(c -> c.sendBatch(Batch().queue("delete from batch_pool where t = 0"))?.get(0)),
+    Ok(pg.QueryResult(s"DELETE ${rounds * per}", []))
+  )
+  assertEq(codeAt(db.sendBatch(Batch().queue("select 1 / 0"))?, 0), Some("22012"))
+  val stats = db.stats()
+  assert(stats.total <= 4)
+  assertEq((stats.inUse, stats.waiting), (0, 0))
+  assertEq(stats.idle, stats.total)
+  db.execute("drop table batch_pool")?
+  db.close()
+  Ok(())
+
+@test("a batch whose thread is cancelled is cancelled on the server, and the connection goes on")
+cancelledBatch() -> Result[unit, PgError]
+  val c = batchTable("batch_cancel") match
+    Some(r) -> r?
+    None -> return Ok(())
+  var tail = Batch()
+  for i in 0 ..< 3000
+    tail = tail.queue("insert into batch_cancel values ($1)", i)
+  val started = monotonic()
+  for mode in [Atomic, Independent]
+    // The sleep is in the first window, so the cancellation finds the batch with no Sync sent.
+    val b = Batch(
+      Batch().queue("insert into batch_cancel values (-1)").queue("select pg_sleep(30)").items ++ tail.items
+    )
+    assert(withTimeout(millis(300), _ -> c.sendBatch(b, mode)).isEmpty)
+    assert(!c.isBroken)
+    assert(!c.inTransaction)
+    assertEq(c.queryValue[int]("select 7"), Ok(7))
+  assert((monotonic() - started).toSeconds < 20)
+  // Atomic: nothing kept. Independent: the insert before the sleep was its own transaction.
+  assertEq(c.queryValue[long]("select count(*) from batch_cancel where n = -1"), Ok(long(1)))
+  // Inside a transaction, which the cancellation rolls back.
+  c.execute("truncate batch_cancel")?
+  assert(withTimeout(millis(300), _ -> c.transaction(tx ->
+    tx.execute("insert into batch_cancel values (1)")?
+    tx.sendBatch(Batch(Batch().queue("select pg_sleep(30)").items ++ tail.items)))).isEmpty)
+  assert(!c.isBroken)
+  assert(!c.inTransaction)
+  assertEq(countOf(c, "batch_cancel"), Ok(long(0)))
+  // A cancellation landing wherever it lands in a batch of megabytes, mid-write among the places:
+  // the connection is either given up or goes on answering correctly, never left mid-message.
+  for limit in [long(5), long(20), long(60)]
+    val d = testConnection().get?
+    var big = Batch()
+    for i in 0 ..< 2000
+      big = big.queue("select length($1)", "z".repeat(10000))
+    _ = withTimeout(millis(limit), _ -> d.sendBatch(big))
+    assert(d.isBroken || d.queryValue[int]("select 8") == Ok(8))
+    _ = d.close()
+  c.simpleQuery("drop table batch_cancel")?
+  c.close()
+
+@test("the statement cache serves a batch: a statement queued many times is prepared once, and kept")
+batchCache() -> Result[unit, PgError]
+  val c = testConnection() match
+    Some(r) -> r?
+    None -> return Ok(())
+  val prepared = "select count(*) from pg_prepared_statements"
+  // A statement the cache already holds, from a query run alone.
+  assertEq(c.queryValue[int]("select $1::int + 1", 1), Ok(2))
+  val base = c.cachedStatements
+  var b = Batch()
+  for i in 0 ..< 100
+    b = b.queue("select $1::int + 1", i).queue("select $1::int * 3", i)
+  val r = c.sendBatch(b)?.reader()
+  for i in 0 ..< 100
+    assertEq((r.queryValue[int](), r.queryValue[int]()), (Ok(i + 1), Ok(i * 3)))
+  // Only the second text was new.
+  assertEq(c.cachedStatements, base + 1)
+  assertEq(c.queryValue[long](prepared), Ok(long(base + 2)))
+  // A second batch prepares nothing more, and a query alone uses what the batch prepared.
+  assertEq(c.sendBatch(b)?.failure, None)
+  assertEq(c.queryValue[int]("select $1::int * 3", 5), Ok(15))
+  // The two the batch used and the count.
+  assertEq(c.cachedStatements, base + 2)
+  assertEq(c.queryValue[long](prepared), Ok(long(base + 2)))
+  c.close()
+
+@test("a batch of more statements than the cache holds, and one with no cache, leave nothing behind")
+batchSmallCache() -> Result[unit, PgError]
+  val url = testUrl("sslmode=disable&statement_cache_size=2") match
+    Some(u) -> u
+    None -> return Ok(())
+  val c = pg.connect(url)?
+  var b = Batch()
+  for i in 0 ..< 6
+    b = b.queue(s"select $i").queue(s"select $i + 10")
+  val results = c.sendBatch(b)?
+  assertEq(results.failure, None)
+  assertEq(results.get(11)?.rows(0).get[int](0), Ok(15))
+  assert(c.cachedStatements <= 2)
+  // What the cache dropped is closed along with the next statement prepared: the server holds the
+  // two cached and the count.
+  assertEq(c.queryValue[long]("select count(*) from pg_prepared_statements"), Ok(long(3)))
+  assertEq(c.sendBatch(b)?.failure, None)
+  c.close()?
+  val none = pg.connect(testUrl("sslmode=disable&statement_cache_size=0").get)?
+  val r = none.sendBatch(Batch().queue("select $1::int", 3).queue("select $1::int", 4).queue("select 5"))?.reader()
+  assertEq((r.queryValue[int](), r.queryValue[int](), r.queryValue[int]()), (Ok(3), Ok(4), Ok(5)))
+  assertEq(none.cachedStatements, 0)
+  assertEq(none.queryValue[long]("select count(*) from pg_prepared_statements"), Ok(long(0)))
+  none.close()
+
+@test("a cached statement made stale by DDL is prepared again: an atomic batch is rerun")
+batchStale() -> Result[unit, PgError]
+  val c = testConnection() match
+    Some(r) -> r?
+    None -> return Ok(())
+  c.execute("create temp table batch_shapes (id int)")?
+  c.execute("insert into batch_shapes values (1)")?
+  assertEq(c.query("select * from batch_shapes")?(0).length, 1)
+  c.execute("alter table batch_shapes add column name text default 'x'")?
+  val b = Batch().queue("insert into batch_shapes values (2)").queue("select * from batch_shapes order by id")
+  val rows = c.sendBatch(b)?.get(1)?.rows
+  assertEq(rows.map(row -> row.get[string]("name")), [Ok("x"), Ok("x")])
+  // The first run was rolled back, so the rerun inserted once.
+  assertEq(c.queryValue[long]("select count(*) from batch_shapes"), Ok(long(2)))
+  // An independent batch answers the failure, having run what came before it, and the next run works.
+  c.execute("alter table batch_shapes drop column name")?
+  val independent = c.sendBatch(b, Independent)?
+  assertEq(codeAt(independent, 1), Some("0A000"))
+  assertEq(c.sendBatch(b, Independent)?.get(1)?.rows(0).length, 1)
+  c.close()

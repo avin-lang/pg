@@ -1,0 +1,391 @@
+module dev.avinlang.pg
+
+// Hooks a program sets to watch what its connections do: each statement run, each statement
+// prepared, each connection made, each batch sent, and each connection a pool lends and takes back.
+// They are what a server's middleware logs, measures and traces with.
+//
+// Every hook has the same shape. A tracer is told an operation starts and answers a span, and the
+// span is told how the operation ended. The span is the tracer's own value, so whatever it wants to
+// carry from the start of an operation to its end (a trace id, a start time on its own clock, a
+// counter to bump) it keeps in the span it makes. A tracer that keeps nothing per operation answers
+// one shared span, often itself.
+//
+// A hook runs on the thread running the operation, outside every lock of the connection and the
+// pool, and is told nothing it could use to run a statement on the connection being traced. A hook
+// set to `None`, the default, costs one test of the option. Hooks answer nothing, so nothing a hook
+// does can fail the operation it watches.
+
+import avin.time.{Duration, monotonic}
+
+// ---- Statements ----
+
+// A statement is about to run: its text, how many parameters it binds, and the server process that
+// will run it. `params` holds the parameters' values only where the configuration's
+// `traceParameters` is set; otherwise it is empty, so a tracer never sees a password or a token bound
+// as a parameter unless the program asks for them.
+data QueryStart(sql: string, paramCount: int, pid: int, params: Vector[PgValue] = [])
+
+// A statement has finished: how long it took, the rows it returned or touched (the larger of the
+// rows read and the command tag's count), its command tag, and the error it failed with. Where the
+// thread running it was cancelled, `cancelled` is true, and `rows`, `tag` and `error` are empty.
+data QueryEnd(
+    sql: string,
+    paramCount: int,
+    pid: int,
+    duration: Duration,
+    rows: long,
+    tag: string,
+    error: Option[PgError],
+    cancelled: bool
+)
+
+impl QueryEnd
+  // The SQLSTATE where the server refused the statement.
+  code -> Option[string] = error.flatMap(e -> e.code)
+
+// Watches every statement a connection runs: `query`, `queryOne`, `queryAs`, `queryValue`,
+// `execute`, `simpleQuery`, and the statements a transaction and a pool run for themselves (`BEGIN`,
+// `COMMIT`, `ROLLBACK`, savepoints).
+trait QueryTracer: Sendable
+  queryStart(e: QueryStart) -> QuerySpan
+
+// One statement's span, told how it ended.
+trait QuerySpan: Sendable
+  queryEnd(e: QueryEnd)
+
+// ---- Preparing ----
+
+// A statement is about to be prepared under `name`, "" for an unnamed one: by `prepare`, or by the
+// statement cache on its first use.
+data PrepareStart(sql: string, name: string, pid: int)
+
+// A statement has been prepared, with `paramCount` parameters and `columnCount` columns, or failed
+// to be.
+data PrepareEnd(
+    sql: string,
+    name: string,
+    pid: int,
+    duration: Duration,
+    paramCount: int,
+    columnCount: int,
+    error: Option[PgError],
+    cancelled: bool
+)
+
+impl PrepareEnd
+  // The SQLSTATE where the server refused the statement.
+  code -> Option[string] = error.flatMap(e -> e.code)
+
+// Watches every statement a connection prepares.
+trait PrepareTracer: Sendable
+  prepareStart(e: PrepareStart) -> PrepareSpan
+
+trait PrepareSpan: Sendable
+  prepareEnd(e: PrepareEnd)
+
+// ---- Connecting ----
+
+// How the server had the client prove who it is.
+data AuthMethod
+  // The server asked for nothing.
+  Trust
+  // The password, as it is.
+  Cleartext
+  // The password hashed with MD5 and a salt.
+  Md5
+  // SCRAM-SHA-256, the server proving it knows the password too.
+  ScramSha256
+
+// A connection is about to be made.
+data ConnectStart(host: string, port: int, user: string, database: string)
+
+// A connection has been made, or failed to be: how long it took, the server process serving it,
+// whether it is encrypted, and how it authenticated. A failed one has `pid` 0, `tls` false and no
+// `auth`.
+data ConnectEnd(
+    host: string,
+    port: int,
+    user: string,
+    database: string,
+    duration: Duration,
+    pid: int,
+    tls: bool,
+    auth: Option[AuthMethod],
+    error: Option[PgError],
+    cancelled: bool
+)
+
+// Watches every connection made with the configuration, a pool's among them. Under `sslmode=prefer`
+// a fallback to plain TCP is part of the one connection.
+trait ConnectTracer: Sendable
+  connectStart(e: ConnectStart) -> ConnectSpan
+
+trait ConnectSpan: Sendable
+  connectEnd(e: ConnectEnd)
+
+// ---- Batches ----
+
+// A batch of `size` statements is about to be sent in one round trip.
+data BatchStart(size: int, pid: int)
+
+// One statement of a batch has finished, as a `QueryEnd` says.
+data BatchQuery(sql: string, paramCount: int, rows: long, tag: string, error: Option[PgError])
+
+// The whole batch has finished.
+data BatchEnd(size: int, pid: int, duration: Duration, error: Option[PgError], cancelled: bool)
+
+// Watches every batch a connection sends: told the batch starts, then each statement's outcome in
+// order, then the end.
+trait BatchTracer: Sendable
+  batchStart(e: BatchStart) -> BatchSpan
+
+trait BatchSpan: Sendable
+  batchQuery(e: BatchQuery)
+  batchEnd(e: BatchEnd)
+
+// ---- Pools ----
+
+// A pool has lent a connection, after waiting `wait` for it, or failed to: `error` is `PoolTimedOut`,
+// `PoolClosed`, or why a new connection could not be made. Where the thread asking was cancelled
+// while it waited, `cancelled` is true.
+data AcquireEnd(wait: Duration, pid: int, error: Option[PgError], cancelled: bool)
+
+// A lent connection has come back after `held`; `broken` says the pool let it go rather than keep
+// it.
+data Released(held: Duration, pid: int, broken: bool)
+
+// Watches every connection a pool lends: `acquireStart` as a use asks for one, then `acquireEnd`
+// once it has one or has given up, then, where it had one, `released` once it is given back.
+trait PoolTracer: Sendable
+  acquireStart() -> AcquireSpan
+
+trait AcquireSpan: Sendable
+  acquireEnd(e: AcquireEnd)
+  released(e: Released)
+
+// ---- The slow-query log ----
+
+// A query tracer that writes a line to `sink` for each statement that takes `threshold` or longer,
+// failed or cancelled ones among them: its time, the server process, the rows, the SQLSTATE where it
+// failed, and its text. Parameter values are never written.
+//
+//     val config = PgConfig(queryTracer = Some(SlowQueryLog(250.millis, line -> log.warn(line))))
+data SlowQueryLog(threshold: Duration, sink: @sendable (string) -> unit = line -> eprintln(line))
+
+impl QueryTracer for SlowQueryLog
+  queryStart(e: QueryStart) -> QuerySpan = self
+
+impl QuerySpan for SlowQueryLog
+  queryEnd(e: QueryEnd) = if e.duration >= threshold then sink(slowLine(e))
+
+// The slow-query log's line for `e`.
+private slowLine(e: QueryEnd) -> string
+  val outcome = if e.cancelled then "cancelled" else e.code match
+    Some(code) -> s"failed $code"
+    None -> e.error match
+      Some(err) -> s"failed: ${err.message}"
+      None -> s"${e.rows} rows"
+  s"slow query: ${e.duration} on backend ${e.pid}, $outcome: ${e.sql}"
+
+// ---- Several tracers as one ----
+
+// A query tracer that tells each of `tracers`, in order, of every statement, so the slow-query log
+// can run beside a program's own tracer. Each tracer's span is told the end, in the same order.
+// With no tracers it watches nothing.
+//
+//     val both = QueryTracers([SlowQueryLog(millis(250)), metrics])
+//     val config = PgConfig(queryTracer = Some(both))
+data QueryTracers(tracers: Vector[QueryTracer])
+
+private data QuerySpans(spans: Vector[QuerySpan])
+
+impl QueryTracer for QueryTracers
+  queryStart(e: QueryStart) -> QuerySpan = QuerySpans(tracers.map(t -> t.queryStart(e)))
+
+impl QuerySpan for QuerySpans
+  queryEnd(e: QueryEnd) =
+    for s in spans
+      s.queryEnd(e)
+
+// A prepare tracer that tells each of `tracers`, in order, as `QueryTracers` does.
+data PrepareTracers(tracers: Vector[PrepareTracer])
+
+private data PrepareSpans(spans: Vector[PrepareSpan])
+
+impl PrepareTracer for PrepareTracers
+  prepareStart(e: PrepareStart) -> PrepareSpan = PrepareSpans(tracers.map(t -> t.prepareStart(e)))
+
+impl PrepareSpan for PrepareSpans
+  prepareEnd(e: PrepareEnd) =
+    for s in spans
+      s.prepareEnd(e)
+
+// A connect tracer that tells each of `tracers`, in order, as `QueryTracers` does.
+data ConnectTracers(tracers: Vector[ConnectTracer])
+
+private data ConnectSpans(spans: Vector[ConnectSpan])
+
+impl ConnectTracer for ConnectTracers
+  connectStart(e: ConnectStart) -> ConnectSpan = ConnectSpans(tracers.map(t -> t.connectStart(e)))
+
+impl ConnectSpan for ConnectSpans
+  connectEnd(e: ConnectEnd) =
+    for s in spans
+      s.connectEnd(e)
+
+// A batch tracer that tells each of `tracers`, in order, as `QueryTracers` does.
+data BatchTracers(tracers: Vector[BatchTracer])
+
+private data BatchSpans(spans: Vector[BatchSpan])
+
+impl BatchTracer for BatchTracers
+  batchStart(e: BatchStart) -> BatchSpan = BatchSpans(tracers.map(t -> t.batchStart(e)))
+
+impl BatchSpan for BatchSpans
+  batchQuery(e: BatchQuery) =
+    for s in spans
+      s.batchQuery(e)
+  batchEnd(e: BatchEnd) =
+    for s in spans
+      s.batchEnd(e)
+
+// A pool tracer that tells each of `tracers`, in order, as `QueryTracers` does.
+data PoolTracers(tracers: Vector[PoolTracer])
+
+private data AcquireSpans(spans: Vector[AcquireSpan])
+
+impl PoolTracer for PoolTracers
+  acquireStart() -> AcquireSpan = AcquireSpans(tracers.map(t -> t.acquireStart()))
+
+impl AcquireSpan for AcquireSpans
+  acquireEnd(e: AcquireEnd) =
+    for s in spans
+      s.acquireEnd(e)
+  released(e: Released) =
+    for s in spans
+      s.released(e)
+
+// ---- Calling the hooks ----
+
+// Runs `body`, a statement, between `tracer`'s start and end; `counted` gives a success's rows and
+// tag. The end is reported from a `defer` too, so a cancelled thread's statement is ended.
+private tracedQuery[R](
+    tracer: QueryTracer,
+    sql: string,
+    params: Vector[Typed],
+    withValues: bool,
+    pid: int,
+    body: () -> Result[R, PgError],
+    counted: (R) -> (long, string)
+) -> Result[R, PgError]
+  val n = params.length
+  val span = tracer.queryStart(QueryStart(sql, n, pid, if withValues then params.map(p -> p.value) else []))
+  val began = monotonic()
+  var ended = false
+  defer
+    if !ended then span.queryEnd(QueryEnd(sql, n, pid, monotonic() - began, 0, "", None, true))
+  val result = body()
+  ended = true
+  val (rows, tag) = result match
+    Ok(r) -> counted(r)
+    Err(_) -> (long(0), "")
+  span.queryEnd(QueryEnd(sql, n, pid, monotonic() - began, rows, tag, result.err, false))
+  result
+
+// A statement result's rows for a tracer: those read, or the command tag's count where that is more.
+private rowsOf(r: QueryResult) -> long = if r.affected > long(r.rows.length) then r.affected else long(r.rows.length)
+
+// Runs `body`, sending `batch`, between `tracer`'s start and end, telling the span each statement's
+// outcome in order once the batch has been read. A batch that could not be run at all has no
+// statements told, and ends with its error; one that was run ends with its first statement's failure,
+// where one failed. A cancelled thread's batch is ended from the `defer`, with no statements told.
+private tracedBatch(
+    tracer: BatchTracer,
+    batch: Batch,
+    pid: int,
+    body: () -> Result[BatchResults, PgError]
+) -> Result[BatchResults, PgError]
+  val size = batch.items.length
+  val span = tracer.batchStart(BatchStart(size, pid))
+  val began = monotonic()
+  var ended = false
+  defer
+    if !ended then span.batchEnd(BatchEnd(size, pid, monotonic() - began, None, true))
+  val result = body()
+  ended = true
+  val error = result match
+    Err(e) -> Some(e)
+    Ok(rs) ->
+      for i in 0 ..< rs.results.length
+        val item = batch.items(i)
+        val n = item.params.length
+        span.batchQuery(rs.results(i) match
+          Ok(r) -> BatchQuery(item.sql, n, rowsOf(r), r.tag, None)
+          Err(e) -> BatchQuery(item.sql, n, 0, "", Some(e)))
+      firstFailure(rs.results)
+  span.batchEnd(BatchEnd(size, pid, monotonic() - began, error, false))
+  result
+
+// The first statement's failure in `results`, passing over the `Skipped` ones: a statement that
+// could not be sent fails an atomic batch with those before it skipped.
+private firstFailure(results: Vector[Result[QueryResult, PgError]]) -> Option[PgError]
+  for r in results
+    r match
+      Err(Skipped) -> ()
+      Err(e) -> return Some(e)
+      Ok(_) -> ()
+  None
+
+// Runs `body`, preparing `sql` as `name`, between `tracer`'s start and end.
+private tracedPrepare(
+    tracer: PrepareTracer,
+    sql: string,
+    name: string,
+    pid: int,
+    body: () -> Result[Statement, PgError]
+) -> Result[Statement, PgError]
+  val span = tracer.prepareStart(PrepareStart(sql, name, pid))
+  val began = monotonic()
+  var ended = false
+  defer
+    if !ended then span.prepareEnd(PrepareEnd(sql, name, pid, monotonic() - began, 0, 0, None, true))
+  val result = body()
+  ended = true
+  val (params, columns) = result match
+    Ok(s) -> (s.paramOids.length, s.columns.length)
+    Err(_) -> (0, 0)
+  span.prepareEnd(PrepareEnd(sql, name, pid, monotonic() - began, params, columns, result.err, false))
+  result
+
+// Runs `body`, making a connection with `config`, between `tracer`'s start and end.
+private tracedConnect(
+    tracer: ConnectTracer,
+    config: PgConfig,
+    body: () -> Result[Connection, PgError]
+) -> Result[Connection, PgError]
+  val database = config.database.getOrElse(config.user)
+  val span = tracer.connectStart(ConnectStart(config.host, config.port, config.user, database))
+  val began = monotonic()
+  var ended = false
+  defer
+    if !ended then span.connectEnd(
+      ConnectEnd(config.host, config.port, config.user, database, monotonic() - began, 0, false, None, None, true)
+    )
+  val result = body()
+  ended = true
+  val took = monotonic() - began
+  span.connectEnd(result match
+    Ok(c) -> ConnectEnd(
+      config.host,
+      config.port,
+      config.user,
+      database,
+      took,
+      c.backendPid,
+      c.isTls,
+      Some(c.authMethod),
+      None,
+      false
+    )
+    Err(e) -> ConnectEnd(config.host, config.port, config.user, database, took, 0, false, None, Some(e), false))
+  result

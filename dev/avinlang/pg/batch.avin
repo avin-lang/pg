@@ -1,0 +1,102 @@
+module dev.avinlang.pg
+
+// Batches: statements queued, sent to the server together, and their results read back in order.
+
+// A statement queued in a batch: its text, or a statement prepared on the connection, and its
+// parameters as they are bound.
+data BatchItem(sql: string, statement: Option[Statement], params: Vector[Typed])
+
+// Statements to send together, by `Connection.sendBatch` or `PgPool.sendBatch`, in one round trip
+// rather than one each. A batch is plain data: `queue` answers a batch with one more statement, so a
+// batch can be made on one thread and sent on another.
+//
+//     val batch = Batch()
+//       .queue("insert into users (name) values ($1)", "ada")
+//       .queue("select count(*) from users")
+//     val results = db.sendBatch(batch)?.reader()
+data Batch(items: Vector[BatchItem] = [])
+
+impl Batch
+  // The batch with `sql` queued after its statements, its parameters `$1`, `$2`… bound to `params`.
+  queue(sql: string, params: ToPg*) -> Batch = Batch(items :+ BatchItem(sql, None, params.map(paramOf)))
+
+  // The batch with a prepared statement queued after its statements.
+  queue(statement: Statement, params: ToPg*) -> Batch =
+    Batch(items :+ BatchItem(statement.sql, Some(statement), params.map(paramOf)))
+
+  // How many statements are queued.
+  length -> int = items.length
+
+  // Whether no statement is queued.
+  isEmpty -> bool = items.isEmpty
+
+// How the statements of a batch are run.
+data BatchMode
+  // As one implicit transaction: a statement that fails stops the batch, and nothing it did is kept.
+  Atomic
+  // Each as a transaction of its own: a statement that fails fails alone.
+  Independent
+
+// What each statement of a batch produced, in the order they were queued: its result, or why it
+// failed, `Skipped` for one an atomic batch did not run. Results are plain data, so a pooled
+// connection's body can give them back.
+data BatchResults(results: Vector[Result[QueryResult, PgError]])
+
+impl BatchResults
+  // How many results there are, one for each statement queued.
+  length -> int = results.length
+
+  // The result of the statement queued at `index`, counting from 0; `NoMoreResults` past the last.
+  get(index: int) -> Result[QueryResult, PgError] =
+    if 0 <= index < results.length then results(index) else Err(NoMoreResults)
+
+  // The first statement's failure, or `None` where every statement succeeded.
+  failure -> Option[PgError]
+    for r in results
+      if r.isErr then return r.err
+    None
+
+  // A reader of the results in order, from the first.
+  reader() -> BatchReader = BatchReader(self)
+
+// Reads a batch's results in the order their statements were queued, each as the statement's kind
+// asks: its rows, its rows as a type, one value, or the rows it touched. Each read takes the next
+// result, whether it succeeded or not; a read past the last answers `NoMoreResults`.
+//
+//     val r = db.sendBatch(batch)?.reader()
+//     val inserted = r.execute()?
+//     val users = r.queryAs[User]()?
+class BatchReader(private val batch: BatchResults)
+  private var at = 0
+
+  // How many results are still to be read.
+  remaining -> int = batch.length - at
+
+  // The next result.
+  next() -> Result[QueryResult, PgError]
+    val r = batch.get(at)
+    if at < batch.length then at += 1
+    r
+
+  // The rows the next statement returned.
+  query() -> Result[Vector[Row], PgError] = next().map(r -> r.rows)
+
+  // The first row the next statement returned, or `None` where it returned none.
+  queryOne() -> Result[Option[Row], PgError] = next().map(r -> r.rows.headOption)
+
+  // The rows the next statement returned, each read as a `T`.
+  queryAs[T: FromRow]() -> Result[Vector[T], PgError]
+    val rows = next()?.rows
+    val out = Buffer[T]()
+    for row in rows
+      out.addOne(T.fromRow(row)?)
+    Ok(out.toVector)
+
+  // The first column of the first row the next statement returned, read as a `T`; a statement that
+  // returned no row is a `BadColumn` error.
+  queryValue[T: FromPg]() -> Result[T, PgError] = next()?.rows.headOption match
+    Some(row) -> row.get[T](0)
+    None -> Err(BadColumn("#0", "the statement returned no rows"))
+
+  // How many rows the next statement touched, as its command tag counts them.
+  execute() -> Result[long, PgError] = next().map(r -> r.affected)

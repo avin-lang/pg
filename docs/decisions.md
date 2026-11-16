@@ -190,3 +190,177 @@ Found 2026-11-15, reported to avin, not worked around: `TcpStream.connect` resol
 is held and no other worker is started in its place, and a collection waits for it. Every other wait
 the driver makes parks the lightweight thread on the runtime's poller or its locks. A numeric host
 (`127.0.0.1`) or one in the hosts file answers at once, so this shows only with a slow resolver.
+
+## Tracing: a tracer answers a span, and the span carries the context
+
+pgx's tracers take a `context.Context` at the start of an operation and answer one, which is then
+handed to the end. avin has no context value, so the same carrying is done with a value of the
+tracer's own: `queryStart(QueryStart) -> QuerySpan`, and the span's `queryEnd(QueryEnd)`. A trace id,
+a counter, a parent span: the tracer keeps it in the span it makes, typed as it likes, and no
+downcast is needed. A tracer with nothing per operation answers one shared span, often itself (the
+slow-query log does). The same shape serves prepare, connect, batch and pool acquire; the pool's span
+also takes `released`, so one span covers a connection from the wait to its return. Alternatives
+weighed: a generic tracer trait with the context as a type parameter (a configuration field cannot
+hold a tracer of an unknown context type), and an opaque `Sendable` token handed from start to end
+(the tracer would have to cast it back). **Review with the user**: a value the *caller* holds, such as
+an HTTP request's id, has no way into `queryStart`, since avin has no ambient context and the query
+methods take none; a middleware today makes a tracer per request, or puts the id where its tracer
+can read it. A per-call context argument, or an ambient one in avin, would settle it.
+
+## One field per hook on `PgConfig`; the pool's tracer is on the configuration too
+
+`PgConfig` has `queryTracer`, `prepareTracer`, `connectTracer`, `batchTracer` and `poolTracer`, each an
+`Option` of its trait. pgx has one `Tracer` field and finds the other hooks by asserting which
+interfaces it implements, which avin does not offer; separate fields say plainly what is traced. A
+pool made with a configuration traces with its `poolTracer`, as pgxpool reads its tracer from the
+connection configuration, so one value configures everything. Every hook trait and span trait is
+`Sendable`: a configuration is shared by a pool's threads, and the pool's span is used inside the
+isolated body that holds the connection.
+
+## A hook costs one option test when unset, and runs outside every lock
+
+Each hook is called from one spot: `run`, `runStatement` and `simpleQuery` for statements, `parse`
+for preparing, `Connection.connect` for connecting, `PgPool.leased` for the pool. With the hook
+`None` the spot is a `match` that goes straight to the untraced code, so nothing is allocated and no
+clock is read. A connection is used by one thread and holds no lock; the pool's lock is let go
+before the body runs and taken only after it returns, so a hook may use the pool (its statistics,
+another of its connections) without waiting on itself. A hook is told the backend's pid, never the
+connection, so it cannot start a statement on the connection in the middle of one.
+
+## Statement and pool ends are reported from a `defer`, so a cancelled thread's end arrives
+
+The end of a statement, a prepare, a connect and a pool acquire is told from a `defer` where the
+operation did not return, with `cancelled` true and no error, rows or tag. A pool use cancelled while
+it waits is told `acquireEnd` as cancelled; one cancelled after it was lent is told `released` as
+usual. The statements a transaction and a pool run for themselves (`BEGIN`, `COMMIT`, savepoints,
+the `ROLLBACK` on return) are traced as statements, as pgx traces them.
+
+## Hooks answer nothing; a trap in one stops the program
+
+A hook's methods return `unit`, so there is no error for the client to handle and nothing a hook does
+can fail the operation or leave the connection in a state of its own making. A trap inside a hook
+stops the program, as a trap does everywhere in avin (threads.md: a failure is a value, a trap stops
+the program); pgx's hooks cannot fail either, and a panic in one ends the program unless the caller
+recovers it.
+Catching a trap is not something avin offers, so this is the language's rule rather than this
+client's choice.
+
+## Parameter values are hidden unless `traceParameters` is set
+
+`QueryStart.params` is empty by default and `paramCount` always set, so a tracer that logs what it is
+told does not log a password or a token bound as a parameter. `traceParameters = true` hands the
+values over, for a development log. The slow-query log never writes them either way.
+
+## The slow-query log is a `QueryTracer` with a threshold and a line sink
+
+`SlowQueryLog(threshold, sink = eprintln)` writes one line for each statement whose time is at or
+past the threshold, failed and cancelled ones included: `slow query: <time> on backend <pid>, <rows
+| failed SQLSTATE | cancelled>: <sql>`. A sink of strings fits any logger; to run it beside a
+program's own tracer, the two are combined with `QueryTracers` (below).
+
+## Several tracers as one: `QueryTracers(Vector[QueryTracer])`, one combinator per hook
+
+A hook field holds one tracer, so, after pgx's `multitracer`, `QueryTracers`, `PrepareTracers`,
+`ConnectTracers`, `BatchTracers` and `PoolTracers` each wrap a `Vector` of tracers of their kind and
+are one themselves. A start asks every tracer, in the vector's order, for its span; the combined span
+holds those spans and tells each the end (and, for batches, each statement; for the pool, the
+release) in the same order. Each tracer thus carries its own context exactly as it would alone. An
+empty vector watches nothing; the hook is still set, so it costs the option test plus an empty loop.
+Alternatives weighed: one `Tracers` value implementing all five traits from five vectors (a single
+name, but every program would build vectors for hooks it does not use, and a tracer of one kind
+could not be passed); a variadic `QueryTracers.of(a, b)` (the vector literal is as short); hook
+fields holding a `Vector` themselves (every unset hook would cost a length test instead of an option
+test, and the common one-tracer case would need brackets). Ends are told in start order rather than
+reverse (pgx's `multitracer` does the same); a program whose tracers nest, such as an outer timing
+span around an inner one, would want reverse. **Review with the user**: the order of ends.
+
+## Batches are traced around the whole send, the statements told once it has been read
+
+`sendBatch` on a connection whose configuration has a `batchTracer` runs between `batchStart` and
+`batchEnd`, in either mode, and a pool's `sendBatch` lends through the pool's traced lease, so the
+pool tracer sees the lend and return around the batch's own span. A cached statement found stale
+and the batch rerun is one traced batch. The batch is read eagerly, so the statements' outcomes are
+told in order after the last answer has been read, each with its text, parameter count, rows, tag
+and error (`Skipped` for those an atomic batch did not run), and before `batchEnd`. `batchEnd`
+carries the batch's own error where it could not be run at all (closed, broken), else the first
+statement's failure other than `Skipped`, which is what `BatchResults.failure` answers, as pgx's
+batch end carries the first error read. The end is told from a `defer`, as `tracedQuery` does, so a
+batch whose thread is cancelled ends with `cancelled` and no statements told. An empty batch is
+traced too (size 0, nothing told): every call is observed, and it costs nothing on the wire. The
+statements a batch prepares for itself are not told to the `prepareTracer`; they are part of the
+batch's one span. Alternatives weighed: telling each statement as its answer is read (closer to
+pgx's lazy reader, but the statements a refused send never ran would then be told out of order or
+not at all, and the eager reader gains nothing from it); telling the statements that did complete
+before a cancellation (they are not answers the caller will ever see). **Review with the user**:
+whether the batch's own preparing should be told to the prepare tracer.
+
+## Batches: an immutable `Batch`, read eagerly into `BatchResults`
+
+`Batch` is plain data: `queue` answers a new batch with one more statement, so a batch is sendable
+and can be built on one thread and run on a pooled connection's. `sendBatch` reads every answer
+before it returns, into `BatchResults` (plain data, one `Result[QueryResult, PgError]` per
+statement), and `BatchResults.reader()` reads them in order as each statement's kind asks
+(`execute`, `query`, `queryOne`, `queryAs`, `queryValue`), much as pgx's `BatchResults` does. Reading
+eagerly means the connection is never left in the middle of a batch while the program reads, and a
+pooled body can give the results back. Alternatives weighed: a mutable builder (`b.queue(…)` with no
+reassignment, as in pgx), which would not be sendable; and pgx's lazy reader over the connection,
+which keeps every answer's rows out of memory at once but ties the connection to the reader until it
+is closed. **Review with the user**: whether a lazy, streaming reader is wanted for batches whose
+answers are too big to hold.
+
+## A batch is one implicit transaction by default; `Independent` syncs each statement
+
+`Atomic` (the default) sends every statement's Bind and Execute with a single Sync at the end, as
+pgx does: the batch is one implicit transaction, a failure fails that statement and the server skips
+the rest (`Skipped`), and what ran before it is rolled back. `Independent` ends each statement with a
+Sync of its own, so each outside a transaction is committed or fails alone. Inside
+`transaction(f)` both join the open transaction, and a failure leaves it failed (`25P02` for the
+statements after it in an independent batch). Alternatives weighed: offering only the atomic form
+(pgx), or making independence the default (fewer surprises for a list of unrelated writes, but
+weaker than what pgx users expect).
+
+## Statements are prepared first, together; a refused one is sent unprepared
+
+A batch prepares the statements the cache does not hold in one round trip before it runs (each Parse
+and Describe with its own Sync, so a refusal is refused alone), because a parameter's binary
+encoding depends on the type the server infers. A statement the server refuses to prepare, most
+often one on a table an earlier statement of the batch creates, is not failed then: it is sent in
+its place unprepared (Parse, Bind with text parameters, Describe of the portal, Execute) and its
+rows are read as text, so a real error fails it where it stands and the rest of the batch follows
+the protocol's rules. Inside a transaction the preparing is wrapped in `SAVEPOINT pg_batch` and
+rolled back to, so a refused Parse does not fail the transaction (prepared statements outlive the
+rollback). Parameters that do not fit a prepared statement (a `Config` error found before anything is
+sent) fail an atomic batch before any of it runs, every other statement answering `Skipped`; an
+independent batch fails only that statement. A batch of more distinct statements than the cache
+holds keeps them all while it runs and trims the cache after; with no cache they are closed with the
+next statement prepared. A cached statement made stale by DDL fails its statement; an atomic batch
+outside a transaction, which kept nothing, is then run once more with the statement prepared afresh,
+as a single statement is. Alternatives weighed: pgx's rule, where a statement that cannot be
+prepared fails the whole batch (so a batch cannot create a table and use it); and preparing inline
+in the same pipeline, which needs the parameter types before they are known. **Review with the
+user**: the unprepared fallback is invisible except in its text encoding of parameters.
+
+## Batches are sent a 32 KiB window at a time
+
+The server stops reading while it cannot write, so a client that writes a whole large batch before
+reading deadlocks once both directions' socket buffers fill. avin's streams belong to one thread at
+a time and have no non-blocking write, so a writer thread and a reader thread cannot share one; the
+batch instead sends a window of at most 32 KiB of statements (one at least), followed by a Flush
+(the server buffers its answers otherwise), reads every answer to it, and only then sends the next.
+The bytes written ahead of what is read stay well under the 128 KiB a socket buffers by default at
+each end, so no write waits on a server that is itself waiting. It costs one round trip per window,
+about a thousand small statements. Alternatives weighed: a writer/reader split on two lightweight
+threads (needs a stream that can be read and written from two threads, which avin does not offer),
+and a non-blocking write that reads when the socket is full (pgx's way; needs a writable-readiness
+or partial-write primitive). **Review with the user**: whether `avin.net` should grow either, which
+would let the whole batch be in flight at once.
+
+## A cancelled batch: Sync, drain every ReadyForQuery owed; a cut write breaks the connection
+
+A batch keeps count of the ReadyForQuery messages owed and whether messages are out since the last
+Sync. A cancelled batch sends the CancelRequest, a Sync where one is missing, and reads until
+nothing is owed, within the drain limit; an atomic batch then has kept nothing. An independent batch
+keeps what its statements before the cancelled one committed, and the ones already sent after it
+still run. A thread cancelled while a write is under way may have sent half a message, so the
+connection is broken at once rather than drained to the limit; this holds for single statements
+too.

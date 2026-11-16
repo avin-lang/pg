@@ -220,6 +220,38 @@ println(s"${busy.inUse} in use, ${busy.waiting} waiting, ${busy.acquires} served
 pool.close()
 ```
 
+## Batches
+
+A `Batch` queues statements, and `sendBatch` sends them all at once rather than waiting for each
+answer before sending the next; the results come back in the order the statements were queued, read
+one by one as each statement's kind asks. On a local server a thousand inserts as one batch took 2 ms,
+against 32 ms one at a time.
+
+```avin
+import dev.avinlang.pg.Batch
+
+db.execute("create temporary table users (id int, name text)")?
+val batch = Batch()
+  .queue("insert into users values ($1, $2)", 1, "ada")
+  .queue("insert into users values ($1, $2)", 2, "grace")
+  .queue("select id, name from users order by id")
+val r = db.sendBatch(batch)?.reader()
+val inserted = r.execute()? + r.execute()?   // 2
+val users = r.queryAs[User]()?               // [User(1, "ada"), User(2, "grace")]
+```
+
+A batch runs as one transaction: where a statement fails, its result is its error, those after it
+are not run and answer `Skipped`, and nothing the batch did is kept. `sendBatch(batch, Independent)`
+runs each statement as a transaction of its own instead, so a failure is that statement's alone.
+Inside `transaction(f)` a batch is part of the transaction. A batch is plain data, so it can be made
+on one thread and sent on another; `PgPool.sendBatch` sends one on a pooled connection.
+
+The statements are prepared through the statement cache, those not yet prepared all together in one
+more round trip. One the server cannot prepare yet, because it names a table an earlier statement of
+the batch creates, is sent unprepared and runs in its place. A batch of any size is sent a window of
+32 KiB at a time, so a batch of thousands of statements with large answers never leaves both ends
+waiting to write. A batch whose thread is cancelled is cancelled as a single statement is.
+
 ## Cancellation
 
 A statement whose thread is cancelled, by `withTimeout` or a scope, is cancelled on the server too:
@@ -231,6 +263,89 @@ import avin.threads.withTimeout
 import avin.time.seconds
 
 val r = withTimeout(seconds(2), _ -> db.query("select pg_sleep(60)"))   // None: cancelled
+```
+
+## Tracing
+
+Hooks on the configuration watch what its connections do, for a server's logs, metrics and traces:
+`queryTracer` each statement run, `prepareTracer` each statement prepared, `connectTracer` each
+connection made (with its authentication method and whether it is encrypted), `batchTracer` each
+batch, and `poolTracer` each connection a pool lends (with the wait) and takes back (with how long
+it was held, and whether it was let go). A tracer is told an operation starts and answers a span; the
+span is told how it ended: its time, the rows it returned or touched, its command tag, its error and
+SQLSTATE, the server process, and whether its thread was cancelled. Whatever the tracer wants to
+carry from the start to the end, it keeps in the span it makes.
+
+A tracer sees how many parameters a statement binds, never their values, unless `traceParameters`
+is set. A hook runs on the operation's thread, outside every lock of the connection and the pool; an
+unset hook costs nothing beyond a test of its option. Hooks answer nothing, so they cannot fail the
+statement they watch.
+
+```avin
+import avin.threads.Atomic
+import avin.time.millis
+import dev.avinlang.pg.{PgConfig, PgPool, QueryEnd, QuerySpan, QueryStart, QueryTracer}
+
+// Numbers each statement, and logs its start and its end under that number.
+class Numbered(private val log: @sendable (string) -> unit): Sendable
+  val next = Atomic(long(0))
+
+data NumberedSpan(n: long, log: @sendable (string) -> unit)
+
+impl QueryTracer for Numbered
+  queryStart(e: QueryStart) -> QuerySpan
+    val n = next.add(1)
+    log(s"#$n on backend ${e.pid}: ${e.sql}")
+    NumberedSpan(n, log)
+
+impl QuerySpan for NumberedSpan
+  queryEnd(e: QueryEnd) = log(s"#$n: ${e.rows} rows, ${e.code.getOrElse("ok")}")
+
+val config = PgConfig.parse("postgres://app:secret@localhost/shop")?
+val db = PgPool.of(config with {queryTracer = Some(Numbered(line -> println(line)))}, maxSize = 8)
+```
+
+`SlowQueryLog(threshold, sink)` is a query tracer that writes a line for each statement that takes
+`threshold` or longer, its parameters' values never among it; `sink` defaults to standard error.
+
+```avin
+import dev.avinlang.pg.SlowQueryLog
+
+val logged = config with {queryTracer = Some(SlowQueryLog(millis(250)))}
+// slow query: 1.2s on backend 4711, 3 rows: select … from orders where …
+```
+
+A batch tracer is told the batch starts, then, once the batch has been read, each statement's
+outcome in order (a statement an atomic batch skipped answers `Skipped`), then the end, which carries
+the first statement's failure. A batch whose thread is cancelled ends with `cancelled` set and no
+statements told. A pooled batch is traced by its connection's batch tracer, inside the pool's lend.
+
+```avin
+import avin.threads.Mutex
+import dev.avinlang.pg.{BatchEnd, BatchQuery, BatchSpan, BatchStart, BatchTracer}
+
+// Logs each batch as one line: its size, and the statements that failed.
+data BatchLine(log: @sendable (string) -> unit, failed: Mutex[Buffer[string]] = Mutex(Buffer[string]()))
+
+impl BatchTracer for BatchLine
+  batchStart(e: BatchStart) -> BatchSpan = BatchLine(log)
+
+impl BatchSpan for BatchLine
+  batchQuery(e: BatchQuery) = if e.error.isDefined then failed.with(b -> b.addOne(e.sql))
+  batchEnd(e: BatchEnd) = log(s"batch of ${e.size}, failed: ${failed.with(b -> b.toVector)}")
+
+val traced = config with {batchTracer = Some(BatchLine(line -> println(line)))}
+// batch of 3, failed: [select 1 / 0, select 3]
+```
+
+One hook holds one tracer; `QueryTracers`, `PrepareTracers`, `ConnectTracers`, `BatchTracers` and
+`PoolTracers` make several act as one, each told of every event in the order given, through a span of
+its own. So the slow-query log runs beside a program's own tracer:
+
+```avin
+import dev.avinlang.pg.QueryTracers
+
+val both = config with {queryTracer = Some(QueryTracers([SlowQueryLog(millis(250)), Numbered(line -> println(line))]))}
 ```
 
 ## Not yet

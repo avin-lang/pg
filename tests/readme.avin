@@ -1,13 +1,17 @@
 module tests
 
 // The README's examples, against the test server: a count with a parameter, rows read by column and
-// into a derived type, a unique violation's SQLSTATE, a transfer in a transaction, a pool, and a
-// statement cancelled by a timeout.
+// into a derived type, a unique violation's SQLSTATE, a transfer in a transaction, a pool, a batch,
+// a statement cancelled by a timeout, and tracing.
 
-import avin.threads.withTimeout
-import avin.time.seconds
+import avin.threads.{Atomic, Mutex, withTimeout}
+import avin.time.{millis, seconds}
 import dev.avinlang.pg
-import dev.avinlang.pg.{Connection, PgColumn, PgConfig, PgError, PgPool, PoolBusy, FromRow}
+
+import dev.avinlang.pg.{
+  Batch, BatchEnd, BatchQuery, BatchSpan, BatchStart, BatchTracer, Connection, PgColumn, PgConfig, PgError, PgPool,
+  PoolBusy, FromRow, QueryEnd, QuerySpan, QueryStart, QueryTracer, QueryTracers, SlowQueryLog
+}
 
 data ReadmeItem(id: int, @PgColumn("name") label: string, price: Option[BigDecimal] = None) derives FromRow
 
@@ -117,6 +121,119 @@ readmeServerPool() -> Result[unit, PgError]
   assertEq(full.use(c -> Ok(statusOf(full))), Ok(503))
   full.close()
   Ok(())
+
+data User(id: int, name: string) derives FromRow
+
+@test("the README's batch: two inserts and a query sent together, read in order")
+readmeBatch() -> Result[unit, PgError]
+  val db = testConnection() match
+    Some(r) -> r?
+    None -> return Ok(())
+  db.execute("create temporary table users (id int, name text)")?
+  val batch = Batch()
+    .queue("insert into users values ($1, $2)", 1, "ada")
+    .queue("insert into users values ($1, $2)", 2, "grace")
+    .queue("select id, name from users order by id")
+  val r = db.sendBatch(batch)?.reader()
+  val inserted = r.execute()? + r.execute()?
+  val users = r.queryAs[User]()?
+  assertEq(inserted, long(2))
+  assertEq(users, [User(1, "ada"), User(2, "grace")])
+  db.close()
+
+// The README's tracer: each statement numbered, its start and end logged under that number.
+class Numbered(private val log: @sendable (string) -> unit): Sendable
+  val next = Atomic(long(0))
+
+data NumberedSpan(n: long, log: @sendable (string) -> unit)
+
+impl QueryTracer for Numbered
+  queryStart(e: QueryStart) -> QuerySpan
+    val n = next.add(1)
+    log(s"#$n on backend ${e.pid}: ${e.sql}")
+    NumberedSpan(n, log)
+
+impl QuerySpan for NumberedSpan
+  queryEnd(e: QueryEnd) = log(s"#$n: ${e.rows} rows, ${e.code.getOrElse("ok")}")
+
+private record(lines: Mutex[Buffer[string]], line: string)
+  lines.with(b ->
+    b.addOne(line)
+    ())
+
+@test("the README's tracing: statements numbered from start to end, and the slow-query log")
+readmeTracing() -> Result[unit, PgError]
+  val url = testUrl() match
+    Some(u) -> u
+    None -> return Ok(())
+  val lines = Mutex(Buffer[string]())
+  val config = PgConfig.parse(url)?
+  val db = PgPool.of(config with {queryTracer = Some(Numbered(line -> record(lines, line)))}, maxSize = 8)
+  val pid = db.use(c -> Ok(c.backendPid))?
+  db.query("select 1")?
+  assert(db.query("select nothing_here").isErr)
+  db.close()
+  assertEq(
+    lines.with(b -> b.toVector),
+    [
+      s"#1 on backend $pid: select 1",
+      "#1: 1 rows, ok",
+      s"#2 on backend $pid: select nothing_here",
+      "#2: 0 rows, 42703"
+    ]
+  )
+  val slow = Mutex(Buffer[string]())
+  val logged = config with {queryTracer = Some(SlowQueryLog(millis(250), line -> record(slow, line)))}
+  val c = pg.connect(logged)?
+  c.query("select pg_sleep(0.3)")?
+  c.query("select 1")?
+  assertEq(slow.with(b -> b.length), 1)
+  assert(slow.with(b -> b(0)).endsWith(s"on backend ${c.backendPid}, 1 rows: select pg_sleep(0.3)"))
+  c.close()
+
+// The README's batch tracer: each batch one line, its size and the statements that failed.
+data BatchLine(log: @sendable (string) -> unit, failed: Mutex[Buffer[string]] = Mutex(Buffer[string]()))
+
+impl BatchTracer for BatchLine
+  batchStart(e: BatchStart) -> BatchSpan = BatchLine(log)
+
+impl BatchSpan for BatchLine
+  batchQuery(e: BatchQuery) = if e.error.isDefined then failed.with(b -> b.addOne(e.sql))
+  batchEnd(e: BatchEnd) = log(s"batch of ${e.size}, failed: ${failed.with(b -> b.toVector)}")
+
+@test("the README's batch tracer: a batch's size and its failed statements on one line")
+readmeBatchTracing() -> Result[unit, PgError]
+  val url = testUrl() match
+    Some(u) -> u
+    None -> return Ok(())
+  val lines = Mutex(Buffer[string]())
+  val config = PgConfig.parse(url)?
+  val traced = config with {batchTracer = Some(BatchLine(line -> record(lines, line)))}
+  val c = pg.connect(traced)?
+  c.sendBatch(Batch().queue("select 1").queue("select 1 / 0").queue("select 3"))?
+  c.sendBatch(Batch().queue("select 4"))?
+  assertEq(lines.with(b -> b.toVector), ["batch of 3, failed: [select 1 / 0, select 3]", "batch of 1, failed: []"])
+  c.close()
+
+@test("the README's tracer combinator: the slow-query log beside the numbering tracer")
+readmeTracers() -> Result[unit, PgError]
+  val url = testUrl() match
+    Some(u) -> u
+    None -> return Ok(())
+  val lines = Mutex(Buffer[string]())
+  val config = PgConfig.parse(url)?
+  val both = config with {
+    queryTracer = Some(QueryTracers([SlowQueryLog(millis(250), line -> record(lines, line)), Numbered(line ->
+      record(lines, line))]))
+  }
+  val c = pg.connect(both)?
+  c.query("select pg_sleep(0.3)")?
+  val seen = lines.with(b -> b.toVector)
+  assertEq(seen.length, 3)
+  assertEq(seen(0), s"#1 on backend ${c.backendPid}: select pg_sleep(0.3)")
+  assert(seen(1).startsWith("slow query: ") && seen(1).endsWith("1 rows: select pg_sleep(0.3)"))
+  assertEq(seen(2), "#1: 1 rows, ok")
+  c.close()
 
 @test("the README's cancellation: a statement past its time is cancelled")
 readmeCancel() -> Result[unit, PgError]
