@@ -59,6 +59,10 @@ data PgError
   PoolTimedOut
   // The pool is closed.
   PoolClosed
+  // A statement in an atomic batch was not run, because another statement in the batch failed.
+  Skipped
+  // A batch's results were read past the last of them.
+  NoMoreResults
 
 impl PgError
   // The server's SQLSTATE where the server refused the statement, or `None` for any other failure.
@@ -81,6 +85,8 @@ impl Error for PgError
     Closed -> "the connection is closed"
     PoolTimedOut -> "timed out waiting for a pooled connection"
     PoolClosed -> "the pool is closed"
+    Skipped -> "the statement was not run: another statement in its batch failed"
+    NoMoreResults -> "the batch has no more results"
 
   cause -> Option[Error] = self match
     Io(e) -> Some(e)

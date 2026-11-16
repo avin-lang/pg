@@ -1,6 +1,7 @@
 module dev.avinlang.pg
 
-import avin.threads.{AcquireTimedOut, Atomic, CreateFailed, Lease, Pool, PoolError, PoolStats}
+// `Atomic` is also `BatchMode`'s variant in this module, so the thread library's cell is renamed.
+import avin.threads.{AcquireTimedOut, Atomic as AtomicCell, CreateFailed, Lease, Pool, PoolError, PoolStats}
 import avin.time.{Duration, monotonic}
 
 // Connections shared between threads: `use(f)` lends one to `f` and takes it back when `f` returns,
@@ -60,7 +61,7 @@ class PgPool(private val pool: Pool[Connection, PgError], private val tracer: Op
     val span = t.acquireStart()
     val asked = monotonic()
     // Set by the lease's body, which may capture only sendable values.
-    val ended = Atomic(false)
+    val ended = AtomicCell(false)
     defer
       if !ended.load() then span.acquireEnd(AcquireEnd(monotonic() - asked, 0, None, true))
     val result = leaseFor(timeout, l ->
@@ -77,6 +78,10 @@ class PgPool(private val pool: Pool[Connection, PgError], private val tracer: Op
         val failure = poolFailure(e)
         span.acquireEnd(AcquireEnd(monotonic() - asked, 0, Some(failure), false))
         Err(failure)
+
+  // Runs the statements of `batch` together on a pooled connection (`Connection.sendBatch`).
+  sendBatch(batch: Batch, mode: BatchMode = Atomic) -> Result[BatchResults, PgError] =
+    flattened(pool.lease(l -> lent(l, c -> c.sendBatch(batch, mode))))
 
   // Makes connections until the pool holds its `minIdle`.
   warm() -> Result[unit, PgError] = pool.warm().mapErr(poolFailure)

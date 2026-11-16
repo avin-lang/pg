@@ -1,15 +1,16 @@
 module tests
 
 // The README's examples, against the test server: a count with a parameter, rows read by column and
-// into a derived type, a unique violation's SQLSTATE, a transfer in a transaction, a pool, tracing,
-// and a statement cancelled by a timeout.
+// into a derived type, a unique violation's SQLSTATE, a transfer in a transaction, a pool, a batch,
+// a statement cancelled by a timeout, and tracing.
 
 import avin.threads.{Atomic, Mutex, withTimeout}
 import avin.time.{millis, seconds}
 import dev.avinlang.pg
 
 import dev.avinlang.pg.{
-  Connection, PgColumn, PgConfig, PgError, PgPool, FromRow, QueryEnd, QuerySpan, QueryStart, QueryTracer, SlowQueryLog
+  Batch, Connection, PgColumn, PgConfig, PgError, PgPool, FromRow, QueryEnd, QuerySpan, QueryStart, QueryTracer,
+  SlowQueryLog
 }
 
 data ReadmeItem(id: int, @PgColumn("name") label: string, price: Option[BigDecimal] = None) derives FromRow
@@ -89,6 +90,25 @@ readmePool() -> Result[unit, PgError]
   assertEq(names.map(r -> r.get[string]("name")), [Ok("ada"), Ok("grace")])
   pool.close()
   Ok(())
+
+data User(id: int, name: string) derives FromRow
+
+@test("the README's batch: two inserts and a query sent together, read in order")
+readmeBatch() -> Result[unit, PgError]
+  val db = testConnection() match
+    Some(r) -> r?
+    None -> return Ok(())
+  db.execute("create temporary table users (id int, name text)")?
+  val batch = Batch()
+    .queue("insert into users values ($1, $2)", 1, "ada")
+    .queue("insert into users values ($1, $2)", 2, "grace")
+    .queue("select id, name from users order by id")
+  val r = db.sendBatch(batch)?.reader()
+  val inserted = r.execute()? + r.execute()?
+  val users = r.queryAs[User]()?
+  assertEq(inserted, long(2))
+  assertEq(users, [User(1, "ada"), User(2, "grace")])
+  db.close()
 
 // The README's tracer: each statement numbered, its start and end logged under that number.
 class Numbered(private val log: @sendable (string) -> unit): Sendable
