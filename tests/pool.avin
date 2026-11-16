@@ -56,7 +56,10 @@ pooledStatements() -> Result[unit, PgError]
     None -> return Ok(())
   db.execute("drop table if exists pool_items")?
   db.execute("create table pool_items (n int, label text)")?
-  assertEq(db.execute("insert into pool_items values ($1, $2), ($3, $4)", 1, "one", 2, None: Option[string]), Ok(long(2)))
+  assertEq(
+    db.execute("insert into pool_items values ($1, $2), ($3, $4)", 1, "one", 2, None: Option[string]),
+    Ok(long(2))
+  )
   val rows = db.query("select label from pool_items where n >= $1 order by n", 1)?
   assertEq(rows.map(r -> r.get[Option[string]]("label")), [Ok(Some("one")), Ok(None)])
   assertEq(db.transaction(c ->

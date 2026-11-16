@@ -61,10 +61,10 @@ private cacheKey(sql: string, oids: Vector[int]) -> string = oids.mkString(",") 
 // ready again, so the connection can be used on; where that fails the connection is broken, and
 // `isBroken` says so. A transaction a cancellation stops is rolled back.
 class Connection(
-    private var stream: ByteStream,
-    private val config: PgConfig,
-    // Whether the connection is encrypted.
-    val isTls: bool
+  private var stream: ByteStream,
+  private val config: PgConfig,
+  // Whether the connection is encrypted.
+  val isTls: bool
 )
   private var reader = MessageReader(stream)
   private var pid = 0
@@ -127,12 +127,18 @@ class Connection(
 
   // The first column of the first row `sql` returns, read as a `T`; a statement that returns no row
   // is a `Column` error.
-  queryValue[T: FromPg](sql: string, params: ToPg*) -> Result[T, PgError] = run(sql, params.map(paramOf))?.rows.headOption match
+  queryValue[T: FromPg](
+      sql: string,
+      params: ToPg*
+  ) -> Result[T, PgError] = run(sql, params.map(paramOf))?.rows.headOption match
     Some(row) -> row.get[T](0)
     None -> Err(BadColumn("#0", "the statement returned no rows"))
 
   // Runs `sql` and answers how many rows it touched, as its command tag counts them.
-  execute(sql: string, params: ToPg*) -> Result[long, PgError] = run(sql, params.map(paramOf)).map(r -> affectedBy(r.tag))
+  execute(
+      sql: string,
+      params: ToPg*
+  ) -> Result[long, PgError] = run(sql, params.map(paramOf)).map(r -> affectedBy(r.tag))
 
   // Runs a prepared statement and answers how many rows it touched.
   execute(statement: Statement, params: ToPg*) -> Result[long, PgError] =
@@ -317,7 +323,9 @@ class Connection(
     val encoded = Buffer[(bool, Option[Vector[byte]])]()
     var i = 0
     while i < params.length
-      encoded.addOne(encodeFor(statement.paramOids(i), params(i).value).mapErr(e -> Config(s"parameter $$${i + 1}: $e"))?)
+      encoded.addOne(
+        encodeFor(statement.paramOids(i), params(i).value).mapErr(e -> Config(s"parameter $$${i + 1}: $e"))?
+      )
       i += 1
     out.int16(encoded.length)
     for (binary, _) in encoded
@@ -464,14 +472,18 @@ class Connection(
         'R' ->
           val r = In(m.body)
           r.int32() match
-            0 -> if scram.isDefined && !proven then return Err(Auth("the server accepted the password without proving it knows it"))
+            0 -> if scram.isDefined && !proven then return Err(
+              Auth("the server accepted the password without proving it knows it")
+            )
             3 -> send(Out().begin('p').cstring(password()?).close())?
             5 -> send(Out().begin('p').cstring(md5Answer(config.user, password()?, r.bytes(4))).close())?
             10 ->
               val mechanisms = Buffer[string]()
               while r.remaining > 1
                 mechanisms.addOne(r.cstring())
-              if !mechanisms.contains("SCRAM-SHA-256") then return Err(Auth(s"the server offers ${mechanisms.mkString(", ")}, and this client speaks SCRAM-SHA-256"))
+              if !mechanisms.contains("SCRAM-SHA-256") then return Err(
+                Auth(s"the server offers ${mechanisms.mkString(", ")}, and this client speaks SCRAM-SHA-256")
+              )
               val s = Scram(password()?)
               scram = Some(s)
               val first = s.first.bytes
@@ -484,7 +496,9 @@ class Connection(
               val s = scram.okOr(Protocol("SASLFinal before SASL began"))?
               s.verify(string.fromUtf8Lossy(r.bytes(r.remaining)))?
               proven = true
-            code -> return Err(Auth(s"the server asks for authentication method $code, which this client does not speak"))
+            code -> return Err(
+              Auth(s"the server asks for authentication method $code, which this client does not speak")
+            )
         'K' ->
           val r = In(m.body)
           pid = r.int32()
@@ -496,7 +510,9 @@ class Connection(
         _ -> return Err(Protocol(s"unexpected message `${m.kind}` during startup"))
     Ok(())
 
-  private password() -> Result[string, PgError] = config.password.okOr(Auth("the server asks for a password and none was given"))
+  private password() -> Result[string, PgError] = config.password.okOr(
+    Auth("the server asks for a password and none was given")
+  )
 
 // ---- Messages ----
 
@@ -540,7 +556,11 @@ private rowOf(columns: Vector[Column], m: Message, binary: (Column) -> bool) -> 
     i += 1
   Ok(Row(columns, values.toVector))
 
-private binaryRow(columns: Vector[Column], m: Message) -> Result[Row, PgError] = rowOf(columns, m, c -> binaryType(c.typeOid))
+private binaryRow(columns: Vector[Column], m: Message) -> Result[Row, PgError] = rowOf(
+  columns,
+  m,
+  c -> binaryType(c.typeOid)
+)
 
 private textRow(columns: Vector[Column], m: Message) -> Result[Row, PgError] = rowOf(columns, m, _ -> false)
 
@@ -567,29 +587,32 @@ private diagnosticOf(m: Message) -> Diagnostic
       'S' ->
         localized = text
         d
-      'V' -> d with { severity = text }
-      'C' -> d with { code = text }
-      'M' -> d with { message = text }
-      'D' -> d with { detail = Some(text) }
-      'H' -> d with { hint = Some(text) }
-      'P' -> d with { position = text.toIntOption() }
-      'p' -> d with { internalPosition = text.toIntOption() }
-      'q' -> d with { internalQuery = Some(text) }
-      'W' -> d with { where = Some(text) }
-      's' -> d with { schema = Some(text) }
-      't' -> d with { table = Some(text) }
-      'c' -> d with { column = Some(text) }
-      'd' -> d with { dataType = Some(text) }
-      'n' -> d with { constraint = Some(text) }
-      'F' -> d with { file = Some(text) }
-      'L' -> d with { line = text.toIntOption() }
-      'R' -> d with { routine = Some(text) }
+      'V' -> d with {severity = text}
+      'C' -> d with {code = text}
+      'M' -> d with {message = text}
+      'D' -> d with {detail = Some(text)}
+      'H' -> d with {hint = Some(text)}
+      'P' -> d with {position = text.toIntOption()}
+      'p' -> d with {internalPosition = text.toIntOption()}
+      'q' -> d with {internalQuery = Some(text)}
+      'W' -> d with {where = Some(text)}
+      's' -> d with {schema = Some(text)}
+      't' -> d with {table = Some(text)}
+      'c' -> d with {column = Some(text)}
+      'd' -> d with {dataType = Some(text)}
+      'n' -> d with {constraint = Some(text)}
+      'F' -> d with {file = Some(text)}
+      'L' -> d with {line = text.toIntOption()}
+      'R' -> d with {routine = Some(text)}
       _ -> d
   finished(d, localized)
 
 // The severity is the unlocalized one where the server sends it (9.6 and later), the localized one
 // otherwise.
-private finished(d: Diagnostic, localized: string) -> Diagnostic = if d.severity == "" then d with { severity = localized } else d
+private finished(
+    d: Diagnostic,
+    localized: string
+) -> Diagnostic = if d.severity == "" then d with {severity = localized} else d
 
 // ---- Connecting ----
 
@@ -633,7 +656,9 @@ object Connection
     if !tls then return Ok(Connection(tcp, config, false))
     tcp.write(Out().beginUntyped().int32(SslRequestCode).close().toArray()).mapErr(e -> Io(e))?
     val answer = tcp.read(1).mapErr(e -> Io(e))?
-    if answer.length == 0 then return Err(Io(IoError(io.ConnectionReset, "read from", s"${config.host}:${config.port}")))
+    if answer.length == 0 then return Err(
+      Io(IoError(io.ConnectionReset, "read from", s"${config.host}:${config.port}"))
+    )
     char(int(answer(0))) match
       'S' ->
         val settings = config.rootCertificate match

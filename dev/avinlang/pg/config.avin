@@ -39,53 +39,63 @@ data PgConfig(
 
 object PgConfig
   // The settings a connection URL gives: `postgres://user:password@host:port/database?options`, or
-  // `postgresql://`. The user name, password and database are percent-decoded. The options are
+  // `postgresql://`. An IPv6 host is written in brackets, `[::1]`. The user name, password and
+  // database are percent-decoded. The options are
   // `sslmode` (`disable`, `prefer` or `require`; `verify-full` is `require`), `sslrootcert` (a
   // file of PEM authorities, read now), `application_name`, `connect_timeout` (whole seconds) and
   // `statement_cache_size`; any other is refused, so a misspelt one is not silently ignored.
   parse(text: string) -> Result[PgConfig, PgError]
     val url = Url.parse(text).mapErr(e -> Config(s"not a URL: ${e.message}"))?
-    if url.scheme != "postgres" && url.scheme != "postgresql" then return Err(Config(s"the scheme is `${url.scheme}`, not `postgres`"))
+    if url.scheme != "postgres" && url.scheme != "postgresql" then return Err(
+      Config(s"the scheme is `${url.scheme}`, not `postgres`")
+    )
     var config = PgConfig()
     url.host match
-      Some(h) -> if h != "" then config = config with { host = h }
+      Some(h) -> if h != "" then config = config with {host = h.stripPrefix("[").stripSuffix("]")}
       None -> ()
     url.port match
-      Some(p) -> config = config with { port = p }
+      Some(p) -> config = config with {port = p}
       None -> ()
     url.userInfo match
       Some(info) ->
         val colon = info.indexOf(":")
-        val (user, password) = if colon < 0 then (info, None) else (info.slice(0, colon), Some(info.slice(colon + 1, info.byteLength)))
+        val (user, password) = if colon < 0 then (info, None) else (
+          info.slice(0, colon),
+          Some(info.slice(colon + 1, info.byteLength))
+        )
         val decodedUser = decoded(user)?
-        if decodedUser != "" then config = config with { user = decodedUser }
+        if decodedUser != "" then config = config with {user = decodedUser}
         password match
-          Some(p) -> config = config with { password = Some(decoded(p)?) }
+          Some(p) -> config = config with {password = Some(decoded(p)?)}
           None -> ()
       None -> ()
     val path = url.path.stripPrefix("/")
-    if path != "" then config = config with { database = Some(decoded(path)?) }
+    if path != "" then config = config with {database = Some(decoded(path)?)}
     for (name, value) in url.queryParams
       config = option(config, name, value)?
     Ok(config)
 
-private decoded(text: string) -> Result[string, PgError] = Url.decode(text).mapErr(e -> Config(s"bad percent-encoding: ${e.message}"))
+private decoded(text: string) -> Result[string, PgError] = Url.decode(text).mapErr(
+  e -> Config(s"bad percent-encoding: ${e.message}")
+)
 
 // `config` with the URL option `name` set to `value`.
 private option(config: PgConfig, name: string, value: string) -> Result[PgConfig, PgError] = name match
   "sslmode" -> value match
-    "disable" -> Ok(config with { sslMode = Disable })
-    "prefer" -> Ok(config with { sslMode = Prefer })
-    "require" | "verify-full" -> Ok(config with { sslMode = Require })
+    "disable" -> Ok(config with {sslMode = Disable})
+    "prefer" -> Ok(config with {sslMode = Prefer})
+    "require" | "verify-full" -> Ok(config with {sslMode = Require})
     _ -> Err(Config(s"sslmode `$value` is not one of disable, prefer, require and verify-full"))
   "sslrootcert" -> fs.readText(value) match
-    Ok(pem) -> Ok(config with { rootCertificate = Some(pem) })
+    Ok(pem) -> Ok(config with {rootCertificate = Some(pem)})
     Err(e) -> Err(Config(s"sslrootcert: ${e.message}"))
-  "application_name" -> Ok(config with { applicationName = Some(value) })
+  "application_name" -> Ok(config with {applicationName = Some(value)})
   "connect_timeout" -> value.toIntOption() match
-    Some(n) -> Ok(config with { connectTimeout = if n > 0 then Some(n.seconds) else None })
+    Some(n) -> Ok(config with {connectTimeout = if n > 0 then Some(n.seconds) else None})
     None -> Err(Config(s"connect_timeout `$value` is not a whole number of seconds"))
   "statement_cache_size" -> value.toIntOption() match
-    Some(n) -> if n >= 0 then Ok(config with { statementCacheSize = n }) else Err(Config("statement_cache_size is negative"))
+    Some(n) -> if n >= 0 then Ok(config with {statementCacheSize = n}) else Err(
+      Config("statement_cache_size is negative")
+    )
     None -> Err(Config(s"statement_cache_size `$value` is not a whole number"))
   _ -> Err(Config(s"the option `$name` is not one this client knows"))

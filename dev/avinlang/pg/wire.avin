@@ -189,7 +189,9 @@ private class MessageReader(private val stream: ByteStream)
   next() -> Result[Message, PgError]
     fill(5)?
     val kind = char(int(buffer(at)))
-    val length = (int(buffer(at + 1)) << 24) | (int(buffer(at + 2)) << 16) | (int(buffer(at + 3)) << 8) | int(buffer(at + 4))
+    val length = (
+      int(buffer(at + 1)) << 24
+    ) | (int(buffer(at + 2)) << 16) | (int(buffer(at + 3)) << 8) | int(buffer(at + 4))
     if length < 4 || length > 0x3fffffff then return Err(Protocol(s"a message of type `$kind` has length $length"))
     fill(1 + length)?
     val body = buffer.slice(at + 5, at + 1 + length)

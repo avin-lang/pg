@@ -1,0 +1,85 @@
+module tests
+
+// Connection URLs read into settings: every part, every option, and each way a URL is refused.
+
+import avin.time.seconds
+import dev.avinlang.pg.{Config, Disable, PgConfig, PgError, Prefer, Require}
+
+// The reason `text` is refused for, or a note that it was not.
+private refusal(text: string) -> string = PgConfig.parse(text) match
+  Err(Config(reason)) -> reason
+  Err(_) -> "refused, but not as Config"
+  Ok(_) -> "accepted"
+
+@test("a URL with only a host takes the defaults for the rest")
+defaults() -> Result[unit, PgError]
+  val c = PgConfig.parse("postgres://db.example")?
+  assertEq((c.host, c.port, c.user, c.password, c.database), ("db.example", 5432, "postgres", None, None))
+  assertEq(
+    (c.sslMode, c.rootCertificate, c.applicationName, c.connectTimeout, c.statementCacheSize),
+    (Prefer, None, None, None, 100)
+  )
+  // An IPv6 address is the host without the brackets the URL writes it in.
+  val v6 = PgConfig.parse("postgres://[::1]:5433/d")?
+  assertEq((v6.host, v6.port), ("::1", 5433))
+  // No host at all is localhost.
+  assertEq(PgConfig.parse("postgres:///shop")?.host, "localhost")
+  assertEq(PgConfig.parse("postgres:///shop")?.database, Some("shop"))
+  Ok(())
+
+@test("every part of a URL: user, password, host, port and database; either scheme")
+everyPart() -> Result[unit, PgError]
+  for scheme in ["postgres", "postgresql"]
+    val c = PgConfig.parse(s"$scheme://alice:s3cret@10.0.0.5:6543/inventory")?
+    assertEq(
+      (c.host, c.port, c.user, c.password, c.database),
+      ("10.0.0.5", 6543, "alice", Some("s3cret"), Some("inventory"))
+    )
+  // A user with no password, and an empty password.
+  assertEq(PgConfig.parse("postgres://bob@h")?.password, None)
+  assertEq(PgConfig.parse("postgres://bob:@h")?.password, Some(""))
+  // Only the first colon divides the user from the password.
+  assertEq(PgConfig.parse("postgres://bob:a:b@h")?.password, Some("a:b"))
+  Ok(())
+
+@test("the user, password and database are percent-decoded, Unicode included")
+percentDecoded() -> Result[unit, PgError]
+  val c = PgConfig.parse("postgres://j%C3%BCrgen:p%40ss%2Fw%3Ard@h/caf%C3%A9%20db")?
+  assertEq((c.user, c.password, c.database), ("jürgen", Some("p@ss/w:rd"), Some("café db")))
+  Ok(())
+
+@test("the options: sslmode, application_name, connect_timeout and statement_cache_size")
+options() -> Result[unit, PgError]
+  assertEq(PgConfig.parse("postgres://h?sslmode=disable")?.sslMode, Disable)
+  assertEq(PgConfig.parse("postgres://h?sslmode=prefer")?.sslMode, Prefer)
+  assertEq(PgConfig.parse("postgres://h?sslmode=require")?.sslMode, Require)
+  assertEq(PgConfig.parse("postgres://h?sslmode=verify-full")?.sslMode, Require)
+  val c = PgConfig.parse("postgres://h/d?application_name=billing&connect_timeout=7&statement_cache_size=0")?
+  assertEq((c.applicationName, c.connectTimeout, c.statementCacheSize), (Some("billing"), Some(7.seconds), 0))
+  // A timeout of 0 is none, as libpq reads it.
+  assertEq(PgConfig.parse("postgres://h?connect_timeout=0")?.connectTimeout, None)
+  // The last of an option given twice wins.
+  assertEq(PgConfig.parse("postgres://h?sslmode=require&sslmode=disable")?.sslMode, Disable)
+  Ok(())
+
+@test("a URL that is not a PostgreSQL one, or has a bad option, is a Config error saying why")
+refused() -> Result[unit, PgError]
+  assertEq(refusal("mysql://h/db"), "the scheme is `mysql`, not `postgres`")
+  assert(refusal("not a url").startsWith("not a URL"))
+  assertEq(
+    refusal("postgres://h?sslmode=verify-ca"),
+    "sslmode `verify-ca` is not one of disable, prefer, require and verify-full"
+  )
+  assertEq(
+    refusal("postgres://h?sslmode=allow"),
+    "sslmode `allow` is not one of disable, prefer, require and verify-full"
+  )
+  assertEq(refusal("postgres://h?connect_timeout=soon"), "connect_timeout `soon` is not a whole number of seconds")
+  assertEq(refusal("postgres://h?statement_cache_size=-1"), "statement_cache_size is negative")
+  assertEq(refusal("postgres://h?statement_cache_size=many"), "statement_cache_size `many` is not a whole number")
+  assertEq(refusal("postgres://h?sslmod=require"), "the option `sslmod` is not one this client knows")
+  // A malformed percent-escape, or escapes that are not UTF-8, are not a URL at all.
+  assertEq(refusal("postgres://u%ZZ@h"), "not a URL: malformed percent-escape at index 12")
+  assertEq(refusal("postgres://h/caf%C3"), "not a URL: percent-escapes not UTF-8 at index 16")
+  assert(refusal("postgres://h:99999999/d").startsWith("not a URL"))
+  Ok(())

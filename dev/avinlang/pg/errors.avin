@@ -66,7 +66,6 @@ impl PgError
     Server(d) -> Some(d.code)
     _ -> None
 
-
 impl Error for PgError
   // A sentence saying what went wrong, for a log; it never holds a password.
   message -> string = self match

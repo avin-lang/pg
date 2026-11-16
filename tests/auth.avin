@@ -9,7 +9,7 @@ import dev.avinlang.pg.{Auth, Connection, PgConfig, PgError}
 
 // Settings for the test server as `user`, with `password`.
 private settingsFor(user: string, password: Option[string]) -> Option[Result[PgConfig, PgError]] =
-  testUrl().map(u -> PgConfig.parse(u).map(c -> c with { user = user, password = password }))
+  testUrl().map(u -> PgConfig.parse(u).map(c -> c with {user = user, password = password}))
 
 // Connects as `user` and answers who the server says is connected.
 private whoAmI(user: string, password: Option[string]) -> Option[Result[string, PgError]] = settingsFor(user, password).map(r ->
@@ -96,7 +96,7 @@ noDatabase()
   val config = settingsFor("pgtest", Some("pgtest")) match
     Some(r) -> r.ok.get
     None -> return
-  val r = pg.connect(config with { database = Some("no_such_database") })
+  val r = pg.connect(config with {database = Some("no_such_database")})
   assertEq(r.err.flatMap(e -> e.code), Some("3D000"))
 
 @test("nothing listening is an Io error")

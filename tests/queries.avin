@@ -7,14 +7,19 @@ module tests
 import avin.threads.Channel
 import avin.time.{Instant, millis}
 import dev.avinlang.pg
-import dev.avinlang.pg.{BadColumn, Closed, Connection, Diagnostic, FromRow, PgColumn, PgConfig, PgError, QueryResult, Server}
+
+import dev.avinlang.pg.{
+  BadColumn, Closed, Connection, Diagnostic, FromRow, PgColumn, PgConfig, PgError, QueryResult, Server
+}
 
 @test("the simple protocol: several statements, their tags and rows, all in text")
 simpleProtocol() -> Result[unit, PgError]
   val c = testConnection() match
     Some(r) -> r?
     None -> return Ok(())
-  val results = c.simpleQuery("create temp table t (id int, name text); insert into t values (1, 'a'), (2, null); select * from t order by id; update t set name = 'b'")?
+  val results = c.simpleQuery(
+    "create temp table t (id int, name text); insert into t values (1, 'a'), (2, null); select * from t order by id; update t set name = 'b'"
+  )?
   assertEq(results.map(r -> r.tag), ["CREATE TABLE", "INSERT 0 2", "SELECT 2", "UPDATE 2"])
   assertEq(results.map(r -> r.affected), [long(0), long(2), long(2), long(2)])
   val rows = results(2).rows
@@ -44,7 +49,16 @@ extendedProtocol() -> Result[unit, PgError]
     Some(r) -> r?
     None -> return Ok(())
   assertEq(c.execute("create temp table items (id serial primary key, name text not null, price numeric)"), Ok(long(0)))
-  assertEq(c.execute("insert into items (name, price) values ($1, $2), ($3, $4)", "pen", BigDecimal("1.25"), "ink", BigDecimal("9")), Ok(long(2)))
+  assertEq(
+    c.execute(
+      "insert into items (name, price) values ($1, $2), ($3, $4)",
+      "pen",
+      BigDecimal("1.25"),
+      "ink",
+      BigDecimal("9")
+    ),
+    Ok(long(2))
+  )
   assertEq(c.execute("update items set price = price * 2 where name = $1", "pen"), Ok(long(1)))
   assertEq(c.execute("update items set price = 0 where name = $1", "nothing"), Ok(long(0)))
   val rows = c.query("select name, price from items where price > $1 order by name", BigDecimal("1"))?
@@ -52,10 +66,16 @@ extendedProtocol() -> Result[unit, PgError]
   assertEq(rows(1).get[BigDecimal]("price"), Ok(BigDecimal("2.50")))
   assertEq(c.queryOne("select name from items where id = $1", 99)?, None)
   assertEq(c.queryValue[long]("select count(*) from items"), Ok(long(2)))
-  assertEq(c.queryValue[long]("select 1 where false").err.map(e -> e.toString()), Some("cannot read column `#0`: the statement returned no rows"))
+  assertEq(
+    c.queryValue[long]("select 1 where false").err.map(e -> e.toString()),
+    Some("cannot read column `#0`: the statement returned no rows")
+  )
   assertEq(c.execute("delete from items"), Ok(long(2)))
   // A statement's parameters must all be given.
-  assertEq(c.query("select $1::int, $2::int", 1).err.map(e -> e.toString()), Some("bad connection settings: the statement has 2 parameters and 1 were given"))
+  assertEq(
+    c.query("select $1::int, $2::int", 1).err.map(e -> e.toString()),
+    Some("bad connection settings: the statement has 2 parameters and 1 were given")
+  )
   c.close()
 
 @test("statements are prepared once and run again from the cache")
@@ -159,7 +179,10 @@ uniqueViolation() -> Result[unit, PgError]
       assert(d.file.isDefined && d.line.isDefined && d.routine.isDefined)
     _ -> fail(s"expected the server's error, found $e")
   assertEq(e.code, Some("23505"))
-  assertEq(e.toString(), "the server answered ERROR 23505: duplicate key value violates unique constraint \"people_email_key\"")
+  assertEq(
+    e.toString(),
+    "the server answered ERROR 23505: duplicate key value violates unique constraint \"people_email_key\""
+  )
   // The connection is ready for the next statement.
   assertEq(c.queryValue[long]("select count(*) from people"), Ok(long(1)))
   c.close()
@@ -195,7 +218,7 @@ notices() -> Result[unit, PgError]
     Some(u) -> u
     None -> return Ok(())
   val seen = Channel[Diagnostic]()
-  val config = PgConfig.parse(url)? with { notices = Some(d -> seen.send(d)) }
+  val config = PgConfig.parse(url)? with {notices = Some(d -> seen.send(d))}
   val c = pg.connect(config)?
   c.simpleQuery("do $$ begin raise notice 'hello %', 42; raise warning 'careful'; end $$")?
   val first = seen.receive(millis(1000)).get
@@ -219,16 +242,27 @@ derivedRows() -> Result[unit, PgError]
   val c = testConnection() match
     Some(r) -> r?
     None -> return Ok(())
-  val items = c.queryAs[Item]("select 2 as id, 'ink' as name, null::numeric as price union all select 1, 'pen', 1.5 order by id")?
+  val items = c.queryAs[Item](
+    "select 2 as id, 'ink' as name, null::numeric as price union all select 1, 'pen', 1.5 order by id"
+  )?
   assertEq(items, [Item(1, "pen", Some(BigDecimal("1.5"))), Item(2, "ink", None)])
   // Columns may come in any order, and extra ones are left alone.
-  assertEq(c.queryAs[Item]("select 'x' as extra, 9.99 as price, 'cap' as name, 3 as id")?, [Item(3, "cap", Some(BigDecimal("9.99")))])
+  assertEq(
+    c.queryAs[Item]("select 'x' as extra, 9.99 as price, 'cap' as name, 3 as id")?,
+    [Item(3, "cap", Some(BigDecimal("9.99")))]
+  )
   val stamp = c.queryOne("select 'epoch'::timestamptz as created_at")?.get.decode[Stamp]()
   assertEq(stamp.map(s -> (s.created.epochMicros, s.label)), Ok((long(0), "none")))
   assertEq(c.queryAs[Stamp]("select 'epoch'::timestamptz as created_at, 'set' as label")?(0).label, "set")
   // A column absent, or of the wrong type, is a Column error naming it.
-  assertEq(c.queryAs[Item]("select 1 as id, 'x' as name").err, Some(BadColumn("price", "the result has no such column")))
-  assertEq(c.queryAs[Item]("select 'one' as id, 'x' as name, 1.0 as price").err, Some(BadColumn("id", "it holds text (text), which is not the type asked for")))
+  assertEq(
+    c.queryAs[Item]("select 1 as id, 'x' as name").err,
+    Some(BadColumn("price", "the result has no such column"))
+  )
+  assertEq(
+    c.queryAs[Item]("select 'one' as id, 'x' as name, 1.0 as price").err,
+    Some(BadColumn("id", "it holds text (text), which is not the type asked for"))
+  )
   assertEq(c.queryAs[Stamp]("select 1 as created").err, Some(BadColumn("created_at", "the result has no such column")))
   c.close()
 

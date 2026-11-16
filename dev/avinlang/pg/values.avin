@@ -290,7 +290,9 @@ private textValue(oid: int, text: string) -> Option[PgValue] = oid match
 // parser reads `+05:00` and `+05:30`.
 private fullOffset(text: string) -> string
   val n = text.byteLength
-  if n >= 3 && (text.byteAt(n - 3) == byte(int('+')) || text.byteAt(n - 3) == byte(int('-'))) then text + ":00" else text
+  if n >= 3 && (
+    text.byteAt(n - 3) == byte(int('+')) || text.byteAt(n - 3) == byte(int('-'))
+  ) then text + ":00" else text
 
 private realOfText(text: string) -> Option[real]
 realOfText("NaN") = Some(real.NaN)
@@ -420,7 +422,9 @@ private textOf(v: PgValue) -> Result[string, string] = v match
   PgUuid(u) -> Ok(u.toString())
   PgDate(d) -> Ok(if d == Date.Max then "infinity" elif d == Date.Min then "-infinity" else d.toString())
   PgTime(t) -> Ok(t.toString())
-  PgTimestamp(t) -> Ok(if t == DateTime.Max then "infinity" elif t == DateTime.Min then "-infinity" else s"${t.date} ${t.time}")
+  PgTimestamp(t) -> Ok(
+    if t == DateTime.Max then "infinity" elif t == DateTime.Min then "-infinity" else s"${t.date} ${t.time}"
+  )
   PgTimestamptz(t) -> Ok(if t == Instant.Max then "infinity" elif t == Instant.Min then "-infinity" else t.toString())
   PgJson(j) -> Ok(j.render)
   PgArray(_, items) -> arrayText(items)

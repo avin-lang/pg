@@ -8,13 +8,19 @@ import avin.time.{Date, DateTime, Instant, date, dateTime, epochMicros, time, Ti
 import avin.uuid.Uuid
 import dev.avinlang.json.Json
 import dev.avinlang.pg
-import dev.avinlang.pg.{Connection, FromPg, PgArray, PgError, PgInt, PgJson, PgNull, PgOther, PgText, PgValue, ToPg, Typed}
+
+import dev.avinlang.pg.{
+  Connection, FromPg, PgArray, PgError, PgInt, PgJson, PgNull, PgOther, PgText, PgValue, ToPg, Typed
+}
 
 // `v` sent as a parameter and selected back, read as the same type.
 private echo[T: FromPg & ToPg](c: Connection, v: T) -> Result[T, PgError] = c.queryValue[T]("select $1", v)
 
 // The same through an explicit `Typed`, the value and type `v` gives.
-private echoTyped[T: FromPg & ToPg](c: Connection, v: T) -> Result[T, PgError] = c.queryValue[T]("select $1", Typed(v.pgOid, v.toPg))
+private echoTyped[T: FromPg & ToPg](c: Connection, v: T) -> Result[T, PgError] = c.queryValue[T](
+  "select $1",
+  Typed(v.pgOid, v.toPg)
+)
 
 @test("a generic function binds a primitive parameter as it is")
 genericPrimitiveParameter() -> Result[unit, PgError]
@@ -167,7 +173,16 @@ times() -> Result[unit, PgError]
   val c = testConnection() match
     Some(r) -> r?
     None -> return Ok(())
-  for d in [date(2000, 1, 1), date(1970, 1, 1), date(1969, 12, 31), date(2024, 2, 29), date(1, 1, 1), date(9999, 12, 31), Date.Max, Date.Min]
+  for d in [
+    date(2000, 1, 1),
+    date(1970, 1, 1),
+    date(1969, 12, 31),
+    date(2024, 2, 29),
+    date(1, 1, 1),
+    date(9999, 12, 31),
+    Date.Max,
+    Date.Min
+  ]
     assertEq(echo(c, d), Ok(d))
   assertEq(textOf[Date](c, "'2024-02-29'::date"), Ok(date(2024, 2, 29)))
   assertEq(textOf[Date](c, "'infinity'::date"), Ok(Date.Max))
@@ -178,14 +193,30 @@ times() -> Result[unit, PgError]
   // 24:00:00 is a time the server has and a `Time` does not: it arrives as text.
   assertEq(binaryOf[string](c, "'24:00:00'::time"), Ok("24:00:00"))
   val reading = dateTime(date(1999, 12, 31), time(23, 59, 59, 999999))
-  for t in [reading, dateTime(date(2000, 1, 1), time(0, 0)), dateTime(date(1900, 6, 1), time(1, 2, 3, 4)), DateTime.Max, DateTime.Min]
+  for t in [
+    reading,
+    dateTime(date(2000, 1, 1), time(0, 0)),
+    dateTime(date(1900, 6, 1), time(1, 2, 3, 4)),
+    DateTime.Max,
+    DateTime.Min
+  ]
     assertEq(echo(c, t), Ok(t))
   assertEq(textOf[DateTime](c, "'1999-12-31 23:59:59.999999'::timestamp"), Ok(reading))
   assertEq(textOf[DateTime](c, "'-infinity'::timestamp"), Ok(DateTime.Min))
-  for i in [epochMicros(0), epochMicros(946684800000000), epochMicros(-1), epochMicros(1700000000123456), Instant.Max, Instant.Min]
+  for i in [
+    epochMicros(0),
+    epochMicros(946684800000000),
+    epochMicros(-1),
+    epochMicros(1700000000123456),
+    Instant.Max,
+    Instant.Min
+  ]
     assertEq(echo(c, i), Ok(i))
   assertEq(textOf[Instant](c, "'2001-02-03 04:05:06.7+00'::timestamptz"), Ok(epochMicros(981173106700000)))
-  assertEq(textOf[Instant](c, "'2001-02-03 04:05:06+05:30'::timestamptz"), Ok(epochMicros(981173106000000 - 19800000000)))
+  assertEq(
+    textOf[Instant](c, "'2001-02-03 04:05:06+05:30'::timestamptz"),
+    Ok(epochMicros(981173106000000 - 19800000000))
+  )
   assertEq(textOf[Instant](c, "'infinity'::timestamptz"), Ok(Instant.Max))
   // The session's zone is UTC, whatever the server's own.
   assertEq(c.parameter("TimeZone"), Some("UTC"))
@@ -196,9 +227,19 @@ jsons() -> Result[unit, PgError]
   val c = testConnection() match
     Some(r) -> r?
     None -> return Ok(())
-  val doc = Json.obj(("name", Json.str("Zoë 😀")), ("n", Json.num(42)), ("tags", Json.arr(Json.str("a"), Json.Null)), ("ok", Json.Bool(true)))
+  val doc = Json.obj(
+    ("name", Json.str("Zoë 😀")),
+    ("n", Json.num(42)),
+    ("tags", Json.arr(Json.str("a"), Json.Null)),
+    ("ok", Json.Bool(true))
+  )
   // jsonb keeps an object's keys in an order of its own, the shorter first; json keeps the text.
-  val ordered = Json.obj(("n", Json.num(42)), ("ok", Json.Bool(true)), ("name", Json.str("Zoë 😀")), ("tags", Json.arr(Json.str("a"), Json.Null)))
+  val ordered = Json.obj(
+    ("n", Json.num(42)),
+    ("ok", Json.Bool(true)),
+    ("name", Json.str("Zoë 😀")),
+    ("tags", Json.arr(Json.str("a"), Json.Null))
+  )
   assertEq(echo(c, doc), Ok(ordered))
   // A `Json` goes as jsonb, so a json column receives jsonb's order; sent typed as json it keeps its own.
   assertEq(c.queryValue[Json]("select $1::json", doc), Ok(ordered))
@@ -220,7 +261,10 @@ arrays() -> Result[unit, PgError]
   assertEq(echo(c, [true, false]), Ok([true, false]))
   assertEq(echo(c, [1.5, real.NegativeInfinity]), Ok([1.5, real.NegativeInfinity]))
   assertEq(echo(c, [BigDecimal("1.10"), BigDecimal("-2")]), Ok([BigDecimal("1.10"), BigDecimal("-2")]))
-  assertEq(c.queryValue[Vector[string]]("select $1::text[]", ["a", "b c", "", "NULL", "x,y", "q\"\\", "日本"]), Ok(["a", "b c", "", "NULL", "x,y", "q\"\\", "日本"]))
+  assertEq(
+    c.queryValue[Vector[string]]("select $1::text[]", ["a", "b c", "", "NULL", "x,y", "q\"\\", "日本"]),
+    Ok(["a", "b c", "", "NULL", "x,y", "q\"\\", "日本"])
+  )
   assertEq(echo(c, [Uuid.Nil]), Ok([Uuid.Nil]))
   assertEq(echo(c, [date(2020, 1, 2)]), Ok([date(2020, 1, 2)]))
   assertEq(echo(c, [time(1, 2, 3)]), Ok([time(1, 2, 3)]))
@@ -233,7 +277,10 @@ arrays() -> Result[unit, PgError]
   // Two dimensions read as vectors of vectors, in both protocols.
   assertEq(binaryOf[Vector[Vector[int]]](c, "'{{1,2},{3,4}}'::int[]"), Ok([[1, 2], [3, 4]]))
   assertEq(textOf[Vector[Vector[int]]](c, "'{{1,2},{3,4}}'::int[]"), Ok([[1, 2], [3, 4]]))
-  assertEq(textOf[Vector[Option[string]]](c, "array['a b', null, 'c\"d', '']"), Ok([Some("a b"), None, Some("c\"d"), Some("")]))
+  assertEq(
+    textOf[Vector[Option[string]]](c, "array['a b', null, 'c\"d', '']"),
+    Ok([Some("a b"), None, Some("c\"d"), Some("")])
+  )
   assertEq(textOf[Vector[int]](c, "'[0:1]={5,6}'::int[]"), Ok([5, 6]))
   assertEq(binaryOf[Vector[BigDecimal]](c, "array[1.5, null]::numeric[]").isErr, true)
   assertEq(binaryOf[Vector[Option[BigDecimal]]](c, "array[1.5, null]::numeric[]"), Ok([Some(BigDecimal("1.5")), None]))
@@ -253,7 +300,10 @@ nulls() -> Result[unit, PgError]
   val none: Option[int] = None
   assertEq(echo(c, none), Ok(None))
   assertEq(c.queryValue[Option[int]]("select $1::int", none), Ok(None))
-  assertEq(c.queryValue[int]("select null::int").err.map(e -> e.toString()), Some("cannot read column `int4`: it is NULL; read it as an Option"))
+  assertEq(
+    c.queryValue[int]("select null::int").err.map(e -> e.toString()),
+    Some("cannot read column `int4`: it is NULL; read it as an Option")
+  )
   assertEq(textOf[Option[long]](c, "null::bigint"), Ok(None))
   c.close()
 
@@ -263,8 +313,14 @@ wrongType() -> Result[unit, PgError]
     Some(r) -> r?
     None -> return Ok(())
   val row = c.queryOne("select 1 as n, 'x' as s")?.get
-  assertEq(row.get[string]("n").err.map(e -> e.toString()), Some("cannot read column `n`: it holds an integer (integer), which is not the type asked for"))
-  assertEq(row.get[int]("missing").err.map(e -> e.toString()), Some("cannot read column `missing`: the result has no such column"))
+  assertEq(
+    row.get[string]("n").err.map(e -> e.toString()),
+    Some("cannot read column `n`: it holds an integer (integer), which is not the type asked for")
+  )
+  assertEq(
+    row.get[int]("missing").err.map(e -> e.toString()),
+    Some("cannot read column `missing`: the result has no such column")
+  )
   assertEq(row.get[int](2).err.map(e -> e.toString()), Some("cannot read column `#2`: the row has 2 columns"))
   assertEq(row.get[int](0), Ok(1))
   assertEq(row.get[PgValue](0), Ok(PgInt(1)))

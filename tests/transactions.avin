@@ -14,7 +14,9 @@ private withTable(name: string) -> Option[Result[Connection, PgError]] = testCon
   c.simpleQuery(s"drop table if exists $name; create table $name (n int)")?
   Ok(c))
 
-private countIn(c: Connection, table: string) -> Result[long, PgError] = c.queryValue[long](s"select count(*) from $table")
+private countIn(c: Connection, table: string) -> Result[long, PgError] = c.queryValue[long](
+  s"select count(*) from $table"
+)
 
 @test("a transaction whose body answers Ok is committed, seen by another connection")
 commits() -> Result[unit, PgError]

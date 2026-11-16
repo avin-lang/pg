@@ -36,7 +36,9 @@ private class Scram(private val password: string)
         salt = fromBase64(part.slice(2, part.byteLength)).mapErr(_ -> Auth("the server's SCRAM salt is not base64"))?
       elif part.startsWith("i=")
         iterations = part.slice(2, part.byteLength).toIntOption().getOrElse(0)
-    if !combined.startsWith(nonce) || combined.byteLength <= nonce.byteLength then return Err(Auth("the server's SCRAM nonce does not extend this client's"))
+    if !combined.startsWith(nonce) || combined.byteLength <= nonce.byteLength then return Err(
+      Auth("the server's SCRAM nonce does not extend this client's")
+    )
     if iterations < 1 then return Err(Auth("the server's SCRAM iteration count is not a positive number"))
     if salt.isEmpty then return Err(Auth("the server sent no SCRAM salt"))
     // A password SASLprep refuses is used as it is, as the server does when it stores one.
@@ -53,8 +55,14 @@ private class Scram(private val password: string)
 
   // Checks the server's final message, `v=<signature>`, which proves it knows the password.
   verify(serverFinal: string) -> Result[unit, PgError]
-    if serverFinal.startsWith("e=") then return Err(Auth(s"the server refused the SCRAM exchange: ${serverFinal.slice(2, serverFinal.byteLength)}"))
+    if serverFinal.startsWith("e=") then return Err(
+      Auth(s"the server refused the SCRAM exchange: ${serverFinal.slice(2, serverFinal.byteLength)}")
+    )
     if !serverFinal.startsWith("v=") then return Err(Auth("the server's final SCRAM message has no signature"))
-    val sent = fromBase64(serverFinal.slice(2, serverFinal.byteLength).takeWhile(c -> c != ',')).mapErr(_ -> Auth("the server's SCRAM signature is not base64"))?
-    if serverSignature.isEmpty || !constantTimeEquals(sent, serverSignature) then return Err(Auth("the server's SCRAM signature is wrong: it does not know the password"))
+    val sent = fromBase64(
+      serverFinal.slice(2, serverFinal.byteLength).takeWhile(c -> c != ',')
+    ).mapErr(_ -> Auth("the server's SCRAM signature is not base64"))?
+    if serverSignature.isEmpty || !constantTimeEquals(sent, serverSignature) then return Err(
+      Auth("the server's SCRAM signature is wrong: it does not know the password")
+    )
     Ok(())

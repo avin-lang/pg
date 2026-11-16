@@ -1,0 +1,98 @@
+module tests
+
+// The README's examples, against the test server: a count with a parameter, rows read by column and
+// into a derived type, a unique violation's SQLSTATE, a transfer in a transaction, a pool, and a
+// statement cancelled by a timeout.
+
+import avin.threads.withTimeout
+import avin.time.seconds
+import dev.avinlang.pg
+import dev.avinlang.pg.{Connection, PgColumn, PgConfig, PgError, PgPool, FromRow}
+
+data ReadmeItem(id: int, @PgColumn("name") label: string, price: Option[BigDecimal] = None) derives FromRow
+
+@test("the README's first example: a count with a parameter")
+readmeCount() -> Result[unit, PgError]
+  val db = testConnection() match
+    Some(r) -> r?
+    None -> return Ok(())
+  val n = db.queryValue[long](
+    "select count(*) from (values (50), (150), (300)) as orders(total) where total > $1",
+    100
+  )?
+  assertEq(s"$n large orders", "2 large orders")
+  db.close()
+
+@test("the README's queries: parameters, NULL, rows read by column and into a derived type")
+readmeQueries() -> Result[unit, PgError]
+  val db = testConnection() match
+    Some(r) -> r?
+    None -> return Ok(())
+  db.execute("create temporary table items (id int primary key, name text, price numeric)")?
+  db.execute(
+      "insert into items values ($1, $2, $3), ($4, $5, $6)",
+      1,
+      "pen",
+      BigDecimal("1.50"),
+      2,
+      "ink",
+      None: Option[BigDecimal]
+  )?
+  var lines: Vector[string] = []
+  for row in db.query("select id, name, price from items order by id")?
+    val name = row.get[string]("name")?
+    val price = row.get[Option[BigDecimal]]("price")?
+    lines = lines :+ s"$name: $price"
+  assertEq(lines, ["pen: Some(1.50)", "ink: None"])
+  val items = db.queryAs[ReadmeItem]("select id, name from items order by id")?
+  assertEq(items, [ReadmeItem(1, "pen"), ReadmeItem(2, "ink")])
+  db.close()
+
+@test("the README's error example: a unique violation's SQLSTATE")
+readmeErrors() -> Result[unit, PgError]
+  val db = testConnection() match
+    Some(r) -> r?
+    None -> return Ok(())
+  db.execute("create temporary table users (email text unique)")?
+  db.execute("insert into users values ($1)", "ada@example.com")?
+  var said = ""
+  db.execute("insert into users values ($1)", "ada@example.com") match
+    Err(e) -> if e.code == Some("23505") then said = "already registered"
+    Ok(_) -> ()
+  assertEq(said, "already registered")
+  db.close()
+
+@test("the README's transaction: a transfer committed")
+readmeTransaction() -> Result[unit, PgError]
+  val db = testConnection() match
+    Some(r) -> r?
+    None -> return Ok(())
+  db.execute("create temporary table accounts (id int, balance int)")?
+  db.execute("insert into accounts values (1, 100), (2, 0)")?
+  db.transaction(tx ->
+    tx.execute("update accounts set balance = balance - $1 where id = $2", 30, 1)?
+    tx.execute("update accounts set balance = balance + $1 where id = $2", 30, 2)?
+    Ok(()))?
+  assertEq(db.query("select balance from accounts order by id")?.map(r -> r.get[int](0)), [Ok(70), Ok(30)])
+  db.close()
+
+@test("the README's pool: names read on a pooled connection")
+readmePool() -> Result[unit, PgError]
+  val url = testUrl() match
+    Some(u) -> u
+    None -> return Ok(())
+  val pool = PgPool.open(url, maxSize = 8)?
+  val names = pool.use(c -> c.query("select name from (values ('ada'), ('grace')) as customers(name)"))?
+  assertEq(names.map(r -> r.get[string]("name")), [Ok("ada"), Ok("grace")])
+  pool.close()
+  Ok(())
+
+@test("the README's cancellation: a statement past its time is cancelled")
+readmeCancel() -> Result[unit, PgError]
+  val db = testConnection() match
+    Some(r) -> r?
+    None -> return Ok(())
+  val r = withTimeout(seconds(2), _ -> db.query("select pg_sleep(60)"))
+  assert(r.isEmpty)
+  assertEq(db.queryValue[int]("select 1"), Ok(1))
+  db.close()

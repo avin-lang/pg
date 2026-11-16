@@ -1,0 +1,255 @@
+module tests
+
+// The protocol against a scripted server: a listener on a free port that reads what the client sends
+// and answers with bytes written here, so the answers a real server never gives can be tried, and
+// what the client makes of each checked.
+
+import avin.net.{TcpListener, TcpStream}
+import avin.threads.{Channel, scope}
+import avin.time.millis
+import dev.avinlang.pg
+import dev.avinlang.pg.{Auth, Connection, PgConfig, PgError, Protocol, Server, SslMode, TlsRefused}
+
+// One step of a scripted server.
+data Step
+  // Reads a message with no type byte: the startup message, an SSLRequest or a CancelRequest.
+  ReadUntyped
+  // Reads one message with a type byte.
+  ReadTyped
+  // Writes these bytes.
+  Send(bytes: Vector[byte])
+  // Closes the connection at once.
+  HangUp
+
+private int32(n: int) -> Vector[byte] = [
+  byte((n >> 24) & 0xff),
+  byte((n >> 16) & 0xff),
+  byte((n >> 8) & 0xff),
+  byte(n & 0xff)
+]
+
+private cstr(s: string) -> Vector[byte] = s.bytes :+ byte(0)
+
+// A message of type `kind` with `body`.
+private msg(kind: char, body: Vector[byte]) -> Vector[byte] = [byte(int(kind))] ++ int32(body.length + 4) ++ body
+
+private val authOk = msg('R', int32(0))
+private val keyData = msg('K', int32(42) ++ int32(7))
+private val ready = msg('Z', [byte(int('I'))])
+private val started = authOk ++ msg('S', cstr("server_version") ++ cstr("16.0")) ++ keyData ++ ready
+
+// Reads exactly `n` bytes, or `None` where the client closed first.
+private readExactly(s: TcpStream, n: int) -> Option[Vector[byte]]
+  var got: Vector[byte] = []
+  while got.length < n
+    val chunk = s.read(n - got.length) match
+      Ok(c) -> c
+      Err(_) -> return None
+    if chunk.length == 0 then return None
+    got = got ++ chunk.toVector
+  Some(got)
+
+private lengthOf(b: Vector[byte]) -> int = (int(b(0)) << 24) | (int(b(1)) << 16) | (int(b(2)) << 8) | int(b(3))
+
+// Runs `steps` against the one client that connects, then waits for the client to hang up.
+private serve(listener: TcpListener, steps: Vector[Step])
+  val s = listener.accept() match
+    Ok(s) -> s
+    Err(_) -> return
+  _ = s.setTimeout(millis(5000))
+  for step in steps
+    step match
+      ReadUntyped ->
+        val head = readExactly(s, 4) match
+          Some(h) -> h
+          None -> return
+        if readExactly(s, lengthOf(head) - 4).isEmpty then return
+      ReadTyped ->
+        val head = readExactly(s, 5) match
+          Some(h) -> h
+          None -> return
+        if readExactly(s, lengthOf(head.drop(1)) - 4).isEmpty then return
+      Send(bytes) -> if s.write(bytes.toArray()).isErr then return
+      HangUp ->
+        _ = s.close()
+        return
+  // What the client sends after the script, Terminate among it, until it closes.
+  while true
+    s.read(4096) match
+      Ok(c) -> if c.length == 0 then break
+      Err(_) -> break
+  _ = s.close()
+
+// Runs `body` with the port of a server following `steps`.
+private withServer[T](steps: Vector[Step], body: (int) -> T) -> T
+  val ports = Channel[int](1)
+  scope(sc ->
+    sc.spawn(() ->
+      TcpListener.bind("127.0.0.1", 0) match
+        Ok(l) ->
+          ports.send(l.port())
+          serve(l, steps)
+          _ = l.close()
+        Err(_) -> ports.send(0))
+    body(ports.receive().get))
+
+private config(port: int, sslMode: SslMode = SslMode.Disable) -> PgConfig =
+  PgConfig(
+    host = "127.0.0.1",
+    port = port,
+    user = "fake",
+    password = Some("secret"),
+    sslMode = sslMode,
+    connectTimeout = Some(millis(5000))
+  )
+
+// Connects to a server following `steps` and answers what `connect` answered, or, for a connection
+// made, what `use` answers; the connection is closed after.
+private connectTo(
+    steps: Vector[Step],
+    sslMode: SslMode = SslMode.Disable,
+    use: (Connection) -> Result[unit, PgError] = _ -> Ok(())
+) -> Result[unit, PgError] =
+  withServer(steps, port -> pg.connect(config(port, sslMode)).flatMap(c ->
+    val r = use(c)
+    _ = c.close()
+    r))
+
+private authError(r: Result[unit, PgError]) -> string = r match
+  Err(Auth(reason)) -> reason
+  _ -> "not an Auth error"
+
+private protocolError(r: Result[unit, PgError]) -> string = r match
+  Err(Protocol(reason)) -> reason
+  _ -> "not a Protocol error"
+
+@test("a scripted startup: the parameters the server sends are kept, and its backend key")
+startup() -> Result[unit, PgError]
+  connectTo([ReadUntyped, Send(started)], use = c ->
+    assertEq(c.backendPid, 42)
+    assertEq(c.parameter("server_version"), Some("16.0"))
+    assertEq(c.parameter("nothing"), None)
+    assert(!c.isTls)
+    assert(!c.inTransaction)
+    Ok(()))
+
+@test("a simple query answered by the script: tags in order, an empty query, a notice and a parameter on the way")
+scriptedQuery() -> Result[unit, PgError]
+  val answer = msg(
+    'N',
+    cstr("SNOTICE") ++ cstr("C00000") ++ cstr("Mhi") ++ [byte(0)]
+  ) ++ msg('C', cstr("DO")) ++ msg('I', []) ++
+    msg('S', cstr("TimeZone") ++ cstr("Europe/Paris")) ++ msg('C', cstr("SELECT 0")) ++ ready
+  connectTo([ReadUntyped, Send(started), ReadTyped, Send(answer)], use = c ->
+    val results = c.simpleQuery("do; ; select")?
+    assertEq(results.map(r -> r.tag), ["DO", "SELECT 0"])
+    assertEq(c.parameter("TimeZone"), Some("Europe/Paris"))
+    Ok(()))
+
+@test("an authentication method the client does not speak is an Auth error naming it")
+unknownMethod() -> Result[unit, PgError]
+  assert(authError(connectTo([ReadUntyped, Send(msg('R', int32(7)))])).contains("method 7"))
+  Ok(())
+
+@test("SASL without SCRAM-SHA-256 among its mechanisms is an Auth error naming what is offered")
+otherMechanism() -> Result[unit, PgError]
+  val offer = msg('R', int32(10) ++ cstr("SCRAM-SHA-1") ++ [byte(0)])
+  assert(authError(connectTo([ReadUntyped, Send(offer)])).contains("SCRAM-SHA-1"))
+  Ok(())
+
+@test("a server that accepts SCRAM without proving it knows the password is refused")
+unprovenScram() -> Result[unit, PgError]
+  val offer = msg('R', int32(10) ++ cstr("SCRAM-SHA-256") ++ [byte(0)])
+  val r = connectTo([ReadUntyped, Send(offer), ReadTyped, Send(started)])
+  assertEq(authError(r), "the server accepted the password without proving it knows it")
+  Ok(())
+
+@test("a SCRAM server-first whose nonce does not extend the client's, or with no salt or iterations, is refused")
+badServerFirst() -> Result[unit, PgError]
+  val offer = msg('R', int32(10) ++ cstr("SCRAM-SHA-256") ++ [byte(0)])
+  val wrongNonce = msg('R', int32(11) ++ "r=someoneelse,s=c2FsdA==,i=4096".bytes)
+  assertEq(
+    authError(connectTo([ReadUntyped, Send(offer), ReadTyped, Send(wrongNonce)])),
+    "the server's SCRAM nonce does not extend this client's"
+  )
+  Ok(())
+
+@test("SASLContinue or SASLFinal before SASL began breaks the protocol")
+saslOutOfOrder() -> Result[unit, PgError]
+  assertEq(
+    protocolError(connectTo([ReadUntyped, Send(msg('R', int32(11) ++ "r=x".bytes))])),
+    "SASLContinue before SASL began"
+  )
+  assertEq(
+    protocolError(connectTo([ReadUntyped, Send(msg('R', int32(12) ++ "v=x".bytes))])),
+    "SASLFinal before SASL began"
+  )
+  Ok(())
+
+@test("a message startup does not allow, and a message with an impossible length, break the protocol")
+badStartupMessages() -> Result[unit, PgError]
+  assertEq(protocolError(connectTo([ReadUntyped, Send(msg('D', int32(0)))])), "unexpected message `D` during startup")
+  val tooShort = [byte(int('R')), byte(0), byte(0), byte(0), byte(2)]
+  assertEq(protocolError(connectTo([ReadUntyped, Send(tooShort)])), "a message of type `R` has length 2")
+  Ok(())
+
+@test("an ErrorResponse during startup is the server's error, its fields read")
+startupError() -> Result[unit, PgError]
+  val refusal = msg(
+    'E',
+    cstr("SFATAL") ++ cstr("VFATAL") ++ cstr("C28000") ++ cstr(
+      "Mno entry for fake"
+    ) ++ cstr("Htry another") ++ [byte(0)]
+  )
+  connectTo([ReadUntyped, Send(refusal)]) match
+    Err(Server(d)) ->
+      assertEq((d.severity, d.code, d.message, d.hint), ("FATAL", "28000", "no entry for fake", Some("try another")))
+    _ -> assert(false, "not a Server error")
+  Ok(())
+
+@test("a server that hangs up during startup is an Io error")
+hangUp() -> Result[unit, PgError]
+  assert(isIo(withServer([ReadUntyped, HangUp], port -> pg.connect(config(port)))))
+  // Part of a message, then nothing.
+  assert(
+    isIo(withServer([ReadUntyped, Send([byte(int('R')), byte(0), byte(0)]), HangUp], port -> pg.connect(config(port))))
+  )
+  // A query's answer cut off: the connection is broken.
+  connectTo([ReadUntyped, Send(started), ReadTyped, Send(msg('C', cstr("SELECT 0"))), HangUp], use = c ->
+    assert(c.simpleQuery("select").isErr)
+    assert(c.isBroken)
+    Ok(()))
+
+private isIo(r: Result[Connection, PgError]) -> bool = r match
+  Err(pg.Io(_)) -> true
+  _ -> false
+
+@test("a query answered out of order breaks the protocol and the connection")
+badQueryAnswers() -> Result[unit, PgError]
+  // A row before any row description.
+  connectTo([ReadUntyped, Send(started), ReadTyped, Send(msg('D', [byte(0), byte(1)] ++ int32(1) ++ "x".bytes) ++ ready)], use = c ->
+    assertEq(c.simpleQuery("select 'x'").err, Some(Protocol("a row of 1 values for 0 columns")))
+    assert(c.isBroken)
+    Ok(()))?
+  // A message no query is answered with.
+  connectTo([ReadUntyped, Send(started), ReadTyped, Send(msg('W', []) ++ ready)], use = c ->
+    assertEq(c.simpleQuery("select 1").err, Some(Protocol("unexpected message `W` answering a query")))
+    assert(c.isBroken)
+    assertEq(c.simpleQuery("select 1").err, Some(pg.Closed))
+    Ok(()))
+
+@test("the TLS request refused: Require fails with TlsRefused, Prefer goes on in plain TCP")
+tlsRefused() -> Result[unit, PgError]
+  assertEq(connectTo([ReadUntyped, Send(["N".bytes(0)])], sslMode = SslMode.Require), Err(TlsRefused))
+  connectTo([ReadUntyped, Send(["N".bytes(0)]), ReadUntyped, Send(started)], sslMode = SslMode.Prefer, use = c ->
+    assert(!c.isTls)
+    assertEq(c.backendPid, 42)
+    Ok(()))
+
+@test("the TLS request answered with neither S nor N breaks the protocol")
+tlsGarbled() -> Result[unit, PgError]
+  assertEq(
+    protocolError(connectTo([ReadUntyped, Send(["E".bytes(0)])], sslMode = SslMode.Require)),
+    "the server answered the TLS request with `E`"
+  )
+  Ok(())
