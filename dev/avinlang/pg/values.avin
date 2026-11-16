@@ -547,8 +547,9 @@ impl[T: FromPg] FromPg for Option[T]
 
 // A value that can be a statement's parameter: `toPg` is the value and `pgOid` its type, `0` to let
 // the server infer the type from the statement, as a `string` does, so a string can be given for a
-// parameter of any type the server reads from text.
-trait ToPg
+// parameter of any type the server reads from text. A parameter is `Sendable`, so a statement's
+// parameters can be handed to a pooled connection's thread.
+trait ToPg: Sendable
   toPg -> PgValue
   pgOid -> int
 

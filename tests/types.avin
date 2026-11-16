@@ -10,22 +10,24 @@ import dev.avinlang.json.Json
 import dev.avinlang.pg
 import dev.avinlang.pg.{Connection, FromPg, PgArray, PgError, PgInt, PgJson, PgNull, PgOther, PgText, PgValue, ToPg, Typed}
 
-// `v` sent as a parameter and selected back, read as the same type. It binds `Typed(v.pgOid,
-// v.toPg)`, what binding `v` itself binds, since a primitive `T` passed as a `ToPg` from a generic
-// function crashes (see `genericPrimitiveParameter`).
-private echo[T: FromPg & ToPg](c: Connection, v: T) -> Result[T, PgError] = c.queryValue[T]("select $1", Typed(v.pgOid, v.toPg))
+// `v` sent as a parameter and selected back, read as the same type.
+private echo[T: FromPg & ToPg](c: Connection, v: T) -> Result[T, PgError] = c.queryValue[T]("select $1", v)
 
-// The same, binding `v` as it is.
-private echoDirect[T: FromPg & ToPg](c: Connection, v: T) -> Result[T, PgError] = c.queryValue[T]("select $1", v)
+// The same through an explicit `Typed`, the value and type `v` gives.
+private echoTyped[T: FromPg & ToPg](c: Connection, v: T) -> Result[T, PgError] = c.queryValue[T]("select $1", Typed(v.pgOid, v.toPg))
 
-@test("a generic function binds a primitive parameter as it is", ignore: "avin 0.0.28 crashes (signal 11) when a generic function passes a primitive T as a trait object")
+@test("a generic function binds a primitive parameter as it is")
 genericPrimitiveParameter() -> Result[unit, PgError]
   val c = testConnection() match
     Some(r) -> r?
     None -> return Ok(())
-  assertEq(echoDirect(c, true), Ok(true))
-  assertEq(echoDirect(c, 7), Ok(7))
-  assertEq(echoDirect(c, 1.5), Ok(1.5))
+  assertEq(echo(c, true), Ok(true))
+  assertEq(echo(c, 7), Ok(7))
+  assertEq(echo(c, int.MinValue), Ok(int.MinValue))
+  assertEq(echo(c, long.MaxValue), Ok(long.MaxValue))
+  assertEq(echo(c, 1.5), Ok(1.5))
+  assertEq(echoTyped(c, 7), Ok(7))
+  assertEq(echoTyped(c, false), Ok(false))
   c.close()
 
 @test("a generic function binds a parameter of a class or data type as it is")
@@ -33,9 +35,9 @@ genericParameter() -> Result[unit, PgError]
   val c = testConnection() match
     Some(r) -> r?
     None -> return Ok(())
-  assertEq(echoDirect(c, "text"), Ok("text"))
-  assertEq(echoDirect(c, BigDecimal("2.5")), Ok(BigDecimal("2.5")))
-  assertEq(echoDirect(c, Some(4)), Ok(Some(4)))
+  assertEq(echo(c, "text"), Ok("text"))
+  assertEq(echo(c, BigDecimal("2.5")), Ok(BigDecimal("2.5")))
+  assertEq(echo(c, Some(4)), Ok(Some(4)))
   c.close()
 
 // The value of `expr` selected by the simple protocol, as text, read as `T`.

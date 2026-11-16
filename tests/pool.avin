@@ -1,0 +1,179 @@
+module tests
+
+// The connection pool: many threads sharing a few connections, a connection the server ends
+// replaced, one handed back inside a transaction rolled back, and the pool's own failures.
+
+import avin.threads.{scope, sleep}
+import avin.time.millis
+import dev.avinlang.pg
+import dev.avinlang.pg.{Config, Connection, PgError, PgPool, PoolClosed, PoolTimedOut, Server}
+
+// A pool on the test server, or `None` where the test is skipped.
+private testPool(maxSize: int, options: string = "sslmode=disable") -> Option[Result[PgPool, PgError]] =
+  testUrl(options).map(u -> PgPool.open(u, maxSize = maxSize, acquireTimeout = Some(millis(20000))))
+
+// The backend serving the pooled connection `db` lends next.
+private pidOf(db: PgPool) -> Result[int, PgError] = db.use(c -> Ok(c.backendPid))
+
+// `rounds` queries on connections from `db`, each checked, answering the backend each ran on.
+private roundsOf(db: PgPool, t: int, rounds: int) -> Result[Vector[int], PgError]
+  var pids: Vector[int] = []
+  for i in 0 ..< rounds
+    val (sum, pid) = db.use(c ->
+      val sum = c.queryValue[long]("select $1::int8 + $2::int8", t, i)?
+      Ok((sum, c.backendPid)))?
+    assertEq(sum, long(t + i))
+    pids = pids :+ pid
+  Ok(pids)
+
+@test("many threads share a small pool: every query answered, no more connections than its size")
+concurrentLoad() -> Result[unit, PgError]
+  val db = testPool(3) match
+    Some(r) -> r?
+    None -> return Ok(())
+  val threads = 24
+  val rounds = 10
+  val answers = scope(s ->
+    val started = (0 ..< threads).map(t -> s.spawn(() -> roundsOf(db, t, rounds)))
+    started.map(th -> th.join()))
+  var pids: Vector[int] = []
+  for a in answers
+    pids = pids ++ a?
+  assertEq(pids.length, threads * rounds)
+  assert(1 <= pids.distinct.length <= 3)
+  val stats = db.stats()
+  assert(stats.size <= 3)
+  assertEq((stats.lent, stats.waiting), (0, 0))
+  // Every connection came back idle and clean.
+  assertEq(stats.idle, stats.size)
+  db.close()
+  Ok(())
+
+@test("query, execute and transaction run on a pooled connection, parameters and all")
+pooledStatements() -> Result[unit, PgError]
+  val db = testPool(2) match
+    Some(r) -> r?
+    None -> return Ok(())
+  db.execute("drop table if exists pool_items")?
+  db.execute("create table pool_items (n int, label text)")?
+  assertEq(db.execute("insert into pool_items values ($1, $2), ($3, $4)", 1, "one", 2, None: Option[string]), Ok(long(2)))
+  val rows = db.query("select label from pool_items where n >= $1 order by n", 1)?
+  assertEq(rows.map(r -> r.get[Option[string]]("label")), [Ok(Some("one")), Ok(None)])
+  assertEq(db.transaction(c ->
+    c.execute("insert into pool_items values (3, 'three')")?
+    Ok("kept")), Ok("kept"))
+  assertEq(db.transaction[string](c ->
+    c.execute("insert into pool_items values (4, 'four')")?
+    Err(pg.Config("undone"))), Err(pg.Config("undone")))
+  assertEq(db.use(c -> c.queryValue[long]("select count(*) from pool_items")), Ok(long(3)))
+  // A statement the server refuses is its error, and the connection goes back to be lent again.
+  assertEq(db.query("select * from no_such_table").err.flatMap(e -> e.code), Some("42P01"))
+  assertEq(db.use(c -> c.queryValue[int]("select 1")), Ok(1))
+  db.execute("drop table pool_items")?
+  db.close()
+  Ok(())
+
+@test("a pooled connection the server ends while idle is replaced by a new one")
+terminatedIdle() -> Result[unit, PgError]
+  val db = testPool(1) match
+    Some(r) -> r?
+    None -> return Ok(())
+  val first = pidOf(db)?
+  val killer = testConnection().get?
+  assertEq(killer.queryValue[bool]("select pg_terminate_backend($1)", first), Ok(true))
+  killer.close()?
+  // The server's goodbye reaches the idle connection's socket, which validation then sees.
+  sleep(millis(200))
+  val second = pidOf(db)?
+  assert(second != first)
+  assertEq(db.use(c -> c.queryValue[int]("select 2")), Ok(2))
+  assertEq(db.stats().size, 1)
+  db.close()
+  Ok(())
+
+@test("a pooled connection the server ends while lent is let go, and the next use gets a new one")
+terminatedLent() -> Result[unit, PgError]
+  val db = testPool(1) match
+    Some(r) -> r?
+    None -> return Ok(())
+  val first = pidOf(db)?
+  val url = testUrl().get
+  val failed = db.use(c ->
+    val killer = pg.connect(url)?
+    killer.queryValue[bool]("select pg_terminate_backend($1)", c.backendPid)?
+    killer.close()?
+    c.queryValue[int]("select 1"))
+  assert(failed.isErr)
+  val second = pidOf(db)?
+  assert(second != first)
+  assertEq(db.stats().size, 1)
+  db.close()
+  Ok(())
+
+@test("a connection handed back inside a transaction is rolled back before it is lent again")
+returnedMidTransaction() -> Result[unit, PgError]
+  val db = testPool(1) match
+    Some(r) -> r?
+    None -> return Ok(())
+  db.execute("drop table if exists pool_dirty")?
+  db.execute("create table pool_dirty (n int)")?
+  val pid = db.use(c ->
+    c.simpleQuery("begin; insert into pool_dirty values (1)")?
+    assert(c.inTransaction)
+    Ok(c.backendPid))?
+  // The same connection, clean: nothing committed, no transaction open.
+  assertEq(db.use(c -> Ok((c.backendPid, c.inTransaction))), Ok((pid, false)))
+  assertEq(db.use(c -> c.queryValue[long]("select count(*) from pool_dirty")), Ok(long(0)))
+  // Inside nested savepoints, and inside one a failed statement aborted, alike.
+  _ = db.use(c ->
+    c.simpleQuery("begin; insert into pool_dirty values (2); savepoint a; insert into pool_dirty values (3)")?
+    c.query("select 1 / 0"))
+  assertEq(db.use(c -> Ok((c.backendPid, c.inTransaction))), Ok((pid, false)))
+  assertEq(db.use(c -> c.queryValue[long]("select count(*) from pool_dirty")), Ok(long(0)))
+  db.execute("drop table pool_dirty")?
+  db.close()
+  Ok(())
+
+@test("a use that waits past its time answers PoolTimedOut; a closed pool answers PoolClosed")
+timeoutAndClose() -> Result[unit, PgError]
+  val db = testPool(1) match
+    Some(r) -> r?
+    None -> return Ok(())
+  scope(s ->
+    val holder = s.spawn(() -> db.use(c -> c.queryValue[string]("select pg_sleep(1)::text")))
+    sleep(millis(200))
+    assertEq(db.use(millis(100), c -> c.queryValue[int]("select 1")), Err(PoolTimedOut))
+    assert(holder.join().isOk))
+  assertEq(db.use(c -> c.queryValue[int]("select 1")), Ok(1))
+  db.close()
+  assertEq(db.use(c -> c.queryValue[int]("select 1")), Err(PoolClosed))
+  Ok(())
+
+private isConfig(r: Result[PgPool, PgError]) -> bool = r match
+  Err(Config(_)) -> true
+  _ -> false
+
+@test("a connection the pool cannot make is that connection's error; a bad URL is Config")
+creationFails() -> Result[unit, PgError]
+  val url = userUrl("scramuser", "wrong") match
+    Some(u) -> u
+    None -> return Ok(())
+  val db = PgPool.open(url, maxSize = 2)?
+  assertEq(db.use(c -> c.queryValue[int]("select 1")).err.flatMap(e -> e.code), Some("28P01"))
+  assertEq(db.stats().size, 0)
+  db.close()
+  assert(isConfig(PgPool.open("mysql://x@localhost/db")))
+  assert(isConfig(PgPool.open("postgres://x@localhost/db?bogus=1")))
+  Ok(())
+
+@test("warm makes minIdle connections before any is asked for")
+warmed() -> Result[unit, PgError]
+  val url = testUrl() match
+    Some(u) -> u
+    None -> return Ok(())
+  val db = PgPool.open(url, maxSize = 4, minIdle = 2)?
+  assertEq(db.stats().size, 0)
+  db.warm()?
+  assertEq((db.stats().size, db.stats().idle), (2, 2))
+  db.close()
+  Ok(())

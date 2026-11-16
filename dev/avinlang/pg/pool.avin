@@ -29,14 +29,12 @@ class PgPool(private val pool: Pool[Connection, PgError]): Sendable
     flattened(pool.lease(l -> lent(l, c -> c.transaction(f))))
 
   // The rows `sql` returns, run on a pooled connection.
-  query(sql: string, params: ToPg*) -> Result[Vector[Row], PgError]
-    val bound = params.map(paramOf)
-    flattened(pool.lease(l -> lent(l, c -> c.query(sql, bound*))))
+  query(sql: string, params: ToPg*) -> Result[Vector[Row], PgError] =
+    flattened(pool.lease(l -> lent(l, c -> c.query(sql, params*))))
 
   // Runs `sql` on a pooled connection and answers how many rows it touched.
-  execute(sql: string, params: ToPg*) -> Result[long, PgError]
-    val bound = params.map(paramOf)
-    flattened(pool.lease(l -> lent(l, c -> c.execute(sql, bound*))))
+  execute(sql: string, params: ToPg*) -> Result[long, PgError] =
+    flattened(pool.lease(l -> lent(l, c -> c.execute(sql, params*))))
 
   // Makes connections until the pool holds its `minIdle`.
   warm() -> Result[unit, PgError] = pool.warm().mapErr(poolFailure)
