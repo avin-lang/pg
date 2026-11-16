@@ -126,3 +126,77 @@ transaction is rolled back (and let go if that fails); `validate` lends only a c
 open, idle, and has nothing unread from the server, which catches one the server ended while it sat
 idle. Ordinary use, one connection per request with a transaction inside, needs one pooled resource
 at a time.
+
+## Tracing: a tracer answers a span, and the span carries the context
+
+pgx's tracers take a `context.Context` at the start of an operation and answer one, which is then
+handed to the end. avin has no context value, so the same carrying is done with a value of the
+tracer's own: `queryStart(QueryStart) -> QuerySpan`, and the span's `queryEnd(QueryEnd)`. A trace id,
+a counter, a parent span: the tracer keeps it in the span it makes, typed as it likes, and no
+downcast is needed. A tracer with nothing per operation answers one shared span, often itself (the
+slow-query log does). The same shape serves prepare, connect, batch and pool acquire; the pool's span
+also takes `released`, so one span covers a connection from the wait to its return. Alternatives
+weighed: a generic tracer trait with the context as a type parameter (a configuration field cannot
+hold a tracer of an unknown context type), and an opaque `Sendable` token handed from start to end
+(the tracer would have to cast it back). **Review with the user**: a value the *caller* holds, such as
+an HTTP request's id, has no way into `queryStart`, since avin has no ambient context and the query
+methods take none; a middleware today makes a tracer per request, or puts the id where its tracer
+can read it. A per-call context argument, or an ambient one in avin, would settle it.
+
+## One field per hook on `PgConfig`; the pool's tracer is on the configuration too
+
+`PgConfig` has `queryTracer`, `prepareTracer`, `connectTracer`, `batchTracer` and `poolTracer`, each an
+`Option` of its trait. pgx has one `Tracer` field and finds the other hooks by asserting which
+interfaces it implements, which avin does not offer; separate fields say plainly what is traced. A
+pool made with a configuration traces with its `poolTracer`, as pgxpool reads its tracer from the
+connection configuration, so one value configures everything. Every hook trait and span trait is
+`Sendable`: a configuration is shared by a pool's threads, and the pool's span is used inside the
+isolated body that holds the connection.
+
+## A hook costs one option test when unset, and runs outside every lock
+
+Each hook is called from one spot: `run`, `runStatement` and `simpleQuery` for statements, `parse`
+for preparing, `Connection.connect` for connecting, `PgPool.leased` for the pool. With the hook
+`None` the spot is a `match` that goes straight to the untraced code, so nothing is allocated and no
+clock is read. A connection is used by one thread and holds no lock; the pool's lock is let go
+before the body runs and taken only after it returns, so a hook may use the pool (its statistics,
+another of its connections) without waiting on itself. A hook is told the backend's pid, never the
+connection, so it cannot start a statement on the connection in the middle of one.
+
+## Statement and pool ends are reported from a `defer`, so a cancelled thread's end arrives
+
+The end of a statement, a prepare, a connect and a pool acquire is told from a `defer` where the
+operation did not return, with `cancelled` true and no error, rows or tag. A pool use cancelled while
+it waits is told `acquireEnd` as cancelled; one cancelled after it was lent is told `released` as
+usual. The statements a transaction and a pool run for themselves (`BEGIN`, `COMMIT`, savepoints,
+the `ROLLBACK` on return) are traced as statements, as pgx traces them.
+
+## Hooks answer nothing; a trap in one stops the program
+
+A hook's methods return `unit`, so there is no error for the client to handle and nothing a hook does
+can fail the operation or leave the connection in a state of its own making. A trap inside a hook
+stops the program, as a trap does everywhere in avin (threads.md: a failure is a value, a trap stops
+the program); pgx's hooks cannot fail either, and a panic in one ends the program unless the caller
+recovers it.
+Catching a trap is not something avin offers, so this is the language's rule rather than this
+client's choice.
+
+## Parameter values are hidden unless `traceParameters` is set
+
+`QueryStart.params` is empty by default and `paramCount` always set, so a tracer that logs what it is
+told does not log a password or a token bound as a parameter. `traceParameters = true` hands the
+values over, for a development log. The slow-query log never writes them either way.
+
+## The slow-query log is a `QueryTracer` with a threshold and a line sink
+
+`SlowQueryLog(threshold, sink = eprintln)` writes one line for each statement whose time is at or
+past the threshold, failed and cancelled ones included: `slow query: <time> on backend <pid>, <rows
+| failed SQLSTATE | cancelled>: <sql>`. A sink of strings fits any logger. **Review with the user**: a
+program that wants both the slow log and its own tracer has to combine them itself, since a field holds
+one tracer; a combinator (pgx's `multitracer`) would be a small addition.
+
+## The batch hook is defined for the batch protocol to call
+
+`BatchTracer` (`batchStart(BatchStart) -> BatchSpan`, the span's `batchQuery` per statement and
+`batchEnd`) and `PgConfig.batchTracer` are in place, after pgx's `BatchTracer`, for the batch protocol
+to call from its own send and read.

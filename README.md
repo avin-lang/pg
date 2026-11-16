@@ -186,6 +186,56 @@ import avin.time.seconds
 val r = withTimeout(seconds(2), _ -> db.query("select pg_sleep(60)"))   // None: cancelled
 ```
 
+## Tracing
+
+Hooks on the configuration watch what its connections do, for a server's logs, metrics and traces:
+`queryTracer` each statement run, `prepareTracer` each statement prepared, `connectTracer` each
+connection made (with its authentication method and whether it is encrypted), `batchTracer` each
+batch, and `poolTracer` each connection a pool lends (with the wait) and takes back (with how long
+it was held, and whether it was let go). A tracer is told an operation starts and answers a span; the
+span is told how it ended: its time, the rows it returned or touched, its command tag, its error and
+SQLSTATE, the server process, and whether its thread was cancelled. Whatever the tracer wants to
+carry from the start to the end, it keeps in the span it makes.
+
+A tracer sees how many parameters a statement binds, never their values, unless `traceParameters`
+is set. A hook runs on the operation's thread, outside every lock of the connection and the pool; an
+unset hook costs nothing beyond a test of its option. Hooks answer nothing, so they cannot fail the
+statement they watch.
+
+```avin
+import avin.threads.Atomic
+import avin.time.millis
+import dev.avinlang.pg.{PgConfig, PgPool, QueryEnd, QuerySpan, QueryStart, QueryTracer}
+
+// Numbers each statement, and logs its start and its end under that number.
+class Numbered(private val log: @sendable (string) -> unit): Sendable
+  val next = Atomic(long(0))
+
+data NumberedSpan(n: long, log: @sendable (string) -> unit)
+
+impl QueryTracer for Numbered
+  queryStart(e: QueryStart) -> QuerySpan
+    val n = next.add(1)
+    log(s"#$n on backend ${e.pid}: ${e.sql}")
+    NumberedSpan(n, log)
+
+impl QuerySpan for NumberedSpan
+  queryEnd(e: QueryEnd) = log(s"#$n: ${e.rows} rows, ${e.code.getOrElse("ok")}")
+
+val config = PgConfig.parse("postgres://app:secret@localhost/shop")?
+val db = PgPool.of(config with {queryTracer = Some(Numbered(line -> println(line)))}, maxSize = 8)
+```
+
+`SlowQueryLog(threshold, sink)` is a query tracer that writes a line for each statement that takes
+`threshold` or longer, its parameters' values never among it; `sink` defaults to standard error.
+
+```avin
+import dev.avinlang.pg.SlowQueryLog
+
+val logged = config with {queryTracer = Some(SlowQueryLog(millis(250)))}
+// slow query: 1.2s on backend 4711, 3 rows: select … from orders where …
+```
+
 ## Not yet
 
 `LISTEN`/`NOTIFY` and `COPY` come next. A notification the server sends is dropped, and `COPY` is

@@ -85,6 +85,10 @@ class Connection(
   private var counter = 0
   // How many transactions and savepoints are open.
   private var depth = 0
+  private var auth: AuthMethod = Trust
+
+  // How the server had this connection authenticate.
+  authMethod -> AuthMethod = auth
 
   // The server process serving this connection, as `pg_backend_pid()` names it.
   backendPid -> int = pid
@@ -111,7 +115,7 @@ class Connection(
 
   // The rows a prepared statement returns.
   query(statement: Statement, params: ToPg*) -> Result[Vector[Row], PgError] =
-    runPrepared(statement, params.map(paramOf)).map(r -> r.rows)
+    runStatement(statement, params.map(paramOf)).map(r -> r.rows)
 
   // The first row `sql` returns, or `None` where it returns none.
   queryOne(sql: string, params: ToPg*) -> Result[Option[Row], PgError] =
@@ -142,7 +146,7 @@ class Connection(
 
   // Runs a prepared statement and answers how many rows it touched.
   execute(statement: Statement, params: ToPg*) -> Result[long, PgError] =
-    runPrepared(statement, params.map(paramOf)).map(r -> affectedBy(r.tag))
+    runStatement(statement, params.map(paramOf)).map(r -> affectedBy(r.tag))
 
   // Prepares `sql` under a name of its own, its parameters' types inferred by the server. The
   // statement stays prepared until the connection closes or `deallocate` closes it.
@@ -161,7 +165,12 @@ class Connection(
 
   // Runs `sql` with the simple query protocol: several statements separated by `;`, no parameters,
   // every value sent as text. Each statement's result is answered in order.
-  simpleQuery(sql: string) -> Result[Vector[QueryResult], PgError]
+  simpleQuery(sql: string) -> Result[Vector[QueryResult], PgError] = config.queryTracer match
+    None -> simpleUntraced(sql)
+    Some(t) -> tracedQuery(t, sql, [], false, pid, () -> simpleUntraced(sql), rs ->
+      (rs.map(rowsOf).sum, rs.lastOption.map(r -> r.tag).getOrElse("")))
+
+  private simpleUntraced(sql: string) -> Result[Vector[QueryResult], PgError]
     usable()?
     val out = Out()
     out.begin('Q').cstring(sql).close()
@@ -243,7 +252,20 @@ class Connection(
 
   // Runs `sql` through the statement cache, retrying once a statement the server no longer accepts
   // (its table changed under it) where no transaction would be lost.
-  private run(sql: string, params: Vector[Typed]) -> Result[QueryResult, PgError]
+  private run(sql: string, params: Vector[Typed]) -> Result[QueryResult, PgError] = config.queryTracer match
+    None -> runCached(sql, params)
+    Some(t) -> tracedQuery(t, sql, params, config.traceParameters, pid, () -> runCached(sql, params), r ->
+      (rowsOf(r), r.tag))
+
+  // `runPrepared`, traced as a query.
+  private runStatement(statement: Statement, params: Vector[Typed]) -> Result[QueryResult, PgError] =
+    config.queryTracer match
+      None -> runPrepared(statement, params)
+      Some(t) ->
+        tracedQuery(t, statement.sql, params, config.traceParameters, pid, () -> runPrepared(statement, params), r ->
+          (rowsOf(r), r.tag))
+
+  private runCached(sql: string, params: Vector[Typed]) -> Result[QueryResult, PgError]
     usable()?
     val statement = statementFor(sql, params)?
     runPrepared(statement, params) match
@@ -287,7 +309,12 @@ class Connection(
     order = order.filter(k -> k != key)
 
   // Prepares `sql` as `name` and asks what its parameters and rows are.
-  private parse(name: string, sql: string, oids: Vector[int]) -> Result[Statement, PgError]
+  private parse(name: string, sql: string, oids: Vector[int]) -> Result[Statement, PgError] =
+    config.prepareTracer match
+      None -> parseUntraced(name, sql, oids)
+      Some(t) -> tracedPrepare(t, sql, name, pid, () -> parseUntraced(name, sql, oids))
+
+  private parseUntraced(name: string, sql: string, oids: Vector[int]) -> Result[Statement, PgError]
     usable()?
     val out = Out()
     for old in evicted
@@ -475,9 +502,14 @@ class Connection(
             0 -> if scram.isDefined && !proven then return Err(
               Auth("the server accepted the password without proving it knows it")
             )
-            3 -> send(Out().begin('p').cstring(password()?).close())?
-            5 -> send(Out().begin('p').cstring(md5Answer(config.user, password()?, r.bytes(4))).close())?
+            3 ->
+              auth = Cleartext
+              send(Out().begin('p').cstring(password()?).close())?
+            5 ->
+              auth = Md5
+              send(Out().begin('p').cstring(md5Answer(config.user, password()?, r.bytes(4))).close())?
             10 ->
+              auth = ScramSha256
               val mechanisms = Buffer[string]()
               while r.remaining > 1
                 mechanisms.addOne(r.cstring())
@@ -625,7 +657,12 @@ connect(config: PgConfig) -> Result[Connection, PgError] = Connection.connect(co
 
 object Connection
   // A connection made with `config`, as the module's `connect` makes it.
-  connect(config: PgConfig) -> Result[Connection, PgError] = config.sslMode match
+  connect(config: PgConfig) -> Result[Connection, PgError] = config.connectTracer match
+    None -> negotiated(config)
+    Some(t) -> tracedConnect(t, config, () -> negotiated(config))
+
+  // A connection over TLS or plain TCP as `config.sslMode` asks.
+  private negotiated(config: PgConfig) -> Result[Connection, PgError] = config.sslMode match
     Disable -> open(config, false)
     Require -> open(config, true)
     Prefer -> open(config, true) match

@@ -1,0 +1,553 @@
+module tests
+
+// Tracing: every hook fired with its fields, on success, on failure, on cancellation and on a pooled
+// connection; spans carrying a value from an operation's start to its end; many threads tracing at
+// once; the slow-query log's threshold; and nothing called where no hook is set.
+
+import avin.threads.{Atomic, Mutex, scope, withTimeout}
+import avin.time.{Duration, millis}
+import dev.avinlang.pg
+
+import dev.avinlang.pg.{
+  AcquireEnd, AcquireSpan, BatchEnd, BatchQuery, BatchSpan, BatchStart, BatchTracer, Cleartext, ConnectEnd, ConnectSpan,
+  ConnectStart, ConnectTracer, Connection, Md5, PgConfig, PgError, PgInt, PgPool, PgText, PoolClosed, PoolTimedOut,
+  PoolTracer, PrepareEnd, PrepareSpan, PrepareStart, PrepareTracer, QueryEnd, QuerySpan, QueryStart, QueryTracer,
+  Released, ScramSha256, Server, SlowQueryLog, Trust
+}
+
+// ---- A tracer that records everything ----
+
+// Every event a hook was told, each start and end paired by the id its span carries.
+class Recorder: Sendable
+  val next = Atomic(0)
+  val queryStarts = Mutex(Buffer[(int, QueryStart)]())
+  val queryEnds = Mutex(Buffer[(int, QueryEnd)]())
+  val prepareStarts = Mutex(Buffer[(int, PrepareStart)]())
+  val prepareEnds = Mutex(Buffer[(int, PrepareEnd)]())
+  val connectStarts = Mutex(Buffer[(int, ConnectStart)]())
+  val connectEnds = Mutex(Buffer[(int, ConnectEnd)]())
+  val acquireEnds = Mutex(Buffer[(int, AcquireEnd)]())
+  val releases = Mutex(Buffer[(int, Released)]())
+  // A pool whose statistics a pool hook reads, which it could not where it ran under the pool's lock.
+  val watched = Mutex(None: Option[PgPool])
+
+  private id() -> int = next.add(1)
+
+// A span: the id its start was given, and where to record its end.
+data Span(id: int, r: Recorder)
+
+private push[T: Sendable](m: Mutex[Buffer[T]], v: T)
+  m.with(b ->
+    b.addOne(v)
+    ())
+
+private items[T: Sendable](m: Mutex[Buffer[T]]) -> Vector[T] = m.with(b -> b.toVector)
+
+impl QueryTracer for Recorder
+  queryStart(e: QueryStart) -> QuerySpan
+    val n = id()
+    push(queryStarts, (n, e))
+    Span(n, self)
+
+impl QuerySpan for Span
+  queryEnd(e: QueryEnd) = push(r.queryEnds, (id, e))
+
+impl PrepareTracer for Recorder
+  prepareStart(e: PrepareStart) -> PrepareSpan
+    val n = id()
+    push(prepareStarts, (n, e))
+    Span(n, self)
+
+impl PrepareSpan for Span
+  prepareEnd(e: PrepareEnd) = push(r.prepareEnds, (id, e))
+
+impl ConnectTracer for Recorder
+  connectStart(e: ConnectStart) -> ConnectSpan
+    val n = id()
+    push(connectStarts, (n, e))
+    Span(n, self)
+
+impl ConnectSpan for Span
+  connectEnd(e: ConnectEnd) = push(r.connectEnds, (id, e))
+
+impl PoolTracer for Recorder
+  acquireStart() -> AcquireSpan
+    // The pool's lock is not held: reading its statistics would wait for ever, or trap, if it were.
+    _ = watched.get().map(p -> p.stats())
+    Span(id(), self)
+
+impl AcquireSpan for Span
+  acquireEnd(e: AcquireEnd)
+    _ = r.watched.get().map(p -> p.stats())
+    push(r.acquireEnds, (id, e))
+
+  released(e: Released)
+    _ = r.watched.get().map(p -> p.stats())
+    push(r.releases, (id, e))
+
+// The test server's settings with every hook set to `r`.
+private tracedConfig(
+    r: Recorder,
+    options: string = "sslmode=disable",
+    values: bool = false
+) -> Option[Result[PgConfig, PgError]] = testUrl(options).map(
+  u -> PgConfig.parse(u).map(
+    c -> c with {
+      queryTracer = Some(r),
+      prepareTracer = Some(r),
+      connectTracer = Some(r),
+      poolTracer = Some(r),
+      traceParameters = values
+    }
+  )
+)
+
+private tracedConnection(r: Recorder, values: bool = false) -> Option[Result[Connection, PgError]] =
+  tracedConfig(r, values = values).map(cr -> pg.connect(cr?))
+
+// A pool with every hook set to `r`.
+private tracedPool(
+    r: Recorder,
+    maxSize: int,
+    acquireTimeout: Option[Duration] = None
+) -> Option[Result[PgPool, PgError]] =
+  tracedConfig(r).map(cr -> cr.map(c -> PgPool.of(c, maxSize = maxSize, acquireTimeout = acquireTimeout)))
+
+// The ends recorded, each checked against the start its span came from: the same statement, the
+// same backend.
+private pairedEnds(r: Recorder) -> Vector[QueryEnd]
+  val starts = HashMap.from(items(r.queryStarts))
+  val ends = items(r.queryEnds)
+  assertEq(starts.size, ends.length)
+  for (id, e) in ends
+    val s = starts.get(id).get
+    assertEq((s.sql, s.paramCount, s.pid), (e.sql, e.paramCount, e.pid))
+    assert(!e.duration.isNegative)
+  ends.map(p -> p.1)
+
+// ---- Statements ----
+
+@test("query, execute, queryValue and simpleQuery are each traced: text, parameters, pid, rows, tag")
+statements() -> Result[unit, PgError]
+  val r = Recorder()
+  val c = tracedConnection(r) match
+    Some(cr) -> cr?
+    None -> return Ok(())
+  c.simpleQuery("drop table if exists trace_items; create table trace_items (n int)")?
+  assertEq(c.execute("insert into trace_items values ($1), ($2)", 1, 2), Ok(long(2)))
+  assertEq(c.query("select n from trace_items where n >= $1", 0)?.length, 2)
+  assertEq(c.queryValue[int]("select 5"), Ok(5))
+  c.execute("delete from trace_items")?
+  c.simpleQuery("drop table trace_items")?
+  val ends = pairedEnds(r)
+  assertEq(
+    ends.map(e -> e.sql),
+    [
+      "drop table if exists trace_items; create table trace_items (n int)",
+      "insert into trace_items values ($1), ($2)",
+      "select n from trace_items where n >= $1",
+      "select 5",
+      "delete from trace_items",
+      "drop table trace_items"
+    ]
+  )
+  assertEq(
+    ends.map(e -> (e.paramCount, e.rows, e.tag)),
+    [
+      (0, long(0), "CREATE TABLE"),
+      (2, long(2), "INSERT 0 2"),
+      (1, long(2), "SELECT 2"),
+      (0, long(1), "SELECT 1"),
+      (0, long(2), "DELETE 2"),
+      (0, long(0), "DROP TABLE")
+    ]
+  )
+  for e in ends
+    assertEq((e.pid, e.error, e.cancelled), (c.backendPid, None, false))
+  // Parameter values are never handed over unless asked for.
+  for (_, s) in items(r.queryStarts)
+    assertEq(s.params, [])
+  c.close()
+
+@test("a statement the server refuses is traced with its SQLSTATE, and the connection goes on")
+refusedTraced() -> Result[unit, PgError]
+  val r = Recorder()
+  val c = tracedConnection(r) match
+    Some(cr) -> cr?
+    None -> return Ok(())
+  assertEq(c.query("select * from no_such_trace_table").err.flatMap(e -> e.code), Some("42P01"))
+  assertEq(c.simpleQuery("select 1; select 1/0").err.flatMap(e -> e.code), Some("22012"))
+  // A statement refused before it reaches the server: the wrong number of parameters.
+  val s = c.prepare("select $1::int")?
+  assert(c.query(s).isErr)
+  assertEq(c.queryValue[int]("select 9"), Ok(9))
+  val ends = pairedEnds(r)
+  assertEq(ends.map(e -> e.code), [Some("42P01"), Some("22012"), None, None])
+  assertEq(ends(2).error, Some(pg.Config("the statement has 1 parameters and 0 were given")))
+  assertEq(ends.map(e -> e.rows), [long(0), long(0), long(0), long(1)])
+  assertEq(ends(3).error, None)
+  c.close()
+
+@test("traceParameters hands a query tracer the parameters' values")
+parameterValues() -> Result[unit, PgError]
+  val r = Recorder()
+  val c = tracedConnection(r, values = true) match
+    Some(cr) -> cr?
+    None -> return Ok(())
+  c.query("select $1::int8, $2", 42, "secret")?
+  val (_, s) = items(r.queryStarts)(0)
+  assertEq((s.paramCount, s.params), (2, [PgInt(42), PgText("secret")]))
+  c.close()
+
+@test("a transaction's BEGIN and COMMIT, and a savepoint's statements, are traced as statements")
+transactionStatements() -> Result[unit, PgError]
+  val r = Recorder()
+  val c = tracedConnection(r) match
+    Some(cr) -> cr?
+    None -> return Ok(())
+  c.transaction(tx ->
+    tx.transaction(inner -> inner.queryValue[int]("select 1"))?
+    tx.queryValue[int]("select 2"))?
+  assertEq(
+    pairedEnds(r).map(e -> e.sql),
+    [
+      "BEGIN",
+      "SAVEPOINT pg_savepoint_1",
+      "select 1",
+      "RELEASE SAVEPOINT pg_savepoint_1",
+      "select 2",
+      "COMMIT"
+    ]
+  )
+  c.close()
+
+@test("a statement whose thread is cancelled is traced as cancelled, and the connection goes on")
+cancelled() -> Result[unit, PgError]
+  val r = Recorder()
+  val c = tracedConnection(r) match
+    Some(cr) -> cr?
+    None -> return Ok(())
+  assert(withTimeout(millis(300), _ -> c.query("select pg_sleep(30)")).isEmpty)
+  assert(withTimeout(millis(300), _ -> c.simpleQuery("select pg_sleep(30)")).isEmpty)
+  assertEq(c.queryValue[int]("select 3"), Ok(3))
+  val ends = pairedEnds(r)
+  assertEq(
+    ends.map(e -> (e.sql, e.cancelled, e.error, e.rows)),
+    [
+      ("select pg_sleep(30)", true, None, long(0)),
+      ("select pg_sleep(30)", true, None, long(0)),
+      ("select 3", false, None, long(1))
+    ]
+  )
+  assert(ends(0).duration >= millis(300))
+  c.close()
+
+// ---- Preparing ----
+
+@test("prepare is traced, by prepare and by the cache's first use only, with its counts and errors")
+prepares() -> Result[unit, PgError]
+  val r = Recorder()
+  val c = tracedConnection(r) match
+    Some(cr) -> cr?
+    None -> return Ok(())
+  val s = c.prepare("select $1::int as a, $2::text as b, 3 as c")?
+  for _ in 0 ..< 3
+    c.queryValue[int]("select $1::int + 1", 1)?
+  assert(c.prepare("selec nothing").isErr)
+  val starts = items(r.prepareStarts)
+  val ends = items(r.prepareEnds)
+  assertEq(starts.map(p -> (p.0, p.1.sql, p.1.name, p.1.pid)), ends.map(p -> (p.0, p.1.sql, p.1.name, p.1.pid)))
+  assertEq(
+    ends.map(p -> p.1.sql),
+    ["select $1::int as a, $2::text as b, 3 as c", "select $1::int + 1", "selec nothing"]
+  )
+  assertEq(ends(0).1.name, s.name)
+  assertEq(
+    ends.map(p -> (p.1.paramCount, p.1.columnCount, p.1.code, p.1.cancelled)),
+    [
+      (2, 3, None, false),
+      (1, 1, None, false),
+      (0, 0, Some("42601"), false)
+    ]
+  )
+  for (_, e) in ends
+    assertEq(e.pid, c.backendPid)
+  // A statement prepared through the cache is traced as a prepare and its run as a query.
+  assertEq(pairedEnds(r).length, 3)
+  c.close()
+
+// ---- Connecting ----
+
+// A connection made as `user` with `password`, traced by `r`.
+private connectAs(r: Recorder, user: string, password: Option[string]) -> Option[Result[Connection, PgError]] =
+  tracedConfig(r).map(cr -> pg.connect(cr? with {user = user, password = password}))
+
+@test("connect is traced with its backend, its authentication method and whether it is encrypted")
+connects() -> Result[unit, PgError]
+  val r = Recorder()
+  val methods = [("pgtest", ScramSha256), ("md5user", Md5), ("plainuser", Cleartext), ("trustuser", Trust)]
+  for (user, method) in methods
+    // Each role's password is its name.
+    val c = connectAs(r, user, Some(user)) match
+      Some(cr) -> cr?
+      None -> return Ok(())
+    assertEq(c.authMethod, method)
+    _ = c.close()
+  val starts = items(r.connectStarts)
+  val ends = items(r.connectEnds)
+  assertEq(starts.map(s -> s.0), ends.map(e -> e.0))
+  assertEq(starts.map(s -> (s.1.user, s.1.database, s.1.port)), methods.map(m -> (m.0, "postgres", ends(0).1.port)))
+  assertEq(
+    ends.map(e -> (e.1.auth, e.1.tls, e.1.error, e.1.cancelled)),
+    methods.map(m -> (Some(m.1), false, None, false))
+  )
+  for (_, e) in ends
+    assert(e.pid != 0)
+  Ok(())
+
+@test("a TLS connection is traced as encrypted")
+tlsConnect() -> Result[unit, PgError]
+  val ca = testCa() match
+    Some(p) -> p
+    None -> return Ok(())
+  val r = Recorder()
+  val c = tracedConfig(r, s"sslmode=require&sslrootcert=$ca") match
+    Some(cr) -> pg.connect(cr?)?
+    None -> return Ok(())
+  val (_, e) = items(r.connectEnds)(0)
+  assertEq((e.tls, e.pid, e.auth), (true, c.backendPid, Some(ScramSha256)))
+  c.close()
+
+@test("a connection refused is traced with its error, no backend and no method")
+connectRefused() -> Result[unit, PgError]
+  val r = Recorder()
+  val wrong = connectAs(r, "pgtest", Some("not it")) match
+    Some(cr) -> cr
+    None -> return Ok(())
+  assertEq(wrong.err.flatMap(e -> e.code), Some("28P01"))
+  // Nothing listening.
+  val nowhere = tracedConfig(r).get? with {port = 1}
+  assert(pg.connect(nowhere).isErr)
+  val ends = items(r.connectEnds).map(p -> p.1)
+  assertEq(
+    ends.map(e -> (e.pid, e.tls, e.auth, e.cancelled, e.port)),
+    [
+      (0, false, None, false, ends(0).port),
+      (0, false, None, false, 1)
+    ]
+  )
+  assertEq(ends(0).error.flatMap(e -> e.code), Some("28P01"))
+  assert(ends(1).error is Some(pg.Io(_)))
+  Ok(())
+
+// ---- Pools ----
+
+@test("a pool traces each lend and return: the wait, the backend, and whether it was let go")
+pooled() -> Result[unit, PgError]
+  val r = Recorder()
+  val db = tracedPool(r, 1, Some(millis(20000))) match
+    Some(p) -> p?
+    None -> return Ok(())
+  r.watched.set(Some(db))
+  val pid = db.use(c -> Ok(c.backendPid))?
+  db.query("select 1")?
+  // A connection the body breaks is let go.
+  _ = db.use(c -> c.query("select pg_terminate_backend(pg_backend_pid())"))
+  db.execute("select 2")?
+  val acquired = items(r.acquireEnds)
+  val released = items(r.releases)
+  assertEq(acquired.map(a -> a.0), released.map(x -> x.0))
+  assertEq(acquired.length, 4)
+  for (_, a) in acquired
+    assert(a.pid != 0 && a.error.isEmpty && !a.cancelled && !a.wait.isNegative)
+  assertEq(acquired(0).1.pid, pid)
+  assertEq(acquired(1).1.pid, pid)
+  assertEq(released.map(x -> x.1.broken), [false, false, true, false])
+  assert(released(3).1.pid != pid)
+  // The pool's connections were traced as they were made, one each time.
+  assertEq(items(r.connectEnds).length, 2)
+  // Statements on a pooled connection are traced as any connection's.
+  assertEq(
+    pairedEnds(r).map(e -> e.sql).filter(s -> s.startsWith("select")),
+    [
+      "select 1",
+      "select pg_terminate_backend(pg_backend_pid())",
+      "select 2"
+    ]
+  )
+  db.close()
+  Ok(())
+
+@test("a pool's acquire that times out, finds the pool closed, or cannot connect is traced with its error")
+poolFailures() -> Result[unit, PgError]
+  val r = Recorder()
+  val db = tracedPool(r, 1) match
+    Some(p) -> p?
+    None -> return Ok(())
+  val timedOut = db.use(_ -> db.use(millis(50), c -> Ok(c.backendPid)))
+  assertEq(timedOut, Err(PoolTimedOut))
+  db.close()
+  assertEq(db.query("select 1"), Err(PoolClosed))
+  val refused = PgPool.of(tracedConfig(r).get? with {password = Some("not it")}, maxSize = 1)
+  assertEq(refused.query("select 1").err.flatMap(e -> e.code), Some("28P01"))
+  refused.close()
+  val ends = items(r.acquireEnds).map(a -> a.1)
+  // The outer use's lend, then the three failures in order.
+  assertEq(
+    ends.map(a -> (a.error, a.cancelled)),
+    [
+      (None, false),
+      (Some(PoolTimedOut), false),
+      (Some(PoolClosed), false),
+      (ends(3).error, false)
+    ]
+  )
+  assert(ends(1).wait >= millis(50))
+  assertEq(ends(3).error.flatMap(e -> e.code), Some("28P01"))
+  assertEq(ends.filter(a -> a.error.isDefined).map(a -> a.pid), [0, 0, 0])
+  // Only the use that was lent a connection gave one back.
+  assertEq(items(r.releases).length, 1)
+  Ok(())
+
+@test("a use cancelled while it waits for a connection is traced as cancelled")
+poolCancelled() -> Result[unit, PgError]
+  val r = Recorder()
+  val db = tracedPool(r, 1) match
+    Some(p) -> p?
+    None -> return Ok(())
+  db.use(_ ->
+    assert(withTimeout(millis(200), _ -> db.use(c -> Ok(c.backendPid))).isEmpty)
+    Ok(()))?
+  val ends = items(r.acquireEnds).map(a -> a.1)
+  assertEq(ends.map(a -> (a.cancelled, a.error)), [(false, None), (true, None)])
+  assert(ends(1).wait >= millis(200))
+  assertEq(items(r.releases).length, 1)
+  db.close()
+  Ok(())
+
+// Thread `t`'s `rounds` statements on `db`, the sum of what they answer.
+private sumsOf(db: PgPool, t: int, rounds: int) -> Result[long, PgError]
+  var sum = long(0)
+  for i in 0 ..< rounds
+    val rows = db.query(s"select $t::int8 + $$1::int8 as n", i)?
+    sum += rows(0).get[long]("n")?
+  Ok(sum)
+
+@test("many threads trace at once through one pool: every start ends once, in its own span")
+manyThreads() -> Result[unit, PgError]
+  val r = Recorder()
+  val db = tracedPool(r, 4, Some(millis(20000))) match
+    Some(p) -> p?
+    None -> return Ok(())
+  val threads = 32
+  val rounds = 8
+  val answers = scope(s ->
+    val started = (0 ..< threads).map(t -> s.spawn(() -> sumsOf(db, t, rounds)))
+    started.map(th -> th.join()))
+  for t in 0 ..< threads
+    assertEq(answers(t), Ok(long(t * rounds + rounds * (rounds - 1) / 2)))
+  val ends = pairedEnds(r)
+  assertEq(ends.length, threads * rounds)
+  // Each thread's statements, all of them, and none twice.
+  for t in 0 ..< threads
+    assertEq(ends.filter(e -> e.sql == s"select $t::int8 + $$1::int8 as n").length, rounds)
+  assert(ends.forall(e -> e.rows == 1 && e.error.isEmpty))
+  assertEq(items(r.acquireEnds).length, threads * rounds)
+  assertEq(items(r.releases).length, threads * rounds)
+  assert(items(r.connectEnds).length <= 4)
+  db.close()
+  Ok(())
+
+// ---- The slow-query log ----
+
+// A slow-query log writing to a buffer.
+private slowLog(threshold: Duration) -> (SlowQueryLog, Mutex[Buffer[string]])
+  val lines = Mutex(Buffer[string]())
+  (SlowQueryLog(threshold, line -> push(lines, line)), lines)
+
+private ended(sql: string, took: Duration, error: Option[PgError] = None, cancelled: bool = false) -> QueryEnd =
+  QueryEnd(sql, 0, 77, took, 3, "SELECT 3", error, cancelled)
+
+@test("the slow-query log writes a statement at or past its threshold, and none below it")
+slowThreshold()
+  val (log, lines) = slowLog(millis(100))
+  log.queryStart(QueryStart("select 1", 0, 77)).queryEnd(ended("fast", Duration(99999)))
+  log.queryStart(QueryStart("select 1", 0, 77)).queryEnd(ended("at", millis(100)))
+  log.queryStart(QueryStart("select 1", 0, 77)).queryEnd(ended("past", millis(1500)))
+  log.queryEnd(ended("failed", millis(200), Some(Server(pg.Diagnostic("ERROR", "57014", "canceling")))))
+  log.queryEnd(ended("cancelled", millis(200), cancelled = true))
+  log.queryEnd(ended("closed", millis(200), Some(pg.Closed)))
+  assertEq(
+    items(lines),
+    [
+      "slow query: 100ms on backend 77, 3 rows: at",
+      "slow query: 1.5s on backend 77, 3 rows: past",
+      "slow query: 200ms on backend 77, failed 57014: failed",
+      "slow query: 200ms on backend 77, cancelled: cancelled",
+      "slow query: 200ms on backend 77, failed: the connection is closed: closed"
+    ]
+  )
+
+// A connection whose query tracer is `log`, parameter values handed to it.
+private loggedConnection(log: SlowQueryLog) -> Option[Result[Connection, PgError]] = testUrl().map(u ->
+  pg.connect(PgConfig.parse(u)? with {queryTracer = Some(log), traceParameters = true}))
+
+@test("the slow-query log on a connection: a slow statement logged, a fast one not, values never")
+slowOnServer() -> Result[unit, PgError]
+  val (log, lines) = slowLog(millis(200))
+  val c = loggedConnection(log) match
+    Some(cr) -> cr?
+    None -> return Ok(())
+  c.queryValue[int]("select $1::int", 1)?
+  c.query("select pg_sleep(0.3), $1::text", "hunter2")?
+  val logged = items(lines)
+  assertEq(logged.length, 1)
+  assert(logged(0).startsWith("slow query: "))
+  assert(logged(0).endsWith(s"on backend ${c.backendPid}, 1 rows: select pg_sleep(0.3), $$1::text"))
+  assert(!logged(0).contains("hunter2"))
+  c.close()
+
+// ---- No hooks, and the batch hook's shape ----
+
+@test("with no hooks set nothing is traced, and a traced connection's hooks see only their own")
+noHooks() -> Result[unit, PgError]
+  val r = Recorder()
+  val plain = testConnection() match
+    Some(cr) -> cr?
+    None -> return Ok(())
+  val traced = tracedConnection(r).get?
+  plain.query("select 1")?
+  plain.prepare("select 2")?
+  plain.transaction(tx -> tx.execute("select 3"))?
+  val db = PgPool.of(PgConfig.parse(testUrl().get)?, maxSize = 1)
+  db.query("select 4")?
+  db.close()
+  assertEq((items(r.queryEnds).length, items(r.prepareEnds).length, items(r.connectEnds).length), (0, 0, 1))
+  assertEq(items(r.acquireEnds).length, 0)
+  val defaults = PgConfig()
+  assert(defaults.queryTracer.isEmpty && defaults.prepareTracer.isEmpty && defaults.connectTracer.isEmpty)
+  assert(defaults.batchTracer.isEmpty && defaults.poolTracer.isEmpty && !defaults.traceParameters)
+  plain.close()?
+  traced.close()
+
+// A batch tracer, as the batch protocol calls it: start, each statement, end.
+class BatchRecorder: Sendable
+  val events = Mutex(Buffer[string]())
+
+impl BatchTracer for BatchRecorder
+  batchStart(e: BatchStart) -> BatchSpan
+    push(events, s"start ${e.size} on ${e.pid}")
+    self
+
+impl BatchSpan for BatchRecorder
+  batchQuery(e: BatchQuery) = push(events, s"${e.sql} ${e.rows} ${e.tag}")
+  batchEnd(e: BatchEnd) = push(events, s"end ${e.size} ${e.cancelled}")
+
+@test("a batch tracer is set on the configuration and takes a batch's start, statements and end")
+batchShape()
+  val b = BatchRecorder()
+  val config = PgConfig(batchTracer = Some(b))
+  val span = config.batchTracer.get.batchStart(BatchStart(2, 9))
+  span.batchQuery(BatchQuery("select 1", 0, 1, "SELECT 1", None))
+  span.batchEnd(BatchEnd(2, 9, millis(1), None, false))
+  assertEq(items(b.events), ["start 2 on 9", "select 1 1 SELECT 1", "end 2 false"])

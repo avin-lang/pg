@@ -23,6 +23,10 @@ data SslMode
 //   statement unnamed, every time.
 // - `notices` receives each notice and warning the server sends; without it they are dropped.
 // - `connectTimeout` limits each wait while connecting and authenticating.
+// - `queryTracer`, `prepareTracer`, `connectTracer`, `batchTracer` and `poolTracer` watch what
+//   connections made with these settings do, and what a pool made with them does (`tracing.avin`).
+//   `traceParameters` hands a query tracer the parameters' values too; without it a tracer sees
+//   only how many there are.
 data PgConfig(
     host: string = "localhost",
     port: int = 5432,
@@ -34,7 +38,13 @@ data PgConfig(
     applicationName: Option[string] = None,
     connectTimeout: Option[Duration] = None,
     statementCacheSize: int = 100,
-    notices: Option[@sendable (Diagnostic) -> unit] = None
+    notices: Option[@sendable (Diagnostic) -> unit] = None,
+    queryTracer: Option[QueryTracer] = None,
+    prepareTracer: Option[PrepareTracer] = None,
+    connectTracer: Option[ConnectTracer] = None,
+    batchTracer: Option[BatchTracer] = None,
+    poolTracer: Option[PoolTracer] = None,
+    traceParameters: bool = false
 )
 
 object PgConfig

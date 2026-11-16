@@ -1,7 +1,7 @@
 module dev.avinlang.pg
 
-import avin.threads.{AcquireTimedOut, CreateFailed, Lease, Pool, PoolError, PoolStats}
-import avin.time.Duration
+import avin.threads.{AcquireTimedOut, Atomic, CreateFailed, Lease, Pool, PoolError, PoolStats}
+import avin.time.{Duration, monotonic}
 
 // Connections shared between threads: `use(f)` lends one to `f` and takes it back when `f` returns,
 // however it returns. A connection is made when one is asked for and none is idle, up to `maxSize`;
@@ -14,27 +14,69 @@ import avin.time.Duration
 //
 // A pool may be shared between threads and actors. `use`'s body is isolated, as a `Pool`'s is: it
 // gives back a sendable value, rows among them, and keeps nothing of the connection.
-class PgPool(private val pool: Pool[Connection, PgError]): Sendable
+// The configuration's `poolTracer` is told of every connection lent and given back.
+class PgPool(private val pool: Pool[Connection, PgError], private val tracer: Option[PoolTracer] = None): Sendable
   // Runs `f` with a connection lent to it, waiting for one for at most the pool's `acquireTimeout`,
   // and answers what `f` answers.
-  use[R: Sendable](@isolating f: (Connection) -> Result[R, PgError]) -> Result[R, PgError] =
-    flattened(pool.lease(l -> lent(l, f)))
+  use[R: Sendable](@isolating f: (Connection) -> Result[R, PgError]) -> Result[R, PgError] = leased(None, f)
 
   // `use(f)`, waiting for a connection for at most `timeout`.
   use[R: Sendable](timeout: Duration, @isolating f: (Connection) -> Result[R, PgError]) -> Result[R, PgError] =
-    flattened(pool.lease(timeout, l -> lent(l, f)))
+    leased(Some(timeout), f)
 
   // Runs `f` in a transaction on a pooled connection (`Connection.transaction`).
   transaction[R: Sendable](@isolating f: (Connection) -> Result[R, PgError]) -> Result[R, PgError] =
-    flattened(pool.lease(l -> lent(l, c -> c.transaction(f))))
+    leased(None, c -> c.transaction(f))
 
   // The rows `sql` returns, run on a pooled connection.
-  query(sql: string, params: ToPg*) -> Result[Vector[Row], PgError] =
-    flattened(pool.lease(l -> lent(l, c -> c.query(sql, params*))))
+  query(sql: string, params: ToPg*) -> Result[Vector[Row], PgError] = leased(None, c -> c.query(sql, params*))
 
   // Runs `sql` on a pooled connection and answers how many rows it touched.
-  execute(sql: string, params: ToPg*) -> Result[long, PgError] =
-    flattened(pool.lease(l -> lent(l, c -> c.execute(sql, params*))))
+  execute(sql: string, params: ToPg*) -> Result[long, PgError] = leased(None, c -> c.execute(sql, params*))
+
+  // Lends a connection to `f`, waiting for at most `timeout`, or the pool's `acquireTimeout` where it
+  // is `None`.
+  private leased[R: Sendable](
+      timeout: Option[Duration],
+      @isolating f: (Connection) -> Result[R, PgError]
+  ) -> Result[R, PgError] = tracer match
+    None -> flattened(leaseFor(timeout, l -> lent(l, f)))
+    Some(t) -> tracedLease(t, timeout, f)
+
+  private leaseFor[R: Sendable](
+      timeout: Option[Duration],
+      @isolating f: (Lease[Connection]) -> R
+  ) -> Result[R, PoolError[PgError]] = timeout match
+    Some(d) -> pool.lease(d, f)
+    None -> pool.lease(f)
+
+  // `leased`, with `t` told of the wait, the connection lent and its return. The lease's own `defer`
+  // readies the connection before `released` is told whether the pool keeps it.
+  private tracedLease[R: Sendable](
+      t: PoolTracer,
+      timeout: Option[Duration],
+      @isolating f: (Connection) -> Result[R, PgError]
+  ) -> Result[R, PgError]
+    val span = t.acquireStart()
+    val asked = monotonic()
+    // Set by the lease's body, which may capture only sendable values.
+    val ended = Atomic(false)
+    defer
+      if !ended.load() then span.acquireEnd(AcquireEnd(monotonic() - asked, 0, None, true))
+    val result = leaseFor(timeout, l ->
+      ended.store(true)
+      val pid = l.resource.backendPid
+      span.acquireEnd(AcquireEnd(monotonic() - asked, pid, None, false))
+      val since = monotonic()
+      defer span.released(Released(monotonic() - since, pid, l.isBroken))
+      lent(l, f))
+    result match
+      Ok(inner) -> inner
+      Err(e) ->
+        ended.store(true)
+        val failure = poolFailure(e)
+        span.acquireEnd(AcquireEnd(monotonic() - asked, 0, Some(failure), false))
+        Err(failure)
 
   // Makes connections until the pool holds its `minIdle`.
   warm() -> Result[unit, PgError] = pool.warm().mapErr(poolFailure)
@@ -72,7 +114,8 @@ object PgPool
       destroy = Some(c -> discard(c)),
       idleTimeout = idleTimeout,
       acquireTimeout = acquireTimeout
-    )
+    ),
+    config.poolTracer
   )
 
 private discard(c: Connection)
