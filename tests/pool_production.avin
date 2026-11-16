@@ -1,0 +1,315 @@
+module tests
+
+// The pool under a server's load: thousands of lightweight threads sharing ten connections while a
+// side thread keeps its turns, a bounded queue that turns callers away at once, connections retired
+// by age and idleness and the minimum kept warm, a ping before lending a connection idle a while,
+// and the running totals `stats` keeps.
+
+import avin.net.TcpListener
+import avin.threads.{Atomic, Channel, scope, sleep}
+import avin.time.{Duration, millis, monotonic, seconds}
+import dev.avinlang.pg
+import dev.avinlang.pg.{PgConfig, PgError, PgPool, PoolBusy, PoolTimedOut}
+
+// Whether `ready` answers true within `limit`, looking every ten milliseconds.
+private eventually(limit: Duration, ready: () -> bool) -> bool
+  val end = monotonic() + limit
+  while !ready()
+    if monotonic() >= end then return false
+    sleep(millis(10))
+  true
+
+@test("thousands of threads share a pool of 10 over TCP and TLS, by host name, and a side thread is never starved")
+noThreadBlocked() -> Result[unit, PgError]
+  val ca = testCa() match
+    Some(c) -> c
+    None -> return Ok(())
+  // By name, so every connection looks its host up, and over TLS, so every one shakes hands.
+  val url = testUrl(s"sslmode=require&sslrootcert=$ca") match
+    Some(u) -> u.replace("127.0.0.1", "localhost")
+    None -> return Ok(())
+  val db = PgPool.open(url, maxSize = 10, acquireTimeout = Some(seconds(120)))?
+  val threads = 5000
+  val done = Atomic(0)
+  val ticks = Atomic(0)
+  val peakWaiting = Atomic(0)
+  val longestGap = Atomic(long(0))
+  val start = monotonic()
+  val answers = scope(s ->
+    s.spawn(() ->
+      var last = monotonic()
+      while done.load() < threads
+        sleep(millis(5))
+        val now = monotonic()
+        val gap = (now - last).micros
+        last = now
+        _ = longestGap.update(g -> if gap > g then gap else g)
+        _ = ticks.add(1)
+        val waiting = db.stats().waiting
+        _ = peakWaiting.update(p -> if waiting > p then waiting else p)
+      ())
+    val started = (0 ..< threads).map(i -> s.spawn(() ->
+      val r = db.use(c -> c.queryValue[int]("select $1::int4 + 1", i))
+      _ = done.add(1)
+      r == Ok(i + 1)))
+    started.map(t -> t.join()))
+  val elapsedMs = (monotonic() - start).micros / 1000
+  // Every request completed, with its own answer.
+  assertEq(answers.count(ok -> ok), threads)
+  val stats = db.stats()
+  assertEq((stats.acquires, stats.timeouts, stats.rejected), (long(threads), long(0), long(0)))
+  assert(stats.created <= 10)
+  // Far more threads waited for a connection at once than the runtime has workers.
+  assert(peakWaiting.load() > 100)
+  // The side thread ticked at least a third of the times it could have, and never went a second
+  // without a turn.
+  println(
+    s"$threads requests in $elapsedMs ms; ${ticks.load()} ticks; longest gap ${longestGap.load() / 1000} ms; peak waiting ${peakWaiting.load()}"
+  )
+  assert(long(ticks.load()) * 5 * 3 >= elapsedMs)
+  assert(longestGap.load() < 1000000)
+  db.close()
+
+  // Fifty threads each making a connection of their own at once, TLS and all.
+  val connected = Atomic(0)
+  val tick = Atomic(0)
+  scope(s ->
+    s.spawn(() ->
+      while connected.load() < 50
+        sleep(millis(5))
+        _ = tick.add(1)
+      ())
+    for i in 0 ..< 50
+      s.spawn(() ->
+        pg.connect(url) match
+          Ok(c) ->
+            if c.isTls && c.queryValue[int]("select 1") == Ok(1) then _ = connected.add(1)
+            _ = c.close()
+          Err(e) -> fail(s"connect: $e")))
+  assertEq(connected.load(), 50)
+  assert(tick.load() > 0)
+  Ok(())
+
+@test("a bounded queue turns a caller away at once with PoolBusy, and serves those that waited")
+boundedQueue() -> Result[unit, PgError]
+  val url = testUrl() match
+    Some(u) -> u
+    None -> return Ok(())
+  val db = PgPool.open(url, maxSize = 2, maxWaiting = Some(3))?
+  val release = Channel[unit]()
+  val outcomes = scope(s ->
+    val holders = (0 ..< 2).map(_ -> s.spawn(() -> db.use(c ->
+      _ = release.receive()
+      c.queryValue[int]("select 1"))))
+    assert(eventually(seconds(10), () -> db.stats().inUse == 2))
+    val waiters = (0 ..< 3).map(i -> s.spawn(() -> db.use(c -> c.queryValue[int]("select $1::int4", i))))
+    assert(eventually(seconds(10), () -> db.stats().waiting == 3))
+    // The fourth caller, timed or not, fails at once.
+    val began = monotonic()
+    assertEq(db.query("select 1").map(rows -> rows.length), Err(PoolBusy))
+    assertEq(db.use(seconds(30), c -> c.queryValue[int]("select 1")), Err(PoolBusy))
+    assert(monotonic() - began < seconds(5))
+    assertEq(db.stats().rejected, long(2))
+    release.send(())
+    release.send(())
+    (holders ++ waiters).map(t -> t.join()))
+  assertEq(outcomes, [Ok(1), Ok(1), Ok(0), Ok(1), Ok(2)])
+  assertEq(PoolBusy.message, "too many callers are waiting for a pooled connection")
+  db.close()
+
+  // Two hundred threads at once on two connections, ten may wait: each either answers or is turned
+  // away, and never more wait than the bound.
+  val busy = PgPool.open(url, maxSize = 2, maxWaiting = Some(10))?
+  val overBound = Atomic(0)
+  val finished = Atomic(0)
+  val results = scope(s ->
+    s.spawn(() ->
+      while finished.load() < 200
+        if busy.stats().waiting > 10 then _ = overBound.add(1)
+        sleep(millis(1))
+      ())
+    val started = (0 ..< 200).map(i -> s.spawn(() ->
+      val r = busy.use(c -> c.queryValue[int]("select $1::int4 from pg_sleep(0.01)", i))
+      _ = finished.add(1)
+      r match
+        Ok(n) -> if n == i then 1 else 99
+        Err(PoolBusy) -> 0
+        Err(_) -> 99))
+    started.map(t -> t.join()))
+  assertEq(results.count(r -> r == 99), 0)
+  val stats = busy.stats()
+  assertEq(long(results.count(r -> r == 1)), stats.acquires)
+  assertEq(long(results.count(r -> r == 0)), stats.rejected)
+  assert(stats.rejected > 0)
+  assertEq(overBound.load(), 0)
+  busy.close()
+  Ok(())
+
+@test("timeouts are counted, and a zero bound means a caller never waits")
+timeoutsCounted() -> Result[unit, PgError]
+  val url = testUrl() match
+    Some(u) -> u
+    None -> return Ok(())
+  val db = PgPool.open(url, maxSize = 1, maxWaiting = Some(0), acquireTimeout = Some(millis(50)))?
+  assertEq(db.use(c -> c.queryValue[int]("select 1")), Ok(1))
+  scope(s ->
+    val holder = s.spawn(() -> db.use(c -> c.queryValue[string]("select pg_sleep(0.5)::text")))
+    assert(eventually(seconds(10), () -> db.stats().inUse == 1))
+    assertEq(db.use(c -> c.queryValue[int]("select 1")), Err(PoolBusy))
+    assert(holder.join().isOk))
+  db.close()
+  val timed = PgPool.open(url, maxSize = 1, acquireTimeout = Some(millis(50)))?
+  scope(s ->
+    val holder = s.spawn(() -> timed.use(c -> c.queryValue[string]("select pg_sleep(0.5)::text")))
+    assert(eventually(seconds(10), () -> timed.stats().inUse == 1))
+    assertEq(timed.use(c -> c.queryValue[int]("select 1")), Err(PoolTimedOut))
+    assertEq(timed.use(millis(0), c -> c.queryValue[int]("select 1")), Err(PoolTimedOut))
+    assert(holder.join().isOk))
+  val stats = timed.stats()
+  assertEq((stats.acquires, stats.timeouts, stats.waited), (long(1), long(2), long(0)))
+  timed.close()
+  Ok(())
+
+@test("a connection older than maxLifetime is replaced, and the health check keeps minIdle warm")
+lifetimeAndWarm() -> Result[unit, PgError]
+  val url = testUrl() match
+    Some(u) -> u
+    None -> return Ok(())
+  val db = PgPool.open(url, maxSize = 2, maxLifetime = Some(millis(300)), healthCheck = None)?
+  val first = db.use(c -> Ok(c.backendPid))?
+  assertEq(db.use(c -> Ok(c.backendPid)), Ok(first))
+  sleep(millis(400))
+  val second = db.use(c -> Ok(c.backendPid))?
+  assert(second != first)
+  // One that grows too old while lent is closed as it comes back.
+  db.use(c ->
+    sleep(millis(400))
+    Ok(()))?
+  val after = db.stats()
+  assertEq((after.total, after.created, after.destroyed), (0, long(2), long(2)))
+  db.close()
+
+  // The health check makes the minimum at once, and makes it again as connections age out: with
+  // jitter, ages between 200 and 400 milliseconds.
+  val warm = PgPool.open(
+    url,
+    maxSize = 5,
+    minIdle = 3,
+    maxLifetime = Some(millis(200)),
+    jitter = Some(millis(200)),
+    healthCheck = Some(millis(50))
+  )?
+  assert(eventually(seconds(10), () -> warm.stats().idle == 3))
+  assert(eventually(seconds(10), () -> warm.stats().destroyed >= 3))
+  assert(eventually(seconds(10), () -> warm.stats().idle == 3))
+  assert(warm.stats().created >= 6)
+  assertEq(warm.use(c -> c.queryValue[int]("select 7")), Ok(7))
+  warm.close()
+  assertEq(warm.stats().total, 0)
+  Ok(())
+
+@test("idle connections past idleTimeout are closed by the health check, down to minIdle")
+idleRetired() -> Result[unit, PgError]
+  val url = testUrl() match
+    Some(u) -> u
+    None -> return Ok(())
+  val db = PgPool.open(
+    url,
+    maxSize = 4,
+    minIdle = 1,
+    idleTimeout = Some(millis(200)),
+    healthCheck = Some(millis(50))
+  )?
+  val release = Channel[unit]()
+  scope(s ->
+    val held = (0 ..< 4).map(_ -> s.spawn(() -> db.use(c ->
+      _ = release.receive()
+      Ok(c.backendPid))))
+    assert(eventually(seconds(10), () -> db.stats().inUse == 4))
+    for _ in 0 ..< 4 do release.send(())
+    for t in held do assert(t.join().isOk))
+  assertEq(db.stats().total, 4)
+  assert(eventually(seconds(10), () -> db.stats().total == 1))
+  // It stays at the minimum: the last one is kept however long it idles.
+  sleep(millis(400))
+  val stats = db.stats()
+  assertEq((stats.total, stats.idle, stats.destroyed), (1, 1, long(3)))
+  db.close()
+  Ok(())
+
+@test("a connection idle for pingAfter is pinged before it is lent; one idle less is not")
+pingedWhenIdle() -> Result[unit, PgError]
+  val url = testUrl() match
+    Some(u) -> u
+    None -> return Ok(())
+  val pinging = PgPool.open(url, maxSize = 1, pingAfter = Some(millis(100)), healthCheck = None)?
+  val never = PgPool.open(url, maxSize = 1, pingAfter = None, healthCheck = None)?
+  val later = PgPool.open(url, maxSize = 1, pingAfter = Some(seconds(60)), healthCheck = None)?
+  for db in [pinging, never, later] do assertEq(db.use(c -> c.queryValue[int]("select 1")), Ok(1))
+  sleep(millis(300))
+  // The ping is the last the server was heard from, just now; unpinged, it was 300 ms ago.
+  assert(pinging.use(c -> Ok(c.idleFor))? < millis(100))
+  assert(never.use(c -> Ok(c.idleFor))? >= millis(300))
+  assert(later.use(c -> Ok(c.idleFor))? >= millis(300))
+  for db in [pinging, never, later] do db.close()
+  // A connection's own ping, and one on a closed connection.
+  val c = testConnection().get?
+  assertEq(c.ping(seconds(5)), Ok(()))
+  assert(c.idleFor < seconds(1))
+  c.close()?
+  assertEq(c.ping(seconds(5)), Err(pg.Closed))
+  Ok(())
+
+// The messages a server sends to start a session, for the silent server below.
+private frame(kind: char, body: Vector[byte]) -> Vector[byte]
+  val n = body.length + 4
+  [byte(int(kind)), byte((n >> 24) & 0xff), byte((n >> 16) & 0xff), byte((n >> 8) & 0xff), byte(n & 0xff)] ++ body
+
+private val sessionStart = frame('R', [byte(0), byte(0), byte(0), byte(0)]) ++ frame('Z', [byte(int('I'))])
+
+// A server that starts each of the `expected` sessions it is asked for and then never answers
+// anything, counting the sessions on `sessions`; each ends when its client hangs up.
+private silentServer(listener: TcpListener, expected: int, sessions: Atomic[int])
+  scope(s ->
+    for _ in 0 ..< expected
+      val conn = listener.accept() match
+        Ok(c) -> c
+        Err(_) -> break
+      _ = sessions.add(1)
+      s.spawn(() ->
+        // The startup message, which the client sends in one piece.
+        _ = conn.read(4096)
+        _ = conn.write(sessionStart.toArray())
+        while true
+          conn.read(4096) match
+            Ok(b) -> if b.length == 0 then break
+            Err(_) -> break
+        _ = conn.close())
+    _ = listener.close())
+
+@test("a pinged connection that does not answer in pingTimeout is let go, and a new one lent")
+pingTimesOut() -> Result[unit, PgError]
+  val listener = TcpListener.bind("127.0.0.1", 0).mapErr(e -> pg.Io(e))?
+  val port = listener.port()
+  val sessions = Atomic(0)
+  val config = PgConfig(host = "127.0.0.1", port = port, user = "fake", sslMode = pg.SslMode.Disable)
+  scope(s ->
+    s.spawn(() -> silentServer(listener, 2, sessions))
+    val db = PgPool.of(
+      config,
+      maxSize = 1,
+      pingAfter = Some(Duration(0)),
+      pingTimeout = millis(100),
+      healthCheck = None
+    )
+    // A fresh connection is never pinged: its body runs at once.
+    assertEq(db.use(c -> Ok(c.backendPid)), Ok(0))
+    // The idle one is pinged, does not answer, and is replaced.
+    val began = monotonic()
+    assertEq(db.use(c -> Ok(c.isBroken)), Ok(false))
+    assert(monotonic() - began >= millis(100))
+    val stats = db.stats()
+    assertEq((stats.created, stats.destroyed, stats.total), (long(2), long(1), 1))
+    assertEq(sessions.load(), 2)
+    db.close())
+  Ok(())

@@ -1,7 +1,7 @@
 module dev.avinlang.pg
 
-import avin.threads.{AcquireTimedOut, CreateFailed, Lease, Pool, PoolError, PoolStats}
-import avin.time.Duration
+import avin.threads.{AcquireTimedOut, Channel, CreateFailed, Lease, Pool, PoolError, QueueFull, Thread, spawn}
+import avin.time.{Duration, seconds}
 
 // Connections shared between threads: `use(f)` lends one to `f` and takes it back when `f` returns,
 // however it returns. A connection is made when one is asked for and none is idle, up to `maxSize`;
@@ -12,9 +12,25 @@ import avin.time.Duration
 //     val db = PgPool.open(url, maxSize = 8)?
 //     val names = db.use(c -> c.query("select name from users"))?
 //
+// Every wait parks only the calling lightweight thread, so thousands of threads may share a pool of
+// a few connections: callers waiting for a connection are served in the order they came. A caller
+// waits at most the pool's `acquireTimeout`, or the time its `use` gives, and fails with
+// `PoolTimedOut`; where `maxWaiting` callers already wait, one more fails at once with `PoolBusy`,
+// which a server answers with 503. A connection is retired once it is older than `maxLifetime`, or
+// has been idle longer than `idleTimeout` (keeping `minIdle`), each lengthened by the connection's own
+// random part of `jitter` so connections made together are not all replaced together. A connection
+// idle for at least `pingAfter` is pinged before it is lent, and one that does not answer within
+// `pingTimeout` is let go and another found. Every `healthCheck`, a thread of the pool's own retires
+// the connections past their limits and makes connections until the pool holds `minIdle`, which it
+// also does as soon as the pool is opened.
+//
 // A pool may be shared between threads and actors. `use`'s body is isolated, as a `Pool`'s is: it
 // gives back a sendable value, rows among them, and keeps nothing of the connection.
-class PgPool(private val pool: Pool[Connection, PgError]): Sendable
+class PgPool(
+    private val pool: Pool[Connection, PgError],
+    private val stop: Channel[unit],
+    private val keeper: Option[Thread[unit]]
+): Sendable
   // Runs `f` with a connection lent to it, waiting for one for at most the pool's `acquireTimeout`,
   // and answers what `f` answers.
   use[R: Sendable](@isolating f: (Connection) -> Result[R, PgError]) -> Result[R, PgError] =
@@ -39,41 +55,127 @@ class PgPool(private val pool: Pool[Connection, PgError]): Sendable
   // Makes connections until the pool holds its `minIdle`.
   warm() -> Result[unit, PgError] = pool.warm().mapErr(poolFailure)
 
-  // What the pool holds now.
-  stats() -> PoolStats = pool.stats()
+  // What the pool holds now, and what it has done since it was opened.
+  stats() -> PgPoolStats
+    val now = pool.stats()
+    val c = pool.counters()
+    PgPoolStats(
+      now.size,
+      now.idle,
+      now.lent,
+      now.waiting,
+      c.acquires,
+      c.waited,
+      c.waitTime,
+      c.timeouts,
+      c.rejected,
+      c.created,
+      c.destroyed
+    )
 
-  // Closes the pool: idle connections are closed now, lent ones as they come back.
-  close() = pool.close()
+  // Closes the pool: its health check stops, idle connections are closed now, and lent ones as they
+  // come back.
+  close()
+    stop.close()
+    if keeper is Some(k) then k.join()
+    pool.close()
+
+// What a pool holds and has done: `total` connections, made or being made, of which `idle` wait to
+// be lent and `inUse` are lent now, with `waiting` callers waiting for one; and since the pool was
+// opened, `acquires` connections lent, `waited` of them after waiting, taking `waitTime` in all from
+// the call to the lending, connecting and pinging included; `timeouts` callers whose time ran out and
+// `rejected` turned away with `PoolBusy`; and `created` connections made and `destroyed` closed.
+data PgPoolStats(
+    total: int,
+    idle: int,
+    inUse: int,
+    waiting: int,
+    acquires: long,
+    waited: long,
+    waitTime: Duration,
+    timeouts: long,
+    rejected: long,
+    created: long,
+    destroyed: long
+)
 
 object PgPool
   // A pool of connections made with the settings of the URL `url`. Nothing is connected until a
-  // connection is first asked for, or `warm` is called.
+  // connection is first asked for, `warm` is called, or the health check makes the `minIdle`.
   open(
       url: string,
       maxSize: int = 10,
       minIdle: int = 0,
-      idleTimeout: Option[Duration] = None,
-      acquireTimeout: Option[Duration] = None
-  ) -> Result[PgPool, PgError] = Ok(PgPool.of(PgConfig.parse(url)?, maxSize, minIdle, idleTimeout, acquireTimeout))
+      idleTimeout: Option[Duration] = Some(seconds(1800)),
+      acquireTimeout: Option[Duration] = None,
+      maxLifetime: Option[Duration] = Some(seconds(3600)),
+      jitter: Option[Duration] = None,
+      maxWaiting: Option[int] = None,
+      pingAfter: Option[Duration] = Some(seconds(1)),
+      pingTimeout: Duration = seconds(5),
+      healthCheck: Option[Duration] = Some(seconds(60))
+  ) -> Result[PgPool, PgError] = Ok(
+    PgPool.of(
+      PgConfig.parse(url)?,
+      maxSize,
+      minIdle,
+      idleTimeout,
+      acquireTimeout,
+      maxLifetime,
+      jitter,
+      maxWaiting,
+      pingAfter,
+      pingTimeout,
+      healthCheck
+    )
+  )
 
   // A pool of connections made with `config`.
   of(
       config: PgConfig,
       maxSize: int = 10,
       minIdle: int = 0,
-      idleTimeout: Option[Duration] = None,
-      acquireTimeout: Option[Duration] = None
-  ) -> PgPool = PgPool(
-    Pool[Connection, PgError](
+      idleTimeout: Option[Duration] = Some(seconds(1800)),
+      acquireTimeout: Option[Duration] = None,
+      maxLifetime: Option[Duration] = Some(seconds(3600)),
+      jitter: Option[Duration] = None,
+      maxWaiting: Option[int] = None,
+      pingAfter: Option[Duration] = Some(seconds(1)),
+      pingTimeout: Duration = seconds(5),
+      healthCheck: Option[Duration] = Some(seconds(60))
+  ) -> PgPool
+    val pool = Pool[Connection, PgError](
       () -> connect(config),
       maxSize,
       minIdle,
-      validate = Some(c -> c.isHealthy),
+      validate = Some(c -> lendable(c, pingAfter, pingTimeout)),
       destroy = Some(c -> discard(c)),
       idleTimeout = idleTimeout,
-      acquireTimeout = acquireTimeout
+      acquireTimeout = acquireTimeout,
+      maxLifetime = maxLifetime,
+      jitter = jitter,
+      maxWaiting = maxWaiting
     )
-  )
+    val stop = Channel[unit]()
+    val keeper = healthCheck.map(every -> spawn(() -> keep(pool, stop, every)))
+    PgPool(pool, stop, keeper)
+
+// Whether the idle connection `c` may be lent: it is healthy, and where it has been idle for at least
+// `pingAfter`, it answers a ping within `pingTimeout`.
+private lendable(c: Connection, pingAfter: Option[Duration], pingTimeout: Duration) -> bool
+  if !c.isHealthy then return false
+  pingAfter match
+    Some(after) if c.idleFor >= after -> c.ping(pingTimeout).isOk
+    _ -> true
+
+// The pool's health check: makes the `minIdle` at once, then every `every` until `stop` is closed
+// retires the connections past their limits and makes the `minIdle` again. A connection it cannot
+// make is tried again at the next check.
+private keep(pool: Pool[Connection, PgError], stop: Channel[unit], every: Duration)
+  _ = pool.warm()
+  while stop.receive(every).isEmpty && !stop.isClosed()
+    _ = pool.evictIdle()
+    _ = pool.warm()
 
 private discard(c: Connection)
   _ = c.close()
@@ -96,5 +198,6 @@ private flattened[R](r: Result[Result[R, PgError], PoolError[PgError]]) -> Resul
 
 private poolFailure(e: PoolError[PgError]) -> PgError = e match
   AcquireTimedOut -> PoolTimedOut
+  QueueFull -> PoolBusy
   PoolError.PoolClosed -> PoolClosed
   CreateFailed(inner) -> inner

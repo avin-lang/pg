@@ -8,7 +8,7 @@ import avin.io
 import avin.io.IoError
 import avin.net.{ByteStream, TcpStream}
 import avin.net.tls.{TlsClient, TlsStream}
-import avin.time.{Duration, seconds}
+import avin.time.{Duration, monotonic, seconds}
 
 // A statement prepared on a connection: its name there, its text, the types of its parameters as
 // the server settled them, and the columns its rows have (none for a statement that returns no
@@ -85,6 +85,8 @@ class Connection(
   private var counter = 0
   // How many transactions and savepoints are open.
   private var depth = 0
+  // When the server was last heard from, on the monotonic clock.
+  private var heard = monotonic()
 
   // The server process serving this connection, as `pg_backend_pid()` names it.
   backendPid -> int = pid
@@ -103,6 +105,20 @@ class Connection(
 
   // How many statements the connection keeps prepared.
   cachedStatements -> int = cache.size
+
+  // How long since the server last sent anything: since the last statement's answer, or since the
+  // connection was made.
+  idleFor -> Duration = monotonic() - heard
+
+  // Makes a round trip to the server, an empty statement, waiting at most `timeout` for the answer;
+  // a connection that fails it, or takes longer, is broken. A pool pings a connection that has been
+  // idle a while before lending it.
+  ping(timeout: Duration) -> Result[unit, PgError]
+    usable()?
+    stream.setTimeout(timeout).mapErr(e -> Io(e))?
+    val answered = simple("")
+    if stream.setTimeout(Duration(0)).isErr then broken = true
+    answered
 
   // ---- Running statements ----
 
@@ -379,6 +395,7 @@ class Connection(
         Err(e) ->
           broken = true
           return Err(e)
+      heard = monotonic()
       m.kind match
         'N' ->
           config.notices match

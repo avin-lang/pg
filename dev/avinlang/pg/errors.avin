@@ -57,6 +57,9 @@ data PgError
   Closed
   // No pooled connection came free before the time to wait ran out.
   PoolTimedOut
+  // Every pooled connection was in use and the pool's `maxWaiting` callers were already waiting, so
+  // the call failed at once: a server answers it with 503 Service Unavailable.
+  PoolBusy
   // The pool is closed.
   PoolClosed
 
@@ -80,6 +83,7 @@ impl Error for PgError
     RolledBack -> "the transaction was rolled back: a statement in it failed"
     Closed -> "the connection is closed"
     PoolTimedOut -> "timed out waiting for a pooled connection"
+    PoolBusy -> "too many callers are waiting for a pooled connection"
     PoolClosed -> "the pool is closed"
 
   cause -> Option[Error] = self match

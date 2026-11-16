@@ -126,3 +126,67 @@ transaction is rolled back (and let go if that fails); `validate` lends only a c
 open, idle, and has nothing unread from the server, which catches one the server ended while it sat
 idle. Ordinary use, one connection per request with a transaction inside, needs one pooled resource
 at a time.
+
+## The bounded queue, lifetimes, jitter and counters belong to `avin.threads.Pool`
+
+Settled on the user's delegation 2026-11-15 (branch `pool-production`, in pg and in avin). The
+pool's FIFO waiting, `maxWaiting` with its `QueueFull`, `maxLifetime`, `jitter` and the running
+totals of `counters()` were added to avin's `Pool` rather than built in `PgPool`: only the pool's
+lock knows the queue's length (a count kept outside overshoots by every caller racing past it),
+when a resource was made, and which calls waited. Every pooled resource wants them, and pgx keeps
+the same split, its generic `puddle` pool counting and `pgxpool` choosing the policy. `PgPool` keeps
+what is PostgreSQL's: the ping, the health-check thread and the defaults. This pg branch needs the
+avin release that carries them. **Review with the user**: it makes pg's branch depend on an avin
+branch landing and releasing first.
+
+## pgx's policy and defaults
+
+Settled on the user's delegation 2026-11-15. `maxLifetime` 1 hour, `idleTimeout` 30 minutes,
+`healthCheck` every minute and a ping for a connection idle at least 1 second are pgx's defaults,
+long proven under Go's lightweight threads; `maxSize` stays 10, and `maxWaiting`, `jitter` and
+`acquireTimeout` default to none, as pgx's do. Before this the pool had no lifetime and no idle
+limit. **Review with the user**: a lifetime and an idle limit are now on by default.
+
+`jitter` lengthens each connection's limits by its own random part of it, as pgx's
+`MaxConnLifetimeJitter` does, so a lifetime is a true minimum; one `jitter` serves both limits.
+
+## The health check is a thread of the pool's own
+
+Settled on the user's delegation 2026-11-15. Every `healthCheck` a lightweight thread calls the
+pool's `evictIdle` (connections past `maxLifetime` or `idleTimeout`) and `warm` (up to `minIdle`),
+and it warms once as soon as the pool opens, as pgx creates `MinConns` in the background. It waits
+on a channel with a timeout, so `close` ends it at once: `close` closes the channel, joins the
+thread, then closes the pool. A connection it cannot make is tried again at the next check; nobody
+waits on its failure. `healthCheck = None` runs no thread, for a pool that wants none (avin's own
+`Pool` has none, by its own decision). It does not ping idle connections, as pgx's does not:
+lending does.
+
+## Ping before lending a connection idle at least `pingAfter`
+
+Settled on the user's delegation 2026-11-15. A connection lent after sitting idle is first checked
+cheaply (open, not broken, not in a transaction, nothing unread), and where it was idle at least
+`pingAfter` also pinged: an empty statement, a round trip answered by EmptyQueryResponse, waiting at
+most `pingTimeout`; one that fails or is slower is broken, let go, and another found. "Idle" is
+`Connection.idleFor`, the time since the server was last heard from, which the connection keeps
+itself, so the pool needs no hook. pgx pings with `-- ping` when a connection has been idle over a
+second; the empty statement is the cheapest round trip the protocol has. Alternatives weighed:
+pinging every lend (a round trip per request); never pinging (a connection a firewall dropped
+silently is lent and fails the request); `validate` given the idle time by `Pool` (a change to
+`Pool`'s `validate` type for what the connection can say itself).
+
+## `PoolBusy`, and `PgPoolStats`
+
+Settled on the user's delegation 2026-11-15. `QueueFull` becomes `PoolBusy`, a case of its own so a
+server can answer 503 rather than 500 or a timeout's 504. `stats()` now answers `PgPoolStats`, the
+snapshot (`total`, `idle`, `inUse`, `waiting`) and the totals (`acquires`, `waited`, `waitTime`,
+`timeouts`, `rejected`, `created`, `destroyed`) in one value with a server's names, read from the
+pool's `stats()` and `counters()` a moment apart. It replaces the `PoolStats` that `stats()` answered
+before, whose names were the generic pool's.
+
+## Host lookup holds its worker
+
+Found 2026-11-15, reported to avin, not worked around: `TcpStream.connect` resolves the host with
+`sysl.net.resolve`, a `getaddrinfo` bound without `blocking`, so while the resolver waits the worker
+is held and no other worker is started in its place, and a collection waits for it. Every other wait
+the driver makes parks the lightweight thread on the runtime's poller or its locks. A numeric host
+(`127.0.0.1`) or one in the hosts file answers at once, so this shows only with a slow resolver.

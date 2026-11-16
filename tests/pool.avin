@@ -42,10 +42,10 @@ concurrentLoad() -> Result[unit, PgError]
   assertEq(pids.length, threads * rounds)
   assert(1 <= pids.distinct.length <= 3)
   val stats = db.stats()
-  assert(stats.size <= 3)
-  assertEq((stats.lent, stats.waiting), (0, 0))
+  assert(stats.total <= 3)
+  assertEq((stats.inUse, stats.waiting), (0, 0))
   // Every connection came back idle and clean.
-  assertEq(stats.idle, stats.size)
+  assertEq(stats.idle, stats.total)
   db.close()
   Ok(())
 
@@ -90,7 +90,7 @@ terminatedIdle() -> Result[unit, PgError]
   val second = pidOf(db)?
   assert(second != first)
   assertEq(db.use(c -> c.queryValue[int]("select 2")), Ok(2))
-  assertEq(db.stats().size, 1)
+  assertEq(db.stats().total, 1)
   db.close()
   Ok(())
 
@@ -109,7 +109,7 @@ terminatedLent() -> Result[unit, PgError]
   assert(failed.isErr)
   val second = pidOf(db)?
   assert(second != first)
-  assertEq(db.stats().size, 1)
+  assertEq(db.stats().total, 1)
   db.close()
   Ok(())
 
@@ -163,7 +163,7 @@ creationFails() -> Result[unit, PgError]
     None -> return Ok(())
   val db = PgPool.open(url, maxSize = 2)?
   assertEq(db.use(c -> c.queryValue[int]("select 1")).err.flatMap(e -> e.code), Some("28P01"))
-  assertEq(db.stats().size, 0)
+  assertEq(db.stats().total, 0)
   db.close()
   assert(isConfig(PgPool.open("mysql://x@localhost/db")))
   assert(isConfig(PgPool.open("postgres://x@localhost/db?bogus=1")))
@@ -174,9 +174,9 @@ warmed() -> Result[unit, PgError]
   val url = testUrl() match
     Some(u) -> u
     None -> return Ok(())
-  val db = PgPool.open(url, maxSize = 4, minIdle = 2)?
-  assertEq(db.stats().size, 0)
+  val db = PgPool.open(url, maxSize = 4, minIdle = 2, healthCheck = None)?
+  assertEq(db.stats().total, 0)
   db.warm()?
-  assertEq((db.stats().size, db.stats().idle), (2, 2))
+  assertEq((db.stats().total, db.stats().idle), (2, 2))
   db.close()
   Ok(())

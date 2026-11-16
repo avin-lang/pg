@@ -7,7 +7,7 @@ module tests
 import avin.threads.withTimeout
 import avin.time.seconds
 import dev.avinlang.pg
-import dev.avinlang.pg.{Connection, PgColumn, PgConfig, PgError, PgPool, FromRow}
+import dev.avinlang.pg.{Connection, PgColumn, PgConfig, PgError, PgPool, PoolBusy, FromRow}
 
 data ReadmeItem(id: int, @PgColumn("name") label: string, price: Option[BigDecimal] = None) derives FromRow
 
@@ -85,6 +85,37 @@ readmePool() -> Result[unit, PgError]
   val names = pool.use(c -> c.query("select name from (values ('ada'), ('grace')) as customers(name)"))?
   assertEq(names.map(r -> r.get[string]("name")), [Ok("ada"), Ok("grace")])
   pool.close()
+  Ok(())
+
+// The README's status for one request on `pool`.
+private statusOf(pool: PgPool) -> int =
+  pool.use(c -> c.queryValue[long]("select count(*) from (values (1), (2)) as orders(id)")) match
+    Ok(_) -> 200
+    Err(PoolBusy) -> 503
+    Err(_) -> 500
+
+@test("the README's pool for a server: its settings, 200 or 503, and its stats")
+readmeServerPool() -> Result[unit, PgError]
+  val url = testUrl() match
+    Some(u) -> u
+    None -> return Ok(())
+  val pool = PgPool.open(
+    url,
+    maxSize = 10,
+    minIdle = 2,
+    acquireTimeout = Some(seconds(2)),
+    maxWaiting = Some(500),
+    maxLifetime = Some(seconds(1800)),
+    jitter = Some(seconds(120))
+  )?
+  assertEq(statusOf(pool), 200)
+  val busy = pool.stats()
+  assertEq(s"${busy.inUse} in use, ${busy.waiting} waiting, ${busy.acquires} served", "0 in use, 0 waiting, 1 served")
+  pool.close()
+  // With every connection in use and no room to wait, the answer is 503.
+  val full = PgPool.open(url, maxSize = 1, maxWaiting = Some(0))?
+  assertEq(full.use(c -> Ok(statusOf(full))), Ok(503))
+  full.close()
   Ok(())
 
 @test("the README's cancellation: a statement past its time is cancelled")

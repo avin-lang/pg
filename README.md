@@ -133,7 +133,7 @@ db.execute("insert into users values ($1)", "ada@example.com") match
 ```
 
 The others: `Io` (the connection could not be made, broke or timed out), `Tls`, `TlsRefused`, `Auth`,
-`Protocol`, `BadColumn`, `Config`, `RolledBack`, `Closed`, `PoolTimedOut` and `PoolClosed`. A
+`Protocol`, `BadColumn`, `Config`, `RolledBack`, `Closed`, `PoolTimedOut`, `PoolBusy` and `PoolClosed`. A
 connection that broke is `isBroken`, and answers `Closed` from then on.
 
 Notices and warnings the server sends go to `PgConfig`'s `notices`, a function given each
@@ -170,6 +170,53 @@ import dev.avinlang.pg.PgPool
 
 val pool = PgPool.open("postgres://app:secret@localhost/shop", maxSize = 8)?
 val names = pool.use(c -> c.query("select name from customers"))?
+pool.close()
+```
+
+### A pool for a server
+
+Every wait the driver makes parks only the lightweight thread making it: connecting, reading and
+writing, the TLS handshake, and waiting for a pooled connection, so thousands of request threads can
+share a pool of ten while every other thread keeps running. The pool's settings, all named
+arguments of `PgPool.open` and `PgPool.of`:
+
+| Setting | Default | What it does |
+|---|---|---|
+| `maxSize` | 10 | connections at most |
+| `minIdle` | 0 | connections the health check keeps made, from the moment the pool opens |
+| `acquireTimeout` | none | how long a caller waits for a connection before `PoolTimedOut`; `use(timeout, f)` sets one call's |
+| `maxWaiting` | none | callers that may wait at once; one more fails at once with `PoolBusy` |
+| `maxLifetime` | 1 hour | a connection older than this is closed instead of lent again |
+| `idleTimeout` | 30 minutes | a connection idle longer than this is closed, keeping `minIdle` |
+| `jitter` | none | lengthens each connection's two limits by its own random part of this, so connections made together are not replaced together |
+| `pingAfter` | 1 second | a connection idle at least this long is pinged before it is lent |
+| `pingTimeout` | 5 seconds | a ping slower than this lets the connection go, and another is found |
+| `healthCheck` | 1 minute | how often the pool's own thread closes connections past their limits and makes up `minIdle`; `None` for no thread |
+
+Waiting callers are served in the order they came. A server answers `PoolBusy` with 503 rather than
+letting requests pile up, and exports `stats()`: `total`, `idle`, `inUse` and `waiting` now, and
+since the pool opened `acquires` (`waited` of them after waiting, `waitTime` in all), `timeouts`,
+`rejected`, and connections `created` and `destroyed`.
+
+```avin
+import dev.avinlang.pg.{PgPool, PoolBusy}
+import avin.time.{millis, seconds}
+
+val pool = PgPool.open(
+  "postgres://app:secret@localhost/shop",
+  maxSize = 10,
+  minIdle = 2,
+  acquireTimeout = Some(seconds(2)),
+  maxWaiting = Some(500),
+  maxLifetime = Some(seconds(1800)),
+  jitter = Some(seconds(120))
+)?
+val status = pool.use(c -> c.queryValue[long]("select count(*) from orders")) match
+  Ok(_) -> 200
+  Err(PoolBusy) -> 503
+  Err(_) -> 500
+val busy = pool.stats()
+println(s"${busy.inUse} in use, ${busy.waiting} waiting, ${busy.acquires} served")
 pool.close()
 ```
 
