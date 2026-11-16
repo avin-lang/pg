@@ -268,6 +268,39 @@ val logged = config with {queryTracer = Some(SlowQueryLog(millis(250)))}
 // slow query: 1.2s on backend 4711, 3 rows: select … from orders where …
 ```
 
+A batch tracer is told the batch starts, then, once the batch has been read, each statement's
+outcome in order (a statement an atomic batch skipped answers `Skipped`), then the end, which carries
+the first statement's failure. A batch whose thread is cancelled ends with `cancelled` set and no
+statements told. A pooled batch is traced by its connection's batch tracer, inside the pool's lend.
+
+```avin
+import avin.threads.Mutex
+import dev.avinlang.pg.{BatchEnd, BatchQuery, BatchSpan, BatchStart, BatchTracer}
+
+// Logs each batch as one line: its size, and the statements that failed.
+data BatchLine(log: @sendable (string) -> unit, failed: Mutex[Buffer[string]] = Mutex(Buffer[string]()))
+
+impl BatchTracer for BatchLine
+  batchStart(e: BatchStart) -> BatchSpan = BatchLine(log)
+
+impl BatchSpan for BatchLine
+  batchQuery(e: BatchQuery) = if e.error.isDefined then failed.with(b -> b.addOne(e.sql))
+  batchEnd(e: BatchEnd) = log(s"batch of ${e.size}, failed: ${failed.with(b -> b.toVector)}")
+
+val traced = config with {batchTracer = Some(BatchLine(line -> println(line)))}
+// batch of 3, failed: [select 1 / 0, select 3]
+```
+
+One hook holds one tracer; `QueryTracers`, `PrepareTracers`, `ConnectTracers`, `BatchTracers` and
+`PoolTracers` make several act as one, each told of every event in the order given, through a span of
+its own. So the slow-query log runs beside a program's own tracer:
+
+```avin
+import dev.avinlang.pg.QueryTracers
+
+val both = config with {queryTracer = Some(QueryTracers([SlowQueryLog(millis(250)), Numbered(line -> println(line))]))}
+```
+
 ## Not yet
 
 `LISTEN`/`NOTIFY` and `COPY` come next. A notification the server sends is dropped, and `COPY` is

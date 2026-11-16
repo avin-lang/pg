@@ -191,15 +191,44 @@ values over, for a development log. The slow-query log never writes them either 
 
 `SlowQueryLog(threshold, sink = eprintln)` writes one line for each statement whose time is at or
 past the threshold, failed and cancelled ones included: `slow query: <time> on backend <pid>, <rows
-| failed SQLSTATE | cancelled>: <sql>`. A sink of strings fits any logger. **Review with the user**: a
-program that wants both the slow log and its own tracer has to combine them itself, since a field holds
-one tracer; a combinator (pgx's `multitracer`) would be a small addition.
+| failed SQLSTATE | cancelled>: <sql>`. A sink of strings fits any logger; to run it beside a
+program's own tracer, the two are combined with `QueryTracers` (below).
 
-## The batch hook is defined for the batch protocol to call
+## Several tracers as one: `QueryTracers(Vector[QueryTracer])`, one combinator per hook
 
-`BatchTracer` (`batchStart(BatchStart) -> BatchSpan`, the span's `batchQuery` per statement and
-`batchEnd`) and `PgConfig.batchTracer` are in place, after pgx's `BatchTracer`, for the batch protocol
-to call from its own send and read.
+A hook field holds one tracer, so, after pgx's `multitracer`, `QueryTracers`, `PrepareTracers`,
+`ConnectTracers`, `BatchTracers` and `PoolTracers` each wrap a `Vector` of tracers of their kind and
+are one themselves. A start asks every tracer, in the vector's order, for its span; the combined span
+holds those spans and tells each the end (and, for batches, each statement; for the pool, the
+release) in the same order. Each tracer thus carries its own context exactly as it would alone. An
+empty vector watches nothing; the hook is still set, so it costs the option test plus an empty loop.
+Alternatives weighed: one `Tracers` value implementing all five traits from five vectors (a single
+name, but every program would build vectors for hooks it does not use, and a tracer of one kind
+could not be passed); a variadic `QueryTracers.of(a, b)` (the vector literal is as short); hook
+fields holding a `Vector` themselves (every unset hook would cost a length test instead of an option
+test, and the common one-tracer case would need brackets). Ends are told in start order rather than
+reverse (pgx's `multitracer` does the same); a program whose tracers nest, such as an outer timing
+span around an inner one, would want reverse. **Review with the user**: the order of ends.
+
+## Batches are traced around the whole send, the statements told once it has been read
+
+`sendBatch` on a connection whose configuration has a `batchTracer` runs between `batchStart` and
+`batchEnd`, in either mode, and a pool's `sendBatch` lends through the pool's traced lease, so the
+pool tracer sees the lend and return around the batch's own span. A cached statement found stale
+and the batch rerun is one traced batch. The batch is read eagerly, so the statements' outcomes are
+told in order after the last answer has been read, each with its text, parameter count, rows, tag
+and error (`Skipped` for those an atomic batch did not run), and before `batchEnd`. `batchEnd`
+carries the batch's own error where it could not be run at all (closed, broken), else the first
+statement's failure other than `Skipped`, which is what `BatchResults.failure` answers, as pgx's
+batch end carries the first error read. The end is told from a `defer`, as `tracedQuery` does, so a
+batch whose thread is cancelled ends with `cancelled` and no statements told. An empty batch is
+traced too (size 0, nothing told): every call is observed, and it costs nothing on the wire. The
+statements a batch prepares for itself are not told to the `prepareTracer`; they are part of the
+batch's one span. Alternatives weighed: telling each statement as its answer is read (closer to
+pgx's lazy reader, but the statements a refused send never ran would then be told out of order or
+not at all, and the eager reader gains nothing from it); telling the statements that did complete
+before a cancellation (they are not answers the caller will ever see). **Review with the user**:
+whether the batch's own preparing should be told to the prepare tracer.
 
 ## Batches: an immutable `Batch`, read eagerly into `BatchResults`
 

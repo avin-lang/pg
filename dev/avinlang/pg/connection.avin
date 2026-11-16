@@ -276,7 +276,14 @@ class Connection(
   // that statement's alone. Inside `transaction(f)` the statements belong to that transaction either
   // way, and a failure leaves it failed. The answer is an `Err` only where the batch could not be run
   // at all: the connection is closed, or broke.
-  sendBatch(batch: Batch, mode: BatchMode = Atomic) -> Result[BatchResults, PgError]
+  //
+  // The configuration's `batchTracer` is told the batch starts, then each statement's outcome in
+  // order once the batch has been read, then its end.
+  sendBatch(batch: Batch, mode: BatchMode = Atomic) -> Result[BatchResults, PgError] = config.batchTracer match
+    None -> runBatch(batch, mode)
+    Some(t) -> tracedBatch(t, batch, pid, () -> runBatch(batch, mode))
+
+  private runBatch(batch: Batch, mode: BatchMode) -> Result[BatchResults, PgError]
     usable()?
     if batch.isEmpty then return Ok(BatchResults([]))
     val wasIdle = status == 'I'

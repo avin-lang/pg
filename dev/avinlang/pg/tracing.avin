@@ -187,6 +187,84 @@ private slowLine(e: QueryEnd) -> string
       None -> s"${e.rows} rows"
   s"slow query: ${e.duration} on backend ${e.pid}, $outcome: ${e.sql}"
 
+// ---- Several tracers as one ----
+
+// A query tracer that tells each of `tracers`, in order, of every statement, so the slow-query log
+// can run beside a program's own tracer. Each tracer's span is told the end, in the same order.
+// With no tracers it watches nothing.
+//
+//     val both = QueryTracers([SlowQueryLog(millis(250)), metrics])
+//     val config = PgConfig(queryTracer = Some(both))
+data QueryTracers(tracers: Vector[QueryTracer])
+
+private data QuerySpans(spans: Vector[QuerySpan])
+
+impl QueryTracer for QueryTracers
+  queryStart(e: QueryStart) -> QuerySpan = QuerySpans(tracers.map(t -> t.queryStart(e)))
+
+impl QuerySpan for QuerySpans
+  queryEnd(e: QueryEnd) =
+    for s in spans
+      s.queryEnd(e)
+
+// A prepare tracer that tells each of `tracers`, in order, as `QueryTracers` does.
+data PrepareTracers(tracers: Vector[PrepareTracer])
+
+private data PrepareSpans(spans: Vector[PrepareSpan])
+
+impl PrepareTracer for PrepareTracers
+  prepareStart(e: PrepareStart) -> PrepareSpan = PrepareSpans(tracers.map(t -> t.prepareStart(e)))
+
+impl PrepareSpan for PrepareSpans
+  prepareEnd(e: PrepareEnd) =
+    for s in spans
+      s.prepareEnd(e)
+
+// A connect tracer that tells each of `tracers`, in order, as `QueryTracers` does.
+data ConnectTracers(tracers: Vector[ConnectTracer])
+
+private data ConnectSpans(spans: Vector[ConnectSpan])
+
+impl ConnectTracer for ConnectTracers
+  connectStart(e: ConnectStart) -> ConnectSpan = ConnectSpans(tracers.map(t -> t.connectStart(e)))
+
+impl ConnectSpan for ConnectSpans
+  connectEnd(e: ConnectEnd) =
+    for s in spans
+      s.connectEnd(e)
+
+// A batch tracer that tells each of `tracers`, in order, as `QueryTracers` does.
+data BatchTracers(tracers: Vector[BatchTracer])
+
+private data BatchSpans(spans: Vector[BatchSpan])
+
+impl BatchTracer for BatchTracers
+  batchStart(e: BatchStart) -> BatchSpan = BatchSpans(tracers.map(t -> t.batchStart(e)))
+
+impl BatchSpan for BatchSpans
+  batchQuery(e: BatchQuery) =
+    for s in spans
+      s.batchQuery(e)
+  batchEnd(e: BatchEnd) =
+    for s in spans
+      s.batchEnd(e)
+
+// A pool tracer that tells each of `tracers`, in order, as `QueryTracers` does.
+data PoolTracers(tracers: Vector[PoolTracer])
+
+private data AcquireSpans(spans: Vector[AcquireSpan])
+
+impl PoolTracer for PoolTracers
+  acquireStart() -> AcquireSpan = AcquireSpans(tracers.map(t -> t.acquireStart()))
+
+impl AcquireSpan for AcquireSpans
+  acquireEnd(e: AcquireEnd) =
+    for s in spans
+      s.acquireEnd(e)
+  released(e: Released) =
+    for s in spans
+      s.released(e)
+
 // ---- Calling the hooks ----
 
 // Runs `body`, a statement, between `tracer`'s start and end; `counted` gives a success's rows and
@@ -216,6 +294,47 @@ private tracedQuery[R](
 
 // A statement result's rows for a tracer: those read, or the command tag's count where that is more.
 private rowsOf(r: QueryResult) -> long = if r.affected > long(r.rows.length) then r.affected else long(r.rows.length)
+
+// Runs `body`, sending `batch`, between `tracer`'s start and end, telling the span each statement's
+// outcome in order once the batch has been read. A batch that could not be run at all has no
+// statements told, and ends with its error; one that was run ends with its first statement's failure,
+// where one failed. A cancelled thread's batch is ended from the `defer`, with no statements told.
+private tracedBatch(
+    tracer: BatchTracer,
+    batch: Batch,
+    pid: int,
+    body: () -> Result[BatchResults, PgError]
+) -> Result[BatchResults, PgError]
+  val size = batch.items.length
+  val span = tracer.batchStart(BatchStart(size, pid))
+  val began = monotonic()
+  var ended = false
+  defer
+    if !ended then span.batchEnd(BatchEnd(size, pid, monotonic() - began, None, true))
+  val result = body()
+  ended = true
+  val error = result match
+    Err(e) -> Some(e)
+    Ok(rs) ->
+      for i in 0 ..< rs.results.length
+        val item = batch.items(i)
+        val n = item.params.length
+        span.batchQuery(rs.results(i) match
+          Ok(r) -> BatchQuery(item.sql, n, rowsOf(r), r.tag, None)
+          Err(e) -> BatchQuery(item.sql, n, 0, "", Some(e)))
+      firstFailure(rs.results)
+  span.batchEnd(BatchEnd(size, pid, monotonic() - began, error, false))
+  result
+
+// The first statement's failure in `results`, passing over the `Skipped` ones: a statement that
+// could not be sent fails an atomic batch with those before it skipped.
+private firstFailure(results: Vector[Result[QueryResult, PgError]]) -> Option[PgError]
+  for r in results
+    r match
+      Err(Skipped) -> ()
+      Err(e) -> return Some(e)
+      Ok(_) -> ()
+  None
 
 // Runs `body`, preparing `sql` as `name`, between `tracer`'s start and end.
 private tracedPrepare(

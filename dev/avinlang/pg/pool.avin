@@ -81,7 +81,7 @@ class PgPool(private val pool: Pool[Connection, PgError], private val tracer: Op
 
   // Runs the statements of `batch` together on a pooled connection (`Connection.sendBatch`).
   sendBatch(batch: Batch, mode: BatchMode = Atomic) -> Result[BatchResults, PgError] =
-    flattened(pool.lease(l -> lent(l, c -> c.sendBatch(batch, mode))))
+    leased(None, c -> c.sendBatch(batch, mode))
 
   // Makes connections until the pool holds its `minIdle`.
   warm() -> Result[unit, PgError] = pool.warm().mapErr(poolFailure)

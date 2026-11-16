@@ -9,7 +9,8 @@ import avin.time.{Duration, millis}
 import dev.avinlang.pg
 
 import dev.avinlang.pg.{
-  AcquireEnd, AcquireSpan, BatchEnd, BatchQuery, BatchSpan, BatchStart, BatchTracer, Cleartext, ConnectEnd, ConnectSpan,
+  Batch, BatchTracers, Closed, ConnectTracers, PoolTracers, PrepareTracers, QueryTracers, Skipped, AcquireEnd,
+  AcquireSpan, BatchEnd, BatchQuery, BatchSpan, BatchStart, BatchTracer, Cleartext, ConnectEnd, ConnectSpan,
   ConnectStart, ConnectTracer, Connection, Md5, PgConfig, PgError, PgInt, PgPool, PgText, PoolClosed, PoolTimedOut,
   PoolTracer, PrepareEnd, PrepareSpan, PrepareStart, PrepareTracer, QueryEnd, QuerySpan, QueryStart, QueryTracer,
   Released, ScramSha256, Server, SlowQueryLog, Trust
@@ -551,3 +552,352 @@ batchShape()
   span.batchQuery(BatchQuery("select 1", 0, 1, "SELECT 1", None))
   span.batchEnd(BatchEnd(2, 9, millis(1), None, false))
   assertEq(items(b.events), ["start 2 on 9", "select 1 1 SELECT 1", "end 2 false"])
+
+// ---- Batches ----
+
+// Every batch event, each statement and end paired with its start by the id its span carries.
+class BatchLog: Sendable
+  val next = Atomic(0)
+  val starts = Mutex(Buffer[(int, BatchStart)]())
+  val queries = Mutex(Buffer[(int, BatchQuery)]())
+  val ends = Mutex(Buffer[(int, BatchEnd)]())
+
+data BatchLogSpan(id: int, log: BatchLog)
+
+impl BatchTracer for BatchLog
+  batchStart(e: BatchStart) -> BatchSpan
+    val n = next.add(1)
+    push(starts, (n, e))
+    BatchLogSpan(n, self)
+
+impl BatchSpan for BatchLogSpan
+  batchQuery(e: BatchQuery) = push(log.queries, (id, e))
+  batchEnd(e: BatchEnd) = push(log.ends, (id, e))
+
+// The one batch `log` saw: its start, its statements as `sql rows tag code`, and its end, each
+// checked to belong to that start.
+private onlyBatch(log: BatchLog) -> (BatchStart, Vector[string], BatchEnd)
+  val starts = items(log.starts)
+  val ends = items(log.ends)
+  assertEq((starts.length, ends.length), (1, 1))
+  val (id, start) = starts(0)
+  assertEq(ends(0).0, id)
+  val queries = items(log.queries)
+  assert(queries.forall(q -> q.0 == id))
+  val end = ends(0).1
+  assertEq((end.size, end.pid), (start.size, start.pid))
+  assert(!end.duration.isNegative)
+  (start, queries.map(q -> described(q.1)), end)
+
+private described(q: BatchQuery) -> string = q.error match
+  Some(e) -> s"${q.sql}/${q.paramCount}: ${e.code.getOrElse(e.message)}"
+  None -> s"${q.sql}/${q.paramCount}: ${q.rows} ${q.tag}"
+
+private batchLogged(log: BatchLog) -> Option[Result[Connection, PgError]] = testUrl().map(u ->
+  pg.connect(PgConfig.parse(u)? with {batchTracer = Some(log)}))
+
+@test("a batch is traced in either mode: its start, each statement's outcome in order, and its end")
+batchTraced() -> Result[unit, PgError]
+  for mode in [pg.Atomic, pg.Independent]
+    val log = BatchLog()
+    val c = batchLogged(log) match
+      Some(cr) -> cr?
+      None -> return Ok(())
+    val b = Batch()
+      .queue("create temporary table bt (n int)")
+      .queue("insert into bt values ($1), ($2)", 1, 2)
+      .queue("select n from bt order by n")
+    val results = c.sendBatch(b, mode)?
+    assertEq(results.length, 3)
+    val (start, queries, end) = onlyBatch(log)
+    assertEq((start.size, start.pid), (3, c.backendPid))
+    assertEq(
+      queries,
+      [
+        "create temporary table bt (n int)/0: 0 CREATE TABLE",
+        "insert into bt values ($1), ($2)/2: 2 INSERT 0 2",
+        "select n from bt order by n/0: 2 SELECT 2"
+      ]
+    )
+    assertEq((end.error, end.cancelled), (None, false))
+    c.close()?
+  Ok(())
+
+@test("a statement failing mid-batch is traced with its SQLSTATE: Skipped after it when atomic, run on when not")
+batchFailureTraced() -> Result[unit, PgError]
+  // A skipped statement has no SQLSTATE, so it is described by its message.
+  val expected = [
+    (pg.Atomic, ["select 1/0: 1 SELECT 1", "select 1 / $1/1: 22012", s"select 3/0: ${Skipped.message}"]),
+    (pg.Independent, ["select 1/0: 1 SELECT 1", "select 1 / $1/1: 22012", "select 3/0: 1 SELECT 1"])
+  ]
+  for (mode, lines) in expected
+    val log = BatchLog()
+    val c = batchLogged(log) match
+      Some(cr) -> cr?
+      None -> return Ok(())
+    val results = c.sendBatch(Batch().queue("select 1").queue("select 1 / $1", 0).queue("select 3"), mode)?
+    val (_, queries, end) = onlyBatch(log)
+    assertEq(queries, lines)
+    assertEq(end.error.flatMap(e -> e.code), Some("22012"))
+    assertEq(end.error, results.failure)
+    assert(!end.cancelled)
+    c.close()?
+  Ok(())
+
+@test("an empty batch, and one on a closed connection, are traced: no statements, the error at the end")
+batchEdgesTraced() -> Result[unit, PgError]
+  val log = BatchLog()
+  val c = batchLogged(log) match
+    Some(cr) -> cr?
+    None -> return Ok(())
+  assertEq(c.sendBatch(Batch())?.length, 0)
+  val (start, queries, end) = onlyBatch(log)
+  assertEq((start.size, queries, end.error, end.cancelled), (0, [], None, false))
+  c.close()?
+  val closed = BatchLog()
+  val d = batchLogged(closed).get?
+  d.close()?
+  assertEq(d.sendBatch(Batch().queue("select 1")).err, Some(Closed))
+  val (s2, q2, e2) = onlyBatch(closed)
+  assertEq((s2.size, q2, e2.error, e2.cancelled), (1, [], Some(Closed), false))
+  Ok(())
+
+@test("a batch whose thread is cancelled is traced as cancelled in either mode, and the next one is traced")
+batchCancelledTraced() -> Result[unit, PgError]
+  for mode in [pg.Atomic, pg.Independent]
+    val log = BatchLog()
+    val c = batchLogged(log) match
+      Some(cr) -> cr?
+      None -> return Ok(())
+    val b = Batch().queue("select 1").queue("select pg_sleep(30)").queue("select 2")
+    assert(withTimeout(millis(300), _ -> c.sendBatch(b, mode)).isEmpty)
+    val (start, queries, end) = onlyBatch(log)
+    assertEq((start.size, queries, end.error, end.cancelled), (3, [], None, true))
+    assertEq(c.queryValue[int]("select 7"), Ok(7))
+    c.sendBatch(Batch().queue("select 8"), mode)?
+    assertEq(items(log.ends).map(e -> e.1.cancelled), [true, false])
+    assertEq(items(log.queries).length, 1)
+    c.close()?
+  Ok(())
+
+// A pool whose connections have `log` as their batch tracer and `r` as the pool's.
+private batchPool(log: BatchLog, r: Recorder, maxSize: int) -> Option[Result[PgPool, PgError]] = testUrl().map(u ->
+  Ok(PgPool.of(
+      PgConfig.parse(u)? with {batchTracer = Some(log), poolTracer = Some(r)},
+      maxSize = maxSize,
+      acquireTimeout = Some(millis(20000))
+  )))
+
+@test("a pooled batch is traced by the batch tracer and lent and returned under the pool tracer")
+pooledBatchTraced() -> Result[unit, PgError]
+  val log = BatchLog()
+  val r = Recorder()
+  val db = batchPool(log, r, 2) match
+    Some(p) -> p?
+    None -> return Ok(())
+  val results = db.sendBatch(Batch().queue("select 1").queue("select 1 / 0"), pg.Independent)?
+  assertEq(results.length, 2)
+  val (start, queries, end) = onlyBatch(log)
+  assertEq(queries, ["select 1/0: 1 SELECT 1", "select 1 / 0/0: 22012"])
+  assertEq(end.error.flatMap(e -> e.code), Some("22012"))
+  val lent = items(r.acquireEnds)
+  val back = items(r.releases)
+  assertEq((lent.length, back.length), (1, 1))
+  assertEq((lent(0).1.pid, back(0).1.pid), (start.pid, start.pid))
+  assertEq(lent(0).0, back(0).0)
+  db.close()
+  Ok(())
+
+private batchSums(db: PgPool, t: int, rounds: int) -> Result[long, PgError]
+  var sum = long(0)
+  for i in 0 ..< rounds
+    val rs = db.sendBatch(Batch().queue("select $1::int8", t).queue("select $1::int8", i))?
+    sum += rs.get(0)?.rows(0).get[long](0)? + rs.get(1)?.rows(0).get[long](0)?
+  Ok(sum)
+
+@test("many threads send batches through one pool: every batch traced once, its statements in its own span")
+manyBatchThreads() -> Result[unit, PgError]
+  val log = BatchLog()
+  val r = Recorder()
+  val db = batchPool(log, r, 3) match
+    Some(p) -> p?
+    None -> return Ok(())
+  val threads = 24
+  val rounds = 5
+  val answers = scope(s ->
+    val started = (0 ..< threads).map(t -> s.spawn(() -> batchSums(db, t, rounds)))
+    started.map(th -> th.join()))
+  for t in 0 ..< threads
+    assertEq(answers(t), Ok(long(t * rounds + rounds * (rounds - 1) / 2)))
+  val starts = items(log.starts)
+  val ends = items(log.ends)
+  assertEq((starts.length, ends.length), (threads * rounds, threads * rounds))
+  assertEq(HashMap.from(starts).size, threads * rounds)
+  val queries = items(log.queries)
+  assertEq(queries.length, 2 * threads * rounds)
+  // Each span told exactly its own two statements.
+  for (id, _) in starts
+    assertEq(queries.filter(q -> q.0 == id).length, 2)
+  assert(ends.forall(e -> !e.1.cancelled && e.1.error.isEmpty))
+  assertEq(items(r.releases).length, threads * rounds)
+  db.close()
+  Ok(())
+
+// ---- Several tracers as one ----
+
+// A tracer of every kind that writes `name` and the event to one shared list, so the order in which
+// several are told can be read.
+data Named(name: string, lines: Mutex[Buffer[string]])
+
+impl QueryTracer for Named
+  queryStart(e: QueryStart) -> QuerySpan
+    push(lines, s"$name query start ${e.sql}")
+    self
+
+impl QuerySpan for Named
+  queryEnd(e: QueryEnd) = push(lines, s"$name query end ${e.rows}")
+
+impl PrepareTracer for Named
+  prepareStart(e: PrepareStart) -> PrepareSpan
+    push(lines, s"$name prepare start ${e.sql}")
+    self
+
+impl PrepareSpan for Named
+  prepareEnd(e: PrepareEnd) = push(lines, s"$name prepare end ${e.columnCount}")
+
+impl ConnectTracer for Named
+  connectStart(e: ConnectStart) -> ConnectSpan
+    push(lines, s"$name connect start")
+    self
+
+impl ConnectSpan for Named
+  connectEnd(e: ConnectEnd) = push(lines, s"$name connect end ${e.error.isEmpty}")
+
+impl BatchTracer for Named
+  batchStart(e: BatchStart) -> BatchSpan
+    push(lines, s"$name batch start ${e.size}")
+    self
+
+impl BatchSpan for Named
+  batchQuery(e: BatchQuery) = push(lines, s"$name batch query ${e.sql}")
+  batchEnd(e: BatchEnd) = push(lines, s"$name batch end")
+
+impl PoolTracer for Named
+  acquireStart() -> AcquireSpan
+    push(lines, s"$name acquire start")
+    self
+
+impl AcquireSpan for Named
+  acquireEnd(e: AcquireEnd) = push(lines, s"$name acquire end")
+  released(e: Released) = push(lines, s"$name released")
+
+@test("each tracer combinator tells two tracers of every event, in order, each through its own span")
+twoTracers() -> Result[unit, PgError]
+  val lines = Mutex(Buffer[string]())
+  val a = Named("a", lines)
+  val b = Named("b", lines)
+  val url = testUrl() match
+    Some(u) -> u
+    None -> return Ok(())
+  val config = PgConfig.parse(url)? with {
+    queryTracer = Some(QueryTracers([a, b])),
+    prepareTracer = Some(PrepareTracers([a, b])),
+    connectTracer = Some(ConnectTracers([a, b])),
+    batchTracer = Some(BatchTracers([a, b])),
+    poolTracer = Some(PoolTracers([a, b]))
+  }
+  val db = PgPool.of(config, maxSize = 1)
+  db.use(c ->
+    c.prepare("select 1 as one")?
+    c.query("select 2")?
+    c.sendBatch(Batch().queue("select 3")))?
+  db.close()
+  assertEq(
+    items(lines),
+    [
+      "a acquire start",
+      "b acquire start",
+      "a connect start",
+      "b connect start",
+      "a connect end true",
+      "b connect end true",
+      "a acquire end",
+      "b acquire end",
+      "a prepare start select 1 as one",
+      "b prepare start select 1 as one",
+      "a prepare end 1",
+      "b prepare end 1",
+      "a query start select 2",
+      "b query start select 2",
+      "a prepare start select 2",
+      "b prepare start select 2",
+      "a prepare end 1",
+      "b prepare end 1",
+      "a query end 1",
+      "b query end 1",
+      "a batch start 1",
+      "b batch start 1",
+      "a batch query select 3",
+      "b batch query select 3",
+      "a batch end",
+      "b batch end",
+      "a released",
+      "b released"
+    ]
+  )
+  Ok(())
+
+@test("a combinator of two recorders gives each its own spans, which pair as they would alone")
+combinedSpans() -> Result[unit, PgError]
+  val one = Recorder()
+  val two = Recorder()
+  val url = testUrl() match
+    Some(u) -> u
+    None -> return Ok(())
+  val c = pg.connect(PgConfig.parse(url)? with {queryTracer = Some(QueryTracers([one, two]))})?
+  c.query("select 1")?
+  assert(c.query("select nothing_here").isErr)
+  for r in [one, two]
+    val ends = pairedEnds(r)
+    assertEq(
+      ends.map(e -> (e.sql, e.rows, e.code)),
+      [("select 1", long(1), None), ("select nothing_here", long(0), Some("42703"))]
+    )
+  c.close()
+
+@test("combinators of no tracers watch nothing, and every operation runs as with no hook")
+zeroTracers() -> Result[unit, PgError]
+  val url = testUrl() match
+    Some(u) -> u
+    None -> return Ok(())
+  val config = PgConfig.parse(url)? with {
+    queryTracer = Some(QueryTracers([])),
+    prepareTracer = Some(PrepareTracers([])),
+    connectTracer = Some(ConnectTracers([])),
+    batchTracer = Some(BatchTracers([])),
+    poolTracer = Some(PoolTracers([]))
+  }
+  val db = PgPool.of(config, maxSize = 1)
+  assertEq(db.use(c -> c.queryValue[int]("select 1")), Ok(1))
+  assertEq(db.sendBatch(Batch().queue("select 2"))?.get(0)?.rows.length, 1)
+  assert(db.query("select nothing_here").isErr)
+  // The spans of no tracers are told an end with nothing to tell.
+  QueryTracers([]).queryStart(QueryStart("select 1", 0, 1)).queryEnd(ended("select 1", millis(1)))
+  db.close()
+  Ok(())
+
+@test("the slow-query log runs beside a program's own tracer: the log writes the slow one, the tracer sees both")
+slowBesideTracer() -> Result[unit, PgError]
+  val (log, lines) = slowLog(millis(200))
+  val r = Recorder()
+  val url = testUrl() match
+    Some(u) -> u
+    None -> return Ok(())
+  val c = pg.connect(PgConfig.parse(url)? with {queryTracer = Some(QueryTracers([log, r]))})?
+  c.query("select 1")?
+  c.query("select pg_sleep(0.3)")?
+  assertEq(pairedEnds(r).map(e -> e.sql), ["select 1", "select pg_sleep(0.3)"])
+  val logged = items(lines)
+  assertEq(logged.length, 1)
+  assert(logged(0).endsWith(s"on backend ${c.backendPid}, 1 rows: select pg_sleep(0.3)"))
+  c.close()
