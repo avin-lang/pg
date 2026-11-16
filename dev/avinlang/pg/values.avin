@@ -1,0 +1,645 @@
+module dev.avinlang.pg
+
+// Values as the server sends and takes them. A row holds each column already decoded as a `PgValue`,
+// so a row is plain data that can leave the connection, a pooled one's included. `FromPg` reads a
+// value as a type of the program's, and `ToPg` makes a parameter of one.
+
+import avin.encoding.{fromHex, toHex}
+import avin.time.{Date, DateTime, Instant, parseDate, parseDateTime, parseTime, parseTimestamp, Time}
+import avin.uuid.Uuid
+import dev.avinlang.json
+import dev.avinlang.json.Json
+
+// A value of a column or a parameter. Each type the client knows has its own variant; any other
+// arrives as its text, with its type's OID.
+data PgValue
+  // SQL NULL.
+  PgNull
+  // `boolean`.
+  PgBool(value: bool)
+  // `smallint`, `integer`, `bigint` and `oid`.
+  PgInt(value: long)
+  // `real` and `double precision`.
+  PgReal(value: real)
+  // `numeric`, any precision; a `NaN` or infinite one arrives as `PgOther`.
+  PgNumeric(value: BigDecimal)
+  // `text`, `varchar`, `char(n)`, `name` and `"char"`.
+  PgText(value: string)
+  // `bytea`.
+  PgBytes(value: Vector[byte])
+  // `uuid`.
+  PgUuid(value: Uuid)
+  // `date`; `infinity` is `Date.Max` and `-infinity` `Date.Min`.
+  PgDate(value: Date)
+  // `time`, without a zone.
+  PgTime(value: Time)
+  // `timestamp`, without a zone; `infinity` is `DateTime.Max` and `-infinity` `DateTime.Min`.
+  PgTimestamp(value: DateTime)
+  // `timestamptz`; `infinity` is `Instant.Max` and `-infinity` `Instant.Min`.
+  PgTimestamptz(value: Instant)
+  // `json` and `jsonb`.
+  PgJson(value: Json)
+  // An array, its elements' type `elementOid`; a multidimensional one holds arrays.
+  PgArray(elementOid: int, items: Vector[PgValue])
+  // A value of a type the client does not decode, as the server writes it in text.
+  PgOther(oid: int, text: string)
+
+// A column of a result: its name and its type's OID.
+data Column(name: string, typeOid: int)
+
+// The type OIDs the client knows.
+private val OidBool = 16
+private val OidBytea = 17
+private val OidChar = 18
+private val OidName = 19
+private val OidInt8 = 20
+private val OidInt2 = 21
+private val OidInt4 = 23
+private val OidText = 25
+private val OidOid = 26
+private val OidJson = 114
+private val OidFloat4 = 700
+private val OidFloat8 = 701
+private val OidBpchar = 1042
+private val OidVarchar = 1043
+private val OidDate = 1082
+private val OidTime = 1083
+private val OidTimestamp = 1114
+private val OidTimestamptz = 1184
+private val OidNumeric = 1700
+private val OidUuid = 2950
+private val OidJsonb = 3802
+
+// The days from 1970-01-01 to 2000-01-01, the server's epoch, and the microseconds.
+private val EpochDays: long = 10957
+private val MicrosPerDay: long = 86400000000
+private val EpochMicros: long = 946684800000000
+
+// The element type of the array type `oid`, or 0 where `oid` is not an array type the client knows.
+private elementOf(oid: int) -> int
+elementOf(1000) = OidBool
+elementOf(1001) = OidBytea
+elementOf(1002) = OidChar
+elementOf(1003) = OidName
+elementOf(1016) = OidInt8
+elementOf(1005) = OidInt2
+elementOf(1007) = OidInt4
+elementOf(1009) = OidText
+elementOf(1028) = OidOid
+elementOf(199) = OidJson
+elementOf(1021) = OidFloat4
+elementOf(1022) = OidFloat8
+elementOf(1014) = OidBpchar
+elementOf(1015) = OidVarchar
+elementOf(1182) = OidDate
+elementOf(1183) = OidTime
+elementOf(1115) = OidTimestamp
+elementOf(1185) = OidTimestamptz
+elementOf(1231) = OidNumeric
+elementOf(2951) = OidUuid
+elementOf(3807) = OidJsonb
+elementOf(_) = 0
+
+// The array type whose elements are `oid`, or 0.
+private arrayOf(oid: int) -> int
+arrayOf(16) = 1000
+arrayOf(17) = 1001
+arrayOf(18) = 1002
+arrayOf(19) = 1003
+arrayOf(20) = 1016
+arrayOf(21) = 1005
+arrayOf(23) = 1007
+arrayOf(25) = 1009
+arrayOf(26) = 1028
+arrayOf(114) = 199
+arrayOf(700) = 1021
+arrayOf(701) = 1022
+arrayOf(1042) = 1014
+arrayOf(1043) = 1015
+arrayOf(1082) = 1182
+arrayOf(1083) = 1183
+arrayOf(1114) = 1115
+arrayOf(1184) = 1185
+arrayOf(1700) = 1231
+arrayOf(2950) = 2951
+arrayOf(3802) = 3807
+arrayOf(_) = 0
+
+// Whether values of type `oid` are asked for, and sent, in binary: every type the client knows but
+// `numeric`, whose binary form is base-10000 digits, and `time`, whose `24:00:00` no `Time` holds.
+private binaryType(oid: int) -> bool =
+  if oid == OidNumeric || oid == OidTime then false
+  elif elementOf(oid) != 0 then binaryType(elementOf(oid))
+  else isKnown(oid)
+
+// Every scalar type the client knows has an array type it knows.
+private isKnown(oid: int) -> bool = arrayOf(oid) != 0
+
+// The name of type `oid`, for an error message.
+private typeName(oid: int) -> string
+typeName(16) = "boolean"
+typeName(17) = "bytea"
+typeName(18) = "\"char\""
+typeName(19) = "name"
+typeName(20) = "bigint"
+typeName(21) = "smallint"
+typeName(23) = "integer"
+typeName(25) = "text"
+typeName(26) = "oid"
+typeName(114) = "json"
+typeName(700) = "real"
+typeName(701) = "double precision"
+typeName(1042) = "character"
+typeName(1043) = "character varying"
+typeName(1082) = "date"
+typeName(1083) = "time"
+typeName(1114) = "timestamp"
+typeName(1184) = "timestamptz"
+typeName(1700) = "numeric"
+typeName(2950) = "uuid"
+typeName(3802) = "jsonb"
+typeName(oid) = if elementOf(oid) != 0 then typeName(elementOf(oid)) + "[]" else s"the type with OID $oid"
+
+// What a value holds, for an error message.
+private kindOf(v: PgValue) -> string = v match
+  PgNull -> "NULL"
+  PgBool(_) -> "a boolean"
+  PgInt(_) -> "an integer"
+  PgReal(_) -> "a floating-point number"
+  PgNumeric(_) -> "a numeric"
+  PgText(_) -> "text"
+  PgBytes(_) -> "bytea"
+  PgUuid(_) -> "a uuid"
+  PgDate(_) -> "a date"
+  PgTime(_) -> "a time"
+  PgTimestamp(_) -> "a timestamp"
+  PgTimestamptz(_) -> "a timestamptz"
+  PgJson(_) -> "JSON"
+  PgArray(_, _) -> "an array"
+  PgOther(oid, _) -> typeName(oid)
+
+// ---- Decoding what the server sends ----
+
+private dateOfDays(days: int) -> Date =
+  if days == int.MaxValue then Date.Max elif days == int.MinValue then Date.Min else Date(days + int(EpochDays))
+
+private readingOfMicros(us: long) -> DateTime
+  if us == long.MaxValue then return DateTime.Max
+  if us == long.MinValue then return DateTime.Min
+  val days = us.floorDiv(MicrosPerDay)
+  DateTime(Date(int(days + EpochDays)), Time(us.floorMod(MicrosPerDay)))
+
+private instantOfMicros(us: long) -> Instant =
+  if us == long.MaxValue then Instant.Max elif us == long.MinValue then Instant.Min else Instant(us + EpochMicros)
+
+// A value of type `oid` sent in binary.
+private decodeBinary(oid: int, bytes: Array[byte]) -> Result[PgValue, string]
+  val r = In(bytes)
+  val value = oid match
+    16 -> PgBool(r.byte1() != 0)
+    21 -> PgInt(long(r.int16()))
+    23 -> PgInt(long(r.int32()))
+    20 -> PgInt(r.int64())
+    26 -> PgInt(long(r.int32()) & 0xffffffff)
+    700 -> PgReal(real.fromBits32(r.int32()))
+    701 -> PgReal(real.fromBits(r.int64()))
+    25 | 1042 | 1043 | 19 | 18 -> return Ok(PgText(string.fromUtf8Lossy(bytes)))
+    17 -> return Ok(PgBytes(bytes.toVector))
+    2950 -> return Uuid.fromBytes(bytes.toVector).map(u -> PgUuid(u)).okOr("a uuid is not 16 bytes")
+    1082 -> PgDate(dateOfDays(r.int32()))
+    1114 -> PgTimestamp(readingOfMicros(r.int64()))
+    1184 -> PgTimestamptz(instantOfMicros(r.int64()))
+    114 -> return jsonOf(string.fromUtf8Lossy(bytes))
+    3802 ->
+      if bytes.length == 0 || int(bytes(0)) != 1 then return Err("an unknown jsonb version")
+      return jsonOf(string.fromUtf8Lossy(bytes.slice(1, bytes.length)))
+    _ ->
+      if elementOf(oid) != 0 then return decodeBinaryArray(bytes)
+      return Ok(PgOther(oid, string.fromUtf8Lossy(bytes)))
+  if r.failed || r.remaining != 0 then Err(s"a ${typeName(oid)} of ${bytes.length} bytes") else Ok(value)
+
+private jsonOf(text: string) -> Result[PgValue, string] = json.parse(text) match
+  Ok(j) -> Ok(PgJson(j))
+  Err(e) -> Err(s"JSON the client cannot read: ${e.message}")
+
+// An array sent in binary: its dimensions, its element type, and each element, its length first.
+private decodeBinaryArray(bytes: Array[byte]) -> Result[PgValue, string]
+  val r = In(bytes)
+  val dims = r.int32()
+  r.int32()
+  val element = r.int32()
+  if r.failed || dims < 0 || dims > 6 then return Err("an array whose header is broken")
+  if dims == 0 then return Ok(PgArray(element, []))
+  val sizes = Buffer[int]()
+  var i = 0
+  while i < dims
+    val size = r.int32()
+    r.int32()
+    if size < 0 then return Err("an array of negative size")
+    sizes.addOne(size)
+    i += 1
+  val items = arrayLevel(r, element, sizes.toVector, 0)?
+  if r.failed || r.remaining != 0 then return Err("an array whose elements do not fill it")
+  Ok(items)
+
+private arrayLevel(r: In, element: int, sizes: Vector[int], level: int) -> Result[PgValue, string]
+  val out = Buffer[PgValue]()
+  var i = 0
+  while i < sizes(level)
+    if level + 1 < sizes.length
+      out.addOne(arrayLevel(r, element, sizes, level + 1)?)
+    else
+      val n = r.int32()
+      if r.failed then return Err("an array cut short")
+      if n == -1
+        out.addOne(PgNull)
+      else
+        out.addOne(decodeBinary(element, r.bytes(n))?)
+    i += 1
+  Ok(PgArray(element, out.toVector))
+
+// A value of type `oid` sent as text. Text a known type cannot be read as, a `NaN` numeric or a
+// time of `24:00:00` for one, arrives as `PgOther`.
+private decodeText(oid: int, text: string) -> PgValue = textValue(oid, text).getOrElse(PgOther(oid, text))
+
+private textValue(oid: int, text: string) -> Option[PgValue] = oid match
+  16 -> if text == "t" then Some(PgBool(true)) elif text == "f" then Some(PgBool(false)) else None
+  21 | 23 | 20 | 26 -> text.toLongOption().map(n -> PgInt(n))
+  700 | 701 -> realOfText(text).map(x -> PgReal(x))
+  1700 -> BigDecimal.parse(text).map(n -> PgNumeric(n))
+  25 | 1042 | 1043 | 19 | 18 -> Some(PgText(text))
+  17 -> if text.startsWith("\\x") then fromHex(text.slice(2, text.byteLength)).ok.map(b -> PgBytes(b)) else None
+  2950 -> Uuid.parse(text).map(u -> PgUuid(u))
+  1082 ->
+    if text == "infinity" then Some(PgDate(Date.Max))
+    elif text == "-infinity" then Some(PgDate(Date.Min))
+    else parseDate(text).ok.map(d -> PgDate(d))
+  1083 -> parseTime(text).ok.map(t -> PgTime(t))
+  1114 ->
+    if text == "infinity" then Some(PgTimestamp(DateTime.Max))
+    elif text == "-infinity" then Some(PgTimestamp(DateTime.Min))
+    else parseDateTime(text).ok.map(t -> PgTimestamp(t))
+  1184 ->
+    if text == "infinity" then Some(PgTimestamptz(Instant.Max))
+    elif text == "-infinity" then Some(PgTimestamptz(Instant.Min))
+    else parseTimestamp(fullOffset(text)).ok.map(t -> PgTimestamptz(t))
+  114 | 3802 -> json.parse(text).ok.map(j -> PgJson(j))
+  _ -> if elementOf(oid) != 0 then TextArray(text, elementOf(oid)).read() else None
+
+// The server writes an offset of whole hours as `+05`, and of seconds as `+05:30:15`; the time
+// parser reads `+05:00` and `+05:30`.
+private fullOffset(text: string) -> string
+  val n = text.byteLength
+  if n >= 3 && (text.byteAt(n - 3) == byte(int('+')) || text.byteAt(n - 3) == byte(int('-'))) then text + ":00" else text
+
+private realOfText(text: string) -> Option[real]
+realOfText("NaN") = Some(real.NaN)
+realOfText("Infinity") = Some(real.PositiveInfinity)
+realOfText("-Infinity") = Some(real.NegativeInfinity)
+realOfText(text) = text.toRealOption()
+
+// An array written as text, `{1,2,NULL}`, `{"a b","c\"d"}`, `{{1,2},{3,4}}`, with its bounds before
+// it where they do not start at 1 (`[0:1]={1,2}`).
+private class TextArray(val text: string, val element: int)
+  var at = 0
+
+  private peek() -> int = if at < text.byteLength then int(text.byteAt(at)) else -1
+
+  read() -> Option[PgValue]
+    if peek() == int('[')
+      while at < text.byteLength && peek() != int('=') do at += 1
+      at += 1
+    val value = level()?
+    if at != text.byteLength then None else Some(value)
+
+  private level() -> Option[PgValue]
+    if peek() != int('{') then return None
+    at += 1
+    val items = Buffer[PgValue]()
+    if peek() == int('}')
+      at += 1
+      return Some(PgArray(element, items.toVector))
+    while true
+      if peek() == int('{')
+        items.addOne(level()?)
+      elif peek() == int('"')
+        items.addOne(decodeText(element, quoted()?))
+      else
+        val start = at
+        while at < text.byteLength && peek() != int(',') && peek() != int('}') do at += 1
+        val word = text.slice(start, at)
+        items.addOne(if word.toUpper == "NULL" then PgNull else decodeText(element, word))
+      if peek() == int(',')
+        at += 1
+      elif peek() == int('}')
+        at += 1
+        return Some(PgArray(element, items.toVector))
+      else return None
+    None
+
+  private quoted() -> Option[string]
+    at += 1
+    val out = Buffer[byte]()
+    while at < text.byteLength
+      val c = text.byteAt(at)
+      if c == byte(int('"'))
+        at += 1
+        return string.fromUtf8(out.toArray()).ok
+      if c == byte(int('\\'))
+        at += 1
+        if at >= text.byteLength then return None
+      out.addOne(text.byteAt(at))
+      at += 1
+    None
+
+// ---- Encoding parameters ----
+
+// `v` in binary as type `oid`, or `None` where it is not a value of that type the client writes in
+// binary.
+private encodeBinary(oid: int, v: PgValue) -> Option[Vector[byte]]
+  val out = Out()
+  (oid, v) match
+    (16, PgBool(b)) -> out.byte1(if b then 1 else 0)
+    (21, PgInt(n)) -> if -32768 <= n <= 32767 then out.int16(int(n)) else return None
+    (23, PgInt(n)) -> if long(int.MinValue) <= n <= long(int.MaxValue) then out.int32(int(n)) else return None
+    (20, PgInt(n)) -> out.int64(n)
+    (700, PgReal(x)) -> out.int32(x.toBits32)
+    (701, PgReal(x)) -> out.int64(x.toBits)
+    (25 | 1042 | 1043 | 19, PgText(s)) -> out.raw(s.bytes)
+    (17, PgBytes(b)) -> out.raw(b)
+    (2950, PgUuid(u)) -> out.raw(u.bytes())
+    (1082, PgDate(d)) -> out.int32(daysOfDate(d)?)
+    (1114, PgTimestamp(t)) -> out.int64(microsOfReading(t)?)
+    (1184, PgTimestamptz(t)) -> out.int64(microsOfInstant(t)?)
+    (114, PgJson(j)) -> out.raw(j.render.bytes)
+    (3802, PgJson(j)) -> out.byte1(1).raw(j.render.bytes)
+    (_, PgArray(element, items)) ->
+      if elementOf(oid) != element then return None
+      out.int32(if items.isEmpty then 0 else 1).int32(if items.exists(i -> i == PgNull) then 1 else 0).int32(element)
+      if !items.isEmpty then out.int32(items.length).int32(1)
+      for item in items
+        if item == PgNull
+          out.int32(-1)
+        else
+          val bytes = encodeBinary(element, item)?
+          out.int32(bytes.length).raw(bytes)
+    _ -> return None
+  Some(out.toVector())
+
+private daysOfDate(d: Date) -> Option[int] =
+  if d == Date.Max then Some(int.MaxValue)
+  elif d == Date.Min then Some(int.MinValue)
+  elif long(d.epochDay) - EpochDays < long(int.MinValue) + 1 then None
+  else Some(int(long(d.epochDay) - EpochDays))
+
+// The server's range for a timestamp is far inside a `long` of microseconds; a reading outside
+// these days is refused here rather than overflowing.
+private val LastDay: long = 100000000
+
+private microsOfReading(t: DateTime) -> Option[long]
+  if t == DateTime.Max then return Some(long.MaxValue)
+  if t == DateTime.Min then return Some(long.MinValue)
+  val days = long(t.date.epochDay) - EpochDays
+  if days < -LastDay || days > LastDay then return None
+  Some(days * MicrosPerDay + t.time.microsOfDay)
+
+private microsOfInstant(t: Instant) -> Option[long]
+  if t == Instant.Max then return Some(long.MaxValue)
+  if t == Instant.Min then return Some(long.MinValue)
+  if t.epochMicros < long.MinValue + EpochMicros then None else Some(t.epochMicros - EpochMicros)
+
+// `v` as the server reads it in text, or why it cannot be written.
+private textOf(v: PgValue) -> Result[string, string] = v match
+  PgNull -> Err("NULL has no text")
+  PgBool(b) -> Ok(if b then "t" else "f")
+  PgInt(n) -> Ok(n.toString())
+  PgReal(x) -> Ok(realText(x))
+  PgNumeric(n) -> Ok(n.toString())
+  PgText(s) -> Ok(s)
+  PgBytes(b) -> Ok("\\x" + toHex(b))
+  PgUuid(u) -> Ok(u.toString())
+  PgDate(d) -> Ok(if d == Date.Max then "infinity" elif d == Date.Min then "-infinity" else d.toString())
+  PgTime(t) -> Ok(t.toString())
+  PgTimestamp(t) -> Ok(if t == DateTime.Max then "infinity" elif t == DateTime.Min then "-infinity" else s"${t.date} ${t.time}")
+  PgTimestamptz(t) -> Ok(if t == Instant.Max then "infinity" elif t == Instant.Min then "-infinity" else t.toString())
+  PgJson(j) -> Ok(j.render)
+  PgArray(_, items) -> arrayText(items)
+  PgOther(_, text) -> Ok(text)
+
+private realText(x: real) -> string =
+  if x.isNaN then "NaN"
+  elif x == real.PositiveInfinity then "Infinity"
+  elif x == real.NegativeInfinity then "-Infinity"
+  else x.toString()
+
+private arrayText(items: Vector[PgValue]) -> Result[string, string]
+  val parts = Buffer[string]()
+  for item in items
+    parts.addOne(item match
+      PgNull -> "NULL"
+      PgArray(_, inner) -> arrayText(inner)?
+      _ -> quotedElement(textOf(item)?))
+  Ok("{" + parts.mkString(",") + "}")
+
+private quotedElement(text: string) -> string
+  if text != "" && text.toUpper != "NULL" && !text.exists(c -> needsQuote(c)) then return text
+  "\"" + text.replace("\\", "\\\\").replace("\"", "\\\"") + "\""
+
+private needsQuote(c: char) -> bool
+needsQuote('{' | '}' | ',' | '"' | '\\' | ' ' | '\t' | '\n' | '\r') = true
+needsQuote(_) = false
+
+// ---- Reading values as the program's types ----
+
+// A type a column's value can be read as. `fromPg` answers `None` where the value is not one of the
+// type's: NULL for any type but an `Option`, or a value of another kind.
+trait FromPg
+  static fromPg(v: PgValue) -> Option[Self]
+
+impl FromPg for PgValue
+  static fromPg(v: PgValue) -> Option[PgValue] = Some(v)
+
+impl FromPg for bool
+  static fromPg(v: PgValue) -> Option[bool] = v match
+    PgBool(b) -> Some(b)
+    _ -> None
+
+impl FromPg for int
+  static fromPg(v: PgValue) -> Option[int] = v match
+    PgInt(n) -> if long(int.MinValue) <= n <= long(int.MaxValue) then Some(int(n)) else None
+    _ -> None
+
+impl FromPg for long
+  static fromPg(v: PgValue) -> Option[long] = v match
+    PgInt(n) -> Some(n)
+    _ -> None
+
+impl FromPg for real
+  static fromPg(v: PgValue) -> Option[real] = v match
+    PgReal(x) -> Some(x)
+    _ -> None
+
+impl FromPg for BigDecimal
+  static fromPg(v: PgValue) -> Option[BigDecimal] = v match
+    PgNumeric(n) -> Some(n)
+    PgInt(n) -> Some(BigDecimal(n))
+    _ -> None
+
+impl FromPg for string
+  static fromPg(v: PgValue) -> Option[string] = v match
+    PgText(s) -> Some(s)
+    PgOther(_, s) -> Some(s)
+    _ -> None
+
+impl FromPg for Vector[byte]
+  static fromPg(v: PgValue) -> Option[Vector[byte]] = v match
+    PgBytes(b) -> Some(b)
+    _ -> None
+
+impl FromPg for Uuid
+  static fromPg(v: PgValue) -> Option[Uuid] = v match
+    PgUuid(u) -> Some(u)
+    _ -> None
+
+impl FromPg for Date
+  static fromPg(v: PgValue) -> Option[Date] = v match
+    PgDate(d) -> Some(d)
+    _ -> None
+
+impl FromPg for Time
+  static fromPg(v: PgValue) -> Option[Time] = v match
+    PgTime(t) -> Some(t)
+    _ -> None
+
+impl FromPg for DateTime
+  static fromPg(v: PgValue) -> Option[DateTime] = v match
+    PgTimestamp(t) -> Some(t)
+    _ -> None
+
+impl FromPg for Instant
+  static fromPg(v: PgValue) -> Option[Instant] = v match
+    PgTimestamptz(t) -> Some(t)
+    _ -> None
+
+impl FromPg for Json
+  static fromPg(v: PgValue) -> Option[Json] = v match
+    PgJson(j) -> Some(j)
+    _ -> None
+
+// An array reads as a vector of its elements, each read as `T`; a multidimensional one as vectors of
+// vectors.
+impl[T: FromPg] FromPg for Vector[T]
+  static fromPg(v: PgValue) -> Option[Vector[T]] = v match
+    PgArray(_, items) ->
+      val out = Buffer[T]()
+      for item in items
+        out.addOne(T.fromPg(item)?)
+      Some(out.toVector)
+    _ -> None
+
+// NULL reads as `None`, and any other value as `Some` of it read as `T`.
+impl[T: FromPg] FromPg for Option[T]
+  static fromPg(v: PgValue) -> Option[Option[T]] = v match
+    PgNull -> Some(None)
+    _ -> T.fromPg(v).map(x -> Some(x))
+
+// ---- Making parameters of the program's values ----
+
+// A value that can be a statement's parameter: `toPg` is the value and `pgOid` its type, `0` to let
+// the server infer the type from the statement, as a `string` does, so a string can be given for a
+// parameter of any type the server reads from text.
+trait ToPg
+  toPg -> PgValue
+  pgOid -> int
+
+impl ToPg for PgValue
+  toPg -> PgValue = self
+  pgOid -> int = self match
+    PgNull -> 0
+    PgBool(_) -> OidBool
+    PgInt(_) -> OidInt8
+    PgReal(_) -> OidFloat8
+    PgNumeric(_) -> OidNumeric
+    PgText(_) -> OidText
+    PgBytes(_) -> OidBytea
+    PgUuid(_) -> OidUuid
+    PgDate(_) -> OidDate
+    PgTime(_) -> OidTime
+    PgTimestamp(_) -> OidTimestamp
+    PgTimestamptz(_) -> OidTimestamptz
+    PgJson(_) -> OidJsonb
+    PgArray(element, _) -> arrayOf(element)
+    PgOther(oid, _) -> oid
+
+impl ToPg for bool
+  toPg -> PgValue = PgBool(self)
+  pgOid -> int = OidBool
+
+impl ToPg for int
+  toPg -> PgValue = PgInt(long(self))
+  pgOid -> int = OidInt4
+
+impl ToPg for long
+  toPg -> PgValue = PgInt(self)
+  pgOid -> int = OidInt8
+
+impl ToPg for real
+  toPg -> PgValue = PgReal(self)
+  pgOid -> int = OidFloat8
+
+impl ToPg for BigDecimal
+  toPg -> PgValue = PgNumeric(self)
+  pgOid -> int = OidNumeric
+
+impl ToPg for string
+  toPg -> PgValue = PgText(self)
+  pgOid -> int = 0
+
+impl ToPg for Vector[byte]
+  toPg -> PgValue = PgBytes(self)
+  pgOid -> int = OidBytea
+
+impl ToPg for Uuid
+  toPg -> PgValue = PgUuid(self)
+  pgOid -> int = OidUuid
+
+impl ToPg for Date
+  toPg -> PgValue = PgDate(self)
+  pgOid -> int = OidDate
+
+impl ToPg for Time
+  toPg -> PgValue = PgTime(self)
+  pgOid -> int = OidTime
+
+impl ToPg for DateTime
+  toPg -> PgValue = PgTimestamp(self)
+  pgOid -> int = OidTimestamp
+
+impl ToPg for Instant
+  toPg -> PgValue = PgTimestamptz(self)
+  pgOid -> int = OidTimestamptz
+
+impl ToPg for Json
+  toPg -> PgValue = PgJson(self)
+  pgOid -> int = OidJsonb
+
+// `None` is NULL, its type left to the server; `Some(v)` is `v`.
+impl[T: ToPg] ToPg for Option[T]
+  toPg -> PgValue = self match
+    Some(v) -> v.toPg
+    None -> PgNull
+  pgOid -> int = self match
+    Some(v) -> v.pgOid
+    None -> 0
+
+// A vector is an array of its elements' type. One whose elements are strings, or that has no element
+// that is not `None`, leaves the array's type to the server, as a string does.
+impl[T: ToPg] ToPg for Vector[T]
+  toPg -> PgValue = PgArray(elementOid(self), map(x -> x.toPg))
+  pgOid -> int = arrayOf(elementOid(self))
+
+private elementOid[T: ToPg](items: Vector[T]) -> int
+  for item in items
+    val oid = item.pgOid
+    if oid != 0 then return oid
+  0

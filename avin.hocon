@@ -1,0 +1,5 @@
+package { name = "pg", version = "0.0.1", description = "A PostgreSQL client: the frontend/backend protocol over TCP and TLS, SCRAM-SHA-256, MD5 and cleartext authentication, simple and extended queries with a statement cache, typed values read by column name or into derived row types, transactions with savepoints, a connection pool, and query cancellation" }
+
+dependencies {
+  json { git = "github.com/avin-lang/json", version = "0.0.2" }
+}

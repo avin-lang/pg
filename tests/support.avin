@@ -1,0 +1,27 @@
+module tests
+
+// What the tests share: the private server's URL, from `PG_TEST_URL` (`scripts/test-db.zsh start`
+// prints it), and the authority that signed its certificate, from `PG_TEST_CA`. A test that needs
+// the server and finds no URL says so and passes.
+
+import avin.process
+import dev.avinlang.pg
+import dev.avinlang.pg.{Connection, PgError}
+
+// The server's URL with `options` as its query, or `None`, saying the test is skipped, where
+// `PG_TEST_URL` is not set.
+testUrl(options: string = "sslmode=disable") -> Option[string] = process.env("PG_TEST_URL") match
+  Some(base) -> Some(if options == "" then base elif base.contains("?") then s"$base&$options" else s"$base?$options")
+  None ->
+    println("skipped: PG_TEST_URL is not set; run `scripts/test-db.zsh start` and export what it prints")
+    None
+
+// The same server's URL as user `user` with `password`.
+userUrl(user: string, password: string, options: string = "sslmode=disable") -> Option[string] =
+  testUrl(options).map(u -> u.replace("pgtest:pgtest@", s"$user:$password@"))
+
+// The path of the authority that signed the server's certificate.
+testCa() -> Option[string] = process.env("PG_TEST_CA")
+
+// A connection to the test server as its superuser, plain TCP.
+testConnection() -> Option[Result[Connection, PgError]] = testUrl().map(u -> pg.connect(u))

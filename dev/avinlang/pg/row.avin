@@ -1,0 +1,82 @@
+module dev.avinlang.pg
+
+// A row of a result: its columns and their values, each already decoded. A row is plain data, so it
+// can be handed to another thread, or given back from a pooled connection's body.
+data Row(columns: Vector[Column], values: Vector[PgValue])
+
+impl Row
+  // The number of columns.
+  length -> int = values.length
+
+  // The names of the columns, in order.
+  names -> Vector[string] = columns.map(c -> c.name)
+
+  // The index of the first column named `name`, or `None`.
+  indexOf(name: string) -> Option[int]
+    var i = 0
+    while i < columns.length
+      if columns(i).name == name then return Some(i)
+      i += 1
+    None
+
+  // The value of the column at `index`, counting from 0, read as `T`.
+  get[T: FromPg](index: int) -> Result[T, PgError]
+    if index < 0 || index >= values.length then return Err(BadColumn(s"#$index", s"the row has ${values.length} columns"))
+    readAs[T](columns(index), values(index))
+
+  // The value of the column named `name`, read as `T`; where several columns have the name, the
+  // first.
+  get[T: FromPg](name: string) -> Result[T, PgError] = indexOf(name) match
+    Some(i) -> readAs[T](columns(i), values(i))
+    None -> Err(BadColumn(name, "the result has no such column"))
+
+  // The row as a `T`, each of its fields read from the column of its name.
+  decode[T: FromRow]() -> Result[T, PgError] = T.fromRow(self)
+
+// `v`, the value of `column`, read as `T`.
+private readAs[T: FromPg](column: Column, v: PgValue) -> Result[T, PgError] = T.fromPg(v) match
+  Some(t) -> Ok(t)
+  None ->
+    if v == PgNull then Err(BadColumn(column.name, "it is NULL; read it as an Option"))
+    else Err(BadColumn(column.name, s"it holds ${kindOf(v)} (${typeName(column.typeOid)}), which is not the type asked for"))
+
+// A type a row can be read as. `derive FromRow` reads each field from the column named after it, or
+// the name its `@PgColumn` gives; a field whose column is absent takes its default where it has one.
+trait FromRow
+  static fromRow(row: Row) -> Result[Self, PgError]
+
+// The column a field is read from, where it is not the field's own name:
+// `@PgColumn("created_at") created: Instant`.
+data PgColumn(name: string)
+
+impl Annotation for PgColumn
+
+derive FromRow for T
+  static fromRow(row: Row) -> Result[T, PgError] = T.build(RowReader(row))
+
+// Supplies a derived type's fields from a row: each field whose column the row has, in the field's
+// order.
+private class RowReader(val row: Row)
+  var cursor = 0
+
+private columnOf(f: FieldShape) -> string = f.annotation[PgColumn]() match
+  Some(c) -> c.name
+  None -> f.name
+
+impl ShapeBuilder[PgError] for RowReader
+  variant(t: TypeShape) -> Result[int, PgError] =
+    if t.variantCount == 1 then Ok(0) else Err(BadColumn(t.name, "a type of several variants cannot be read from a row"))
+
+  next(v: VariantShape) -> Result[Option[int], PgError]
+    while cursor < v.fieldCount
+      val f = v.fields(cursor)
+      cursor += 1
+      if row.indexOf(columnOf(f)).isDefined then return Ok(Some(f.index))
+    Ok(None)
+
+  duplicate(f: FieldShape) -> PgError = BadColumn(columnOf(f), "the column is read twice")
+
+impl RowReader
+  field[F: FromPg](f: FieldShape) -> Result[F, PgError] = row.get[F](columnOf(f))
+
+  missing[F: FromPg](f: FieldShape) -> Result[F, PgError] = Err(BadColumn(columnOf(f), "the result has no such column"))

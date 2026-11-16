@@ -1,0 +1,278 @@
+module tests
+
+// Every type the client knows, sent as a parameter and read back, through the extended protocol (in
+// binary, but numeric and time in text) and through the simple protocol (in text): NULL, the
+// extremes, Unicode, empty arrays.
+
+import avin.time.{Date, DateTime, Instant, date, dateTime, epochMicros, time, Time}
+import avin.uuid.Uuid
+import dev.avinlang.json.Json
+import dev.avinlang.pg
+import dev.avinlang.pg.{Connection, FromPg, PgArray, PgError, PgInt, PgJson, PgNull, PgOther, PgText, PgValue, ToPg, Typed}
+
+// `v` sent as a parameter and selected back, read as the same type. It binds `Typed(v.pgOid,
+// v.toPg)`, what binding `v` itself binds, since a primitive `T` passed as a `ToPg` from a generic
+// function crashes (see `genericPrimitiveParameter`).
+private echo[T: FromPg & ToPg](c: Connection, v: T) -> Result[T, PgError] = c.queryValue[T]("select $1", Typed(v.pgOid, v.toPg))
+
+// The same, binding `v` as it is.
+private echoDirect[T: FromPg & ToPg](c: Connection, v: T) -> Result[T, PgError] = c.queryValue[T]("select $1", v)
+
+@test("a generic function binds a primitive parameter as it is", ignore: "avin 0.0.28 crashes (signal 11) when a generic function passes a primitive T as a trait object")
+genericPrimitiveParameter() -> Result[unit, PgError]
+  val c = testConnection() match
+    Some(r) -> r?
+    None -> return Ok(())
+  assertEq(echoDirect(c, true), Ok(true))
+  assertEq(echoDirect(c, 7), Ok(7))
+  assertEq(echoDirect(c, 1.5), Ok(1.5))
+  c.close()
+
+@test("a generic function binds a parameter of a class or data type as it is")
+genericParameter() -> Result[unit, PgError]
+  val c = testConnection() match
+    Some(r) -> r?
+    None -> return Ok(())
+  assertEq(echoDirect(c, "text"), Ok("text"))
+  assertEq(echoDirect(c, BigDecimal("2.5")), Ok(BigDecimal("2.5")))
+  assertEq(echoDirect(c, Some(4)), Ok(Some(4)))
+  c.close()
+
+// The value of `expr` selected by the simple protocol, as text, read as `T`.
+private textOf[T: FromPg](c: Connection, expr: string) -> Result[T, PgError] =
+  c.simpleQuery(s"select $expr")?(0).rows(0).get[T](0)
+
+// The value of `expr` selected by the extended protocol, read as `T`.
+private binaryOf[T: FromPg](c: Connection, expr: string) -> Result[T, PgError] = c.queryValue[T](s"select $expr")
+
+@test("booleans both ways and in both protocols")
+booleans() -> Result[unit, PgError]
+  val c = testConnection() match
+    Some(r) -> r?
+    None -> return Ok(())
+  assertEq(echo(c, true), Ok(true))
+  assertEq(echo(c, false), Ok(false))
+  assertEq(textOf[bool](c, "true"), Ok(true))
+  assertEq(textOf[bool](c, "false"), Ok(false))
+  assertEq(binaryOf[bool](c, "1 < 2"), Ok(true))
+  c.close()
+
+@test("integers of every width at their limits")
+integers() -> Result[unit, PgError]
+  val c = testConnection() match
+    Some(r) -> r?
+    None -> return Ok(())
+  for n in [0, 1, -1, int.MaxValue, int.MinValue]
+    assertEq(echo(c, n), Ok(n))
+  for n in [long(0), long.MaxValue, long.MinValue]
+    assertEq(echo(c, n), Ok(n))
+  assertEq(binaryOf[int](c, "32767::int2"), Ok(32767))
+  assertEq(binaryOf[int](c, "(-32768)::int2"), Ok(-32768))
+  assertEq(binaryOf[long](c, "9223372036854775807::int8"), Ok(long.MaxValue))
+  assertEq(binaryOf[long](c, "4294967295::oid"), Ok(long(4294967295)))
+  assertEq(textOf[long](c, "(-9223372036854775808)::int8"), Ok(long.MinValue))
+  assertEq(textOf[int](c, "(-32768)::int2"), Ok(-32768))
+  // A bigint that does not fit an int is not read as one.
+  assert(binaryOf[int](c, "2147483648::int8").isErr)
+  assertEq(binaryOf[int](c, "2147483647::int8"), Ok(int.MaxValue))
+  // An int sent for a smallint parameter goes as a smallint, and one out of its range as text, which
+  // the server refuses.
+  val small = c.prepare("select $1::int2 + 0::int2")?
+  assertEq(c.query(small, 7)?(0).get[int](0), Ok(7))
+  assertEq(c.query(small, 70000).err.flatMap(e -> e.code), Some("22003"))
+  c.close()
+
+@test("floating-point numbers: zeros, infinities, NaN, the extremes and float4")
+floats() -> Result[unit, PgError]
+  val c = testConnection() match
+    Some(r) -> r?
+    None -> return Ok(())
+  for x in [0.0, 1.5, -2.25, 0.1, real.MaxValue, real.MinPositiveValue, real.PositiveInfinity, real.NegativeInfinity]
+    assertEq(echo(c, x), Ok(x))
+  // -0.0 keeps its sign, and NaN stays NaN.
+  assertEq(echo(c, -0.0).map(x -> x.toBits), Ok((-0.0).toBits))
+  assert(echo(c, real.NaN)?.isNaN)
+  assertEq(textOf[real](c, "'-0'::float8").map(x -> x.toBits), Ok((-0.0).toBits))
+  assert(textOf[real](c, "'NaN'::float8")?.isNaN)
+  assertEq(textOf[real](c, "'Infinity'::float8"), Ok(real.PositiveInfinity))
+  assertEq(textOf[real](c, "'-Infinity'::float8"), Ok(real.NegativeInfinity))
+  assertEq(textOf[real](c, "0.1::float8"), Ok(0.1))
+  assertEq(textOf[real](c, "1.7976931348623157e308::float8"), Ok(real.MaxValue))
+  assertEq(binaryOf[real](c, "1.5::float4"), Ok(1.5))
+  assertEq(binaryOf[real](c, "'Infinity'::float4"), Ok(real.PositiveInfinity))
+  assertEq(textOf[real](c, "1.5::float4"), Ok(1.5))
+  c.close()
+
+@test("numeric of any size, its scale kept, NaN and infinity as text")
+numerics() -> Result[unit, PgError]
+  val c = testConnection() match
+    Some(r) -> r?
+    None -> return Ok(())
+  val huge = BigDecimal("123456789012345678901234567890123456789012345678901234567890.000000000000000000000000000001")
+  for n in [BigDecimal("0"), BigDecimal("19.99"), BigDecimal("-0.001"), huge, -huge]
+    assertEq(echo(c, n), Ok(n))
+  assertEq(binaryOf[BigDecimal](c, "1.50::numeric(10,2)").map(n -> n.toString()), Ok("1.50"))
+  assertEq(textOf[BigDecimal](c, "1e-20::numeric"), Ok(BigDecimal("0.00000000000000000001")))
+  // An integer column reads as a BigDecimal too.
+  assertEq(binaryOf[BigDecimal](c, "42"), Ok(BigDecimal(42)))
+  // NaN and the infinities have no BigDecimal: they arrive as text.
+  assertEq(binaryOf[PgValue](c, "'NaN'::numeric"), Ok(PgOther(1700, "NaN")))
+  assertEq(binaryOf[string](c, "'Infinity'::numeric"), Ok("Infinity"))
+  assert(binaryOf[BigDecimal](c, "'-Infinity'::numeric").isErr)
+  c.close()
+
+@test("text in every script, the empty string, and the character types")
+texts() -> Result[unit, PgError]
+  val c = testConnection() match
+    Some(r) -> r?
+    None -> return Ok(())
+  for s in ["", "plain", "héllo wörld", "日本語", "emoji 😀 and \u{1F680}", "quote ' and \" and \\", "line\nbreak\ttab"]
+    assertEq(echo(c, s), Ok(s))
+    assertEq(c.queryValue[string]("select $1::text", s), Ok(s))
+    assertEq(c.queryValue[string]("select $1::varchar", s), Ok(s))
+  assertEq(binaryOf[string](c, "'ab'::char(4)"), Ok("ab  "))
+  assertEq(binaryOf[string](c, "'x'::\"char\""), Ok("x"))
+  assertEq(binaryOf[string](c, "'tbl'::name"), Ok("tbl"))
+  assertEq(textOf[string](c, "'日本語'"), Ok("日本語"))
+  c.close()
+
+@test("bytea: empty, every byte value, and both protocols")
+bytes() -> Result[unit, PgError]
+  val c = testConnection() match
+    Some(r) -> r?
+    None -> return Ok(())
+  val every: Vector[byte] = Vector.tabulate(256, i -> byte(i))
+  for b in [Vector.empty[byte](), "abc".bytes, every]
+    assertEq(echo(c, b), Ok(b))
+  assertEq(textOf[Vector[byte]](c, "'\\x00ff10'::bytea"), Ok([byte(0), byte(255), byte(16)]))
+  assertEq(textOf[Vector[byte]](c, "''::bytea"), Ok(Vector.empty[byte]()))
+  c.close()
+
+@test("uuid both ways")
+uuids() -> Result[unit, PgError]
+  val c = testConnection() match
+    Some(r) -> r?
+    None -> return Ok(())
+  val u = Uuid.random()
+  for x in [u, Uuid.Nil, Uuid.Max]
+    assertEq(echo(c, x), Ok(x))
+  assertEq(textOf[Uuid](c, s"'$u'::uuid"), Ok(u))
+  assertEq(c.queryValue[string]("select $1::uuid::text", u), Ok(u.toString()))
+  c.close()
+
+@test("dates, times and timestamps: the epochs, before 1970, fractions and the infinities")
+times() -> Result[unit, PgError]
+  val c = testConnection() match
+    Some(r) -> r?
+    None -> return Ok(())
+  for d in [date(2000, 1, 1), date(1970, 1, 1), date(1969, 12, 31), date(2024, 2, 29), date(1, 1, 1), date(9999, 12, 31), Date.Max, Date.Min]
+    assertEq(echo(c, d), Ok(d))
+  assertEq(textOf[Date](c, "'2024-02-29'::date"), Ok(date(2024, 2, 29)))
+  assertEq(textOf[Date](c, "'infinity'::date"), Ok(Date.Max))
+  assertEq(binaryOf[Date](c, "'-infinity'::date"), Ok(Date.Min))
+  for t in [time(0, 0), time(23, 59, 59, 999999), time(12, 30, 15, 500)]
+    assertEq(echo(c, t), Ok(t))
+  assertEq(binaryOf[Time](c, "'13:14:15.000016'::time"), Ok(time(13, 14, 15, 16)))
+  // 24:00:00 is a time the server has and a `Time` does not: it arrives as text.
+  assertEq(binaryOf[string](c, "'24:00:00'::time"), Ok("24:00:00"))
+  val reading = dateTime(date(1999, 12, 31), time(23, 59, 59, 999999))
+  for t in [reading, dateTime(date(2000, 1, 1), time(0, 0)), dateTime(date(1900, 6, 1), time(1, 2, 3, 4)), DateTime.Max, DateTime.Min]
+    assertEq(echo(c, t), Ok(t))
+  assertEq(textOf[DateTime](c, "'1999-12-31 23:59:59.999999'::timestamp"), Ok(reading))
+  assertEq(textOf[DateTime](c, "'-infinity'::timestamp"), Ok(DateTime.Min))
+  for i in [epochMicros(0), epochMicros(946684800000000), epochMicros(-1), epochMicros(1700000000123456), Instant.Max, Instant.Min]
+    assertEq(echo(c, i), Ok(i))
+  assertEq(textOf[Instant](c, "'2001-02-03 04:05:06.7+00'::timestamptz"), Ok(epochMicros(981173106700000)))
+  assertEq(textOf[Instant](c, "'2001-02-03 04:05:06+05:30'::timestamptz"), Ok(epochMicros(981173106000000 - 19800000000)))
+  assertEq(textOf[Instant](c, "'infinity'::timestamptz"), Ok(Instant.Max))
+  // The session's zone is UTC, whatever the server's own.
+  assertEq(c.parameter("TimeZone"), Some("UTC"))
+  c.close()
+
+@test("json and jsonb: objects, arrays, scalars and Unicode")
+jsons() -> Result[unit, PgError]
+  val c = testConnection() match
+    Some(r) -> r?
+    None -> return Ok(())
+  val doc = Json.obj(("name", Json.str("Zoë 😀")), ("n", Json.num(42)), ("tags", Json.arr(Json.str("a"), Json.Null)), ("ok", Json.Bool(true)))
+  // jsonb keeps an object's keys in an order of its own, the shorter first; json keeps the text.
+  val ordered = Json.obj(("n", Json.num(42)), ("ok", Json.Bool(true)), ("name", Json.str("Zoë 😀")), ("tags", Json.arr(Json.str("a"), Json.Null)))
+  assertEq(echo(c, doc), Ok(ordered))
+  // A `Json` goes as jsonb, so a json column receives jsonb's order; sent typed as json it keeps its own.
+  assertEq(c.queryValue[Json]("select $1::json", doc), Ok(ordered))
+  assertEq(c.queryValue[Json]("select $1", Typed(114, PgJson(doc))), Ok(doc))
+  assertEq(c.queryValue[Json]("select $1::json", Typed(114, PgJson(doc))), Ok(doc))
+  assertEq(c.queryValue[Json]("select $1::jsonb", ordered), Ok(ordered))
+  assertEq(binaryOf[Json](c, "'[1, 2.5, \"x\"]'::json"), Ok(Json.arr(Json.num(1), Json.num(2.5), Json.str("x"))))
+  assertEq(textOf[Json](c, "'{\"a\": null}'::jsonb"), Ok(Json.obj(("a", Json.Null))))
+  assertEq(binaryOf[Json](c, "'7'::jsonb"), Ok(Json.num(7)))
+  c.close()
+
+@test("arrays of each type, empty, with NULLs, of two dimensions, and in text")
+arrays() -> Result[unit, PgError]
+  val c = testConnection() match
+    Some(r) -> r?
+    None -> return Ok(())
+  assertEq(echo(c, [1, 2, 3]), Ok([1, 2, 3]))
+  assertEq(echo(c, [long.MaxValue]), Ok([long.MaxValue]))
+  assertEq(echo(c, [true, false]), Ok([true, false]))
+  assertEq(echo(c, [1.5, real.NegativeInfinity]), Ok([1.5, real.NegativeInfinity]))
+  assertEq(echo(c, [BigDecimal("1.10"), BigDecimal("-2")]), Ok([BigDecimal("1.10"), BigDecimal("-2")]))
+  assertEq(c.queryValue[Vector[string]]("select $1::text[]", ["a", "b c", "", "NULL", "x,y", "q\"\\", "日本"]), Ok(["a", "b c", "", "NULL", "x,y", "q\"\\", "日本"]))
+  assertEq(echo(c, [Uuid.Nil]), Ok([Uuid.Nil]))
+  assertEq(echo(c, [date(2020, 1, 2)]), Ok([date(2020, 1, 2)]))
+  assertEq(echo(c, [time(1, 2, 3)]), Ok([time(1, 2, 3)]))
+  assertEq(echo(c, ["ab".bytes]), Ok(["ab".bytes]))
+  assertEq(echo(c, [Some(1), None, Some(3)]), Ok([Some(1), None, Some(3)]))
+  // An empty array, of a type the statement settles.
+  assertEq(c.queryValue[Vector[int]]("select $1::int[]", Vector.empty[int]()), Ok(Vector.empty[int]()))
+  assertEq(binaryOf[Vector[int]](c, "'{}'::int[]"), Ok(Vector.empty[int]()))
+  assertEq(textOf[Vector[int]](c, "'{}'::int[]"), Ok(Vector.empty[int]()))
+  // Two dimensions read as vectors of vectors, in both protocols.
+  assertEq(binaryOf[Vector[Vector[int]]](c, "'{{1,2},{3,4}}'::int[]"), Ok([[1, 2], [3, 4]]))
+  assertEq(textOf[Vector[Vector[int]]](c, "'{{1,2},{3,4}}'::int[]"), Ok([[1, 2], [3, 4]]))
+  assertEq(textOf[Vector[Option[string]]](c, "array['a b', null, 'c\"d', '']"), Ok([Some("a b"), None, Some("c\"d"), Some("")]))
+  assertEq(textOf[Vector[int]](c, "'[0:1]={5,6}'::int[]"), Ok([5, 6]))
+  assertEq(binaryOf[Vector[BigDecimal]](c, "array[1.5, null]::numeric[]").isErr, true)
+  assertEq(binaryOf[Vector[Option[BigDecimal]]](c, "array[1.5, null]::numeric[]"), Ok([Some(BigDecimal("1.5")), None]))
+  assertEq(textOf[Vector[Json]](c, "array['{\"a\":1}'::jsonb]"), Ok([Json.obj(("a", Json.num(1)))]))
+  c.close()
+
+@test("NULL of every type reads as None, and is an error for a type with no NULL")
+nulls() -> Result[unit, PgError]
+  val c = testConnection() match
+    Some(r) -> r?
+    None -> return Ok(())
+  for t in ["int", "bigint", "text", "bytea", "uuid", "date", "timestamptz", "numeric", "jsonb", "int[]", "time"]
+    val row = c.queryOne(s"select null::$t as v")?.get
+    assertEq(row.get[Option[string]]("v"), Ok(None))
+    assertEq(row.get[PgValue]("v"), Ok(PgNull))
+  assertEq(echo(c, Some(5)), Ok(Some(5)))
+  val none: Option[int] = None
+  assertEq(echo(c, none), Ok(None))
+  assertEq(c.queryValue[Option[int]]("select $1::int", none), Ok(None))
+  assertEq(c.queryValue[int]("select null::int").err.map(e -> e.toString()), Some("cannot read column `int4`: it is NULL; read it as an Option"))
+  assertEq(textOf[Option[long]](c, "null::bigint"), Ok(None))
+  c.close()
+
+@test("a value read as the wrong type is a Column error naming the column and its type")
+wrongType() -> Result[unit, PgError]
+  val c = testConnection() match
+    Some(r) -> r?
+    None -> return Ok(())
+  val row = c.queryOne("select 1 as n, 'x' as s")?.get
+  assertEq(row.get[string]("n").err.map(e -> e.toString()), Some("cannot read column `n`: it holds an integer (integer), which is not the type asked for"))
+  assertEq(row.get[int]("missing").err.map(e -> e.toString()), Some("cannot read column `missing`: the result has no such column"))
+  assertEq(row.get[int](2).err.map(e -> e.toString()), Some("cannot read column `#2`: the row has 2 columns"))
+  assertEq(row.get[int](0), Ok(1))
+  assertEq(row.get[PgValue](0), Ok(PgInt(1)))
+  assertEq(row.names, ["n", "s"])
+  assertEq(row.get[PgValue]("s"), Ok(PgText("x")))
+  // A string parameter lets the server choose its type.
+  assertEq(c.queryValue[long]("select $1::bigint", "12"), Ok(long(12)))
+  assertEq(c.queryValue[Date]("select $1::date", "2020-03-04"), Ok(date(2020, 3, 4)))
+  // A type the client does not decode arrives as its text.
+  assertEq(binaryOf[PgValue](c, "'1 day'::interval"), Ok(PgOther(1186, "1 day")))
+  assertEq(binaryOf[string](c, "'(1,2)'::point"), Ok("(1,2)"))
+  assertEq(binaryOf[PgValue](c, "array[1]::int[]"), Ok(PgArray(23, [PgInt(1)])))
+  c.close()

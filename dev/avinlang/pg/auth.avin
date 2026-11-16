@@ -1,0 +1,60 @@
+module dev.avinlang.pg
+
+// Proving the password: SCRAM-SHA-256 (RFC 5802 and RFC 7677), the server's default, which never
+// sends the password and has the server prove it knows it too; MD5 and clear text for servers set up
+// for them.
+
+import avin.crypto.{constantTimeEquals, hmacSha256, md5, pbkdf2HmacSha256, saslPrep, sha256}
+import avin.encoding.{fromBase64, toBase64, toHex}
+import avin.random.SecureRandom
+
+// The answer to an MD5 challenge: `md5` and the hex digest of the hex digest of the password and the
+// user name, followed by the server's four-byte salt.
+private md5Answer(user: string, password: string, salt: Array[byte]) -> string
+  val inner = toHex(md5(password + user))
+  "md5" + toHex(md5(inner.bytes ++ salt.toVector))
+
+// One SCRAM-SHA-256 exchange, from the client's first message to its check of the server's last.
+private class Scram(private val password: string)
+  private val nonce = toBase64(SecureRandom.nextBytes(18).toVector)
+  // The user name is sent empty: the server takes it from the startup message.
+  private val firstBare = "n=,r=" + nonce
+  private var serverSignature: Vector[byte] = []
+
+  // The client's first message, with the header saying it does not bind to the channel.
+  first -> string = "n,," + firstBare
+
+  // The client's final message, answering the server's first, `r=<nonce>,s=<salt>,i=<iterations>`.
+  final(serverFirst: string) -> Result[string, PgError]
+    var combined = ""
+    var salt: Vector[byte] = []
+    var iterations = 0
+    for part in serverFirst.split(",")
+      if part.startsWith("r=")
+        combined = part.slice(2, part.byteLength)
+      elif part.startsWith("s=")
+        salt = fromBase64(part.slice(2, part.byteLength)).mapErr(_ -> Auth("the server's SCRAM salt is not base64"))?
+      elif part.startsWith("i=")
+        iterations = part.slice(2, part.byteLength).toIntOption().getOrElse(0)
+    if !combined.startsWith(nonce) || combined.byteLength <= nonce.byteLength then return Err(Auth("the server's SCRAM nonce does not extend this client's"))
+    if iterations < 1 then return Err(Auth("the server's SCRAM iteration count is not a positive number"))
+    if salt.isEmpty then return Err(Auth("the server sent no SCRAM salt"))
+    // A password SASLprep refuses is used as it is, as the server does when it stores one.
+    val prepared = saslPrep(password).getOrElse(password)
+    val salted = pbkdf2HmacSha256(prepared.bytes, salt, iterations, 32)
+    val clientKey = hmacSha256(salted, "Client Key".bytes)
+    val storedKey = sha256(clientKey)
+    val withoutProof = "c=biws,r=" + combined
+    val authMessage = firstBare + "," + serverFirst + "," + withoutProof
+    val clientSignature = hmacSha256(storedKey, authMessage.bytes)
+    val proof = Vector.tabulate(clientKey.length, i -> byte(int(clientKey(i)) ^ int(clientSignature(i))))
+    serverSignature = hmacSha256(hmacSha256(salted, "Server Key".bytes), authMessage.bytes)
+    Ok(withoutProof + ",p=" + toBase64(proof))
+
+  // Checks the server's final message, `v=<signature>`, which proves it knows the password.
+  verify(serverFinal: string) -> Result[unit, PgError]
+    if serverFinal.startsWith("e=") then return Err(Auth(s"the server refused the SCRAM exchange: ${serverFinal.slice(2, serverFinal.byteLength)}"))
+    if !serverFinal.startsWith("v=") then return Err(Auth("the server's final SCRAM message has no signature"))
+    val sent = fromBase64(serverFinal.slice(2, serverFinal.byteLength).takeWhile(c -> c != ',')).mapErr(_ -> Auth("the server's SCRAM signature is not base64"))?
+    if serverSignature.isEmpty || !constantTimeEquals(sent, serverSignature) then return Err(Auth("the server's SCRAM signature is wrong: it does not know the password"))
+    Ok(())

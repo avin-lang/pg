@@ -1,0 +1,102 @@
+module dev.avinlang.pg
+
+import avin.threads.{AcquireTimedOut, CreateFailed, Lease, Pool, PoolError, PoolStats}
+import avin.time.Duration
+
+// Connections shared between threads: `use(f)` lends one to `f` and takes it back when `f` returns,
+// however it returns. A connection is made when one is asked for and none is idle, up to `maxSize`;
+// one handed back broken, or found broken or closed while it waited, is let go and another made in
+// its place. A connection handed back inside a transaction, `f` having begun one and not ended it, is
+// rolled back first, so the next user finds it clean.
+//
+//     val db = PgPool.open(url, maxSize = 8)?
+//     val names = db.use(c -> c.query("select name from users"))?
+//
+// A pool may be shared between threads and actors. `use`'s body is isolated, as a `Pool`'s is: it
+// gives back a sendable value, rows among them, and keeps nothing of the connection.
+class PgPool(private val pool: Pool[Connection, PgError]): Sendable
+  // Runs `f` with a connection lent to it, waiting for one for at most the pool's `acquireTimeout`,
+  // and answers what `f` answers.
+  use[R: Sendable](@isolating f: (Connection) -> Result[R, PgError]) -> Result[R, PgError] =
+    flattened(pool.lease(l -> lent(l, f)))
+
+  // `use(f)`, waiting for a connection for at most `timeout`.
+  use[R: Sendable](timeout: Duration, @isolating f: (Connection) -> Result[R, PgError]) -> Result[R, PgError] =
+    flattened(pool.lease(timeout, l -> lent(l, f)))
+
+  // Runs `f` in a transaction on a pooled connection (`Connection.transaction`).
+  transaction[R: Sendable](@isolating f: (Connection) -> Result[R, PgError]) -> Result[R, PgError] =
+    flattened(pool.lease(l -> lent(l, c -> c.transaction(f))))
+
+  // The rows `sql` returns, run on a pooled connection.
+  query(sql: string, params: ToPg*) -> Result[Vector[Row], PgError]
+    val bound = params.map(paramOf)
+    flattened(pool.lease(l -> lent(l, c -> c.query(sql, bound*))))
+
+  // Runs `sql` on a pooled connection and answers how many rows it touched.
+  execute(sql: string, params: ToPg*) -> Result[long, PgError]
+    val bound = params.map(paramOf)
+    flattened(pool.lease(l -> lent(l, c -> c.execute(sql, bound*))))
+
+  // Makes connections until the pool holds its `minIdle`.
+  warm() -> Result[unit, PgError] = pool.warm().mapErr(poolFailure)
+
+  // What the pool holds now.
+  stats() -> PoolStats = pool.stats()
+
+  // Closes the pool: idle connections are closed now, lent ones as they come back.
+  close() = pool.close()
+
+object PgPool
+  // A pool of connections made with the settings of the URL `url`. Nothing is connected until a
+  // connection is first asked for, or `warm` is called.
+  open(
+      url: string,
+      maxSize: int = 10,
+      minIdle: int = 0,
+      idleTimeout: Option[Duration] = None,
+      acquireTimeout: Option[Duration] = None
+  ) -> Result[PgPool, PgError] = Ok(PgPool.of(PgConfig.parse(url)?, maxSize, minIdle, idleTimeout, acquireTimeout))
+
+  // A pool of connections made with `config`.
+  of(
+      config: PgConfig,
+      maxSize: int = 10,
+      minIdle: int = 0,
+      idleTimeout: Option[Duration] = None,
+      acquireTimeout: Option[Duration] = None
+  ) -> PgPool = PgPool(
+    Pool[Connection, PgError](
+      () -> connect(config),
+      maxSize,
+      minIdle,
+      validate = Some(c -> c.isHealthy),
+      destroy = Some(c -> discard(c)),
+      idleTimeout = idleTimeout,
+      acquireTimeout = acquireTimeout
+    )
+  )
+
+private discard(c: Connection)
+  _ = c.close()
+
+// Runs `f` with the lent connection, then readies the connection for the pool: a broken one is
+// marked so the pool lets it go, and one left in a transaction is rolled back. It runs when `f` is
+// cancelled too.
+private lent[R](l: Lease[Connection], @isolating f: (Connection) -> Result[R, PgError]) -> Result[R, PgError]
+  defer handBack(l)
+  f(l.resource)
+
+private handBack(l: Lease[Connection])
+  val c = l.resource
+  if c.isBroken || c.isClosed then l.markBroken()
+  elif c.reset().isErr then l.markBroken()
+
+private flattened[R](r: Result[Result[R, PgError], PoolError[PgError]]) -> Result[R, PgError] = r match
+  Ok(inner) -> inner
+  Err(e) -> Err(poolFailure(e))
+
+private poolFailure(e: PoolError[PgError]) -> PgError = e match
+  AcquireTimedOut -> PoolTimedOut
+  PoolError.PoolClosed -> PoolClosed
+  CreateFailed(inner) -> inner

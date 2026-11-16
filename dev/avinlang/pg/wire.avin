@@ -1,0 +1,197 @@
+module dev.avinlang.pg
+
+// The frontend/backend protocol's framing: a message is a type byte, a four-byte big-endian length
+// that counts itself, and a body. Integers on the wire are big-endian; a string is UTF-8 ended by a
+// zero byte.
+
+import avin.io
+import avin.io.IoError
+import avin.net.ByteStream
+
+// Bytes being put together for the wire: several messages written one after another and sent with
+// one write.
+private class Out()
+  private val bytes = Buffer[byte]()
+  // Where the length of the message being written goes, or -1 when none is open.
+  private var lengthAt = -1
+
+  // Starts a message of type `kind`; `close` writes its length.
+  begin(kind: char) -> Out
+    bytes.addOne(byte(int(kind)))
+    lengthAt = bytes.length
+    int32(0)
+
+  // Starts a message with no type byte, as the startup and request messages are.
+  beginUntyped() -> Out
+    lengthAt = bytes.length
+    int32(0)
+
+  // Ends the message begun last, filling in its length.
+  close() -> Out
+    val n = bytes.length - lengthAt
+    bytes(lengthAt) = byte((n >> 24) & 0xff)
+    bytes(lengthAt + 1) = byte((n >> 16) & 0xff)
+    bytes(lengthAt + 2) = byte((n >> 8) & 0xff)
+    bytes(lengthAt + 3) = byte(n & 0xff)
+    lengthAt = -1
+    self
+
+  byte1(b: int) -> Out
+    bytes.addOne(byte(b & 0xff))
+    self
+
+  int16(n: int) -> Out
+    bytes.addOne(byte((n >> 8) & 0xff))
+    bytes.addOne(byte(n & 0xff))
+    self
+
+  int32(n: int) -> Out
+    bytes.addOne(byte((n >> 24) & 0xff))
+    bytes.addOne(byte((n >> 16) & 0xff))
+    bytes.addOne(byte((n >> 8) & 0xff))
+    bytes.addOne(byte(n & 0xff))
+    self
+
+  int64(n: long) -> Out
+    var shift: long = 56
+    while shift >= 0
+      bytes.addOne(byte(int.wrap((n >> shift) & 0xff)))
+      shift -= 8
+    self
+
+  // `text` as UTF-8 followed by a zero byte.
+  cstring(text: string) -> Out
+    bytes.addAll(text.bytes)
+    bytes.addOne(byte(0))
+    self
+
+  raw(data: Vector[byte]) -> Out
+    bytes.addAll(data)
+    self
+
+  rawArray(data: Array[byte]) -> Out
+    var i = 0
+    while i < data.length
+      bytes.addOne(data(i))
+      i += 1
+    self
+
+  length -> int = bytes.length
+
+  // What has been written.
+  toArray() -> Array[byte] = bytes.toArray()
+
+  toVector() -> Vector[byte] = bytes.toVector
+
+// A message from the server: its type byte and its body.
+private data Message(kind: char, body: Array[byte])
+
+// Reads a message's body field by field. A read past the end is a protocol error, which the reader
+// records and answers zeros for, so a caller checks `failed` once at the end.
+private class In(val body: Array[byte])
+  var at = 0
+  var failed = false
+
+  remaining -> int = body.length - at
+
+  private need(n: int) -> bool
+    if n < 0 || at + n > body.length
+      failed = true
+      at = body.length
+      false
+    else true
+
+  byte1() -> int
+    if !need(1) then return 0
+    at += 1
+    int(body(at - 1))
+
+  int16() -> int
+    if !need(2) then return 0
+    val n = (int(body(at)) << 8) | int(body(at + 1))
+    at += 2
+    if n >= 0x8000 then n - 0x10000 else n
+
+  int32() -> int
+    if !need(4) then return 0
+    val n = (long(body(at)) << 24) | (long(body(at + 1)) << 16) | (long(body(at + 2)) << 8) | long(body(at + 3))
+    at += 4
+    int.wrap(n)
+
+  int64() -> long
+    if !need(8) then return 0
+    var n: long = 0
+    var i = 0
+    while i < 8
+      n = (n << 8) | long(body(at + i))
+      i += 1
+    at += 8
+    n
+
+  // The string up to the next zero byte, which is passed over.
+  cstring() -> string
+    var end = at
+    while end < body.length && int(body(end)) != 0 do end += 1
+    if end >= body.length
+      failed = true
+      at = body.length
+      return ""
+    val text = string.fromUtf8Lossy(body.slice(at, end))
+    at = end + 1
+    text
+
+  // The next `n` bytes.
+  bytes(n: int) -> Array[byte]
+    if !need(n) then return Array.empty[byte]()
+    at += n
+    body.slice(at - n, at)
+
+// Messages read from a connection, from a buffer refilled a chunk at a time.
+private class MessageReader(private val stream: ByteStream)
+  private var buffer: Array[byte] = Array.empty[byte]()
+  private var at = 0
+
+  // Bytes buffered and not yet read.
+  private available -> int = buffer.length - at
+
+  // Reads until at least `n` bytes are buffered, or answers an error for a connection that ended.
+  private fill(n: int) -> Result[unit, PgError]
+    while available < n
+      val chunk = stream.read(65536).mapErr(e -> Io(e))?
+      if chunk.length == 0 then return Err(Io(IoError(io.ConnectionReset, "read from", "the server")))
+      if at == buffer.length
+        buffer = chunk
+      else
+        val joined = Array.fill(available + chunk.length, byte(0))
+        var i = 0
+        while i < available
+          joined(i) = buffer(at + i)
+          i += 1
+        var j = 0
+        while j < chunk.length
+          joined(available + j) = chunk(j)
+          j += 1
+        buffer = joined
+      at = 0
+    Ok(())
+
+  // One byte, read alone, as the answer to an SSLRequest is.
+  single() -> Result[int, PgError]
+    fill(1)?
+    at += 1
+    Ok(int(buffer(at - 1)))
+
+  // Whether bytes have been read past what was consumed: after the answer to an SSLRequest, any
+  // would be the server's plaintext sent before TLS began.
+  hasBuffered -> bool = available > 0
+
+  // The next message.
+  next() -> Result[Message, PgError]
+    fill(5)?
+    val kind = char(int(buffer(at)))
+    val length = (int(buffer(at + 1)) << 24) | (int(buffer(at + 2)) << 16) | (int(buffer(at + 3)) << 8) | int(buffer(at + 4))
+    if length < 4 || length > 0x3fffffff then return Err(Protocol(s"a message of type `$kind` has length $length"))
+    fill(1 + length)?
+    val body = buffer.slice(at + 5, at + 1 + length)
+    at += 1 + length
+    Ok(Message(kind, body))

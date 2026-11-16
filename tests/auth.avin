@@ -1,0 +1,106 @@
+module tests
+
+// Authentication against the private server's roles (scripts/test-db.zsh): SCRAM-SHA-256, MD5,
+// cleartext and trust, each with its failures, and a password SASLprep changes.
+
+import avin.net.Url
+import dev.avinlang.pg
+import dev.avinlang.pg.{Auth, Connection, PgConfig, PgError}
+
+// Settings for the test server as `user`, with `password`.
+private settingsFor(user: string, password: Option[string]) -> Option[Result[PgConfig, PgError]] =
+  testUrl().map(u -> PgConfig.parse(u).map(c -> c with { user = user, password = password }))
+
+// Connects as `user` and answers who the server says is connected.
+private whoAmI(user: string, password: Option[string]) -> Option[Result[string, PgError]] = settingsFor(user, password).map(r ->
+  val c = pg.connect(r?)?
+  val name = c.queryValue[string]("select current_user::text")
+  _ = c.close()
+  name)
+
+@test("SCRAM-SHA-256: the superuser from the URL and an ordinary role")
+scram() -> Result[unit, PgError]
+  val url = testUrl() match
+    Some(u) -> u
+    None -> return Ok(())
+  val c = pg.connect(url)?
+  assertEq(c.queryValue[string]("select current_user::text"), Ok("pgtest"))
+  assert(c.backendPid > 0)
+  assert(c.parameter("server_version").isDefined)
+  c.close()?
+  assertEq(whoAmI("scramuser", Some("scramuser")).get, Ok("scramuser"))
+  Ok(())
+
+@test("SCRAM-SHA-256: a wrong password and an unknown user are refused by the server")
+scramRefused()
+  val wrong = whoAmI("scramuser", Some("not it")) match
+    Some(r) -> r
+    None -> return
+  assertEq(wrong.err.flatMap(e -> e.code), Some("28P01"))
+  assert(wrong.err.get.toString().contains("password authentication failed"))
+  assertEq(whoAmI("nobody_at_all", Some("x")).get.err.flatMap(e -> e.code), Some("28P01"))
+
+@test("a server that asks for a password when none was given")
+noPassword()
+  val r = whoAmI("scramuser", None) match
+    Some(r) -> r
+    None -> return
+  assertEq(r.err, Some(Auth("the server asks for a password and none was given")))
+  assertEq(whoAmI("md5user", None).get.err, Some(Auth("the server asks for a password and none was given")))
+  assertEq(whoAmI("plainuser", None).get.err, Some(Auth("the server asks for a password and none was given")))
+
+@test("SCRAM-SHA-256 with a password SASLprep normalizes, given either way")
+saslPrepPassword() -> Result[unit, PgError]
+  val c = testConnection() match
+    Some(r) -> r?
+    None -> return Ok(())
+  // U+2168 ROMAN NUMERAL NINE normalizes to `IX`, and a soft hyphen is mapped to nothing; the
+  // server stores the verifier of the normalized password.
+  c.simpleQuery("drop role if exists sasluser; create role sasluser login password E'\\u2168'")?
+  c.close()?
+  assertEq(whoAmI("sasluser", Some("\u{2168}")).get, Ok("sasluser"))
+  assertEq(whoAmI("sasluser", Some("IX")).get, Ok("sasluser"))
+  assertEq(whoAmI("sasluser", Some("I\u{AD}X")).get, Ok("sasluser"))
+  assertEq(whoAmI("sasluser", Some("ix")).get.err.flatMap(e -> e.code), Some("28P01"))
+  // In a URL the password is percent-encoded.
+  val url = testUrl().get.replace("pgtest:pgtest@", s"sasluser:${Url.encode("\u{2168}")}@")
+  assertEq(pg.connect(url)?.queryValue[string]("select current_user::text"), Ok("sasluser"))
+  Ok(())
+
+@test("MD5: the right password and a wrong one")
+md5()
+  val ok = whoAmI("md5user", Some("md5user")) match
+    Some(r) -> r
+    None -> return
+  assertEq(ok, Ok("md5user"))
+  assertEq(whoAmI("md5user", Some("wrong")).get.err.flatMap(e -> e.code), Some("28P01"))
+
+@test("cleartext: the right password and a wrong one")
+cleartext()
+  val ok = whoAmI("plainuser", Some("plainuser")) match
+    Some(r) -> r
+    None -> return
+  assertEq(ok, Ok("plainuser"))
+  assertEq(whoAmI("plainuser", Some("wrong")).get.err.flatMap(e -> e.code), Some("28P01"))
+
+@test("trust: no password asked for, and one given is not sent")
+trust()
+  val ok = whoAmI("trustuser", None) match
+    Some(r) -> r
+    None -> return
+  assertEq(ok, Ok("trustuser"))
+  assertEq(whoAmI("trustuser", Some("ignored")).get, Ok("trustuser"))
+
+@test("a database that does not exist is the server's error")
+noDatabase()
+  val config = settingsFor("pgtest", Some("pgtest")) match
+    Some(r) -> r.ok.get
+    None -> return
+  val r = pg.connect(config with { database = Some("no_such_database") })
+  assertEq(r.err.flatMap(e -> e.code), Some("3D000"))
+
+@test("nothing listening is an Io error")
+nothingListening()
+  if testUrl().isEmpty then return
+  val r = pg.connect("postgres://u:p@127.0.0.1:1/x?sslmode=disable")
+  assert(r.err.get.toString().startsWith("the connection to the server failed: cannot connect to 127.0.0.1:1"))

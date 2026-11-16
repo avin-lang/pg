@@ -1,0 +1,88 @@
+module tests
+
+// TLS: the private server's certificate verified against the authority that signed it, refused
+// against another, and the plain and preferring modes.
+
+import dev.avinlang.pg
+import dev.avinlang.pg.{Connection, PgError, Tls, TlsRefused}
+
+// Whether the server says this connection is encrypted.
+private serverSaysTls(c: Connection) -> Result[bool, PgError] = c.queryValue[bool]("select ssl from pg_stat_ssl where pid = pg_backend_pid()")
+
+@test("sslmode=require with the server's authority: a verified TLS connection")
+requireVerified() -> Result[unit, PgError]
+  val ca = testCa() match
+    Some(p) -> p
+    None -> return Ok(())
+  val url = testUrl(s"sslmode=require&sslrootcert=$ca") match
+    Some(u) -> u
+    None -> return Ok(())
+  val c = pg.connect(url)?
+  assert(c.isTls)
+  assertEq(serverSaysTls(c), Ok(true))
+  assertEq(c.queryValue[string]("select $1", "over TLS"), Ok("over TLS"))
+  c.close()
+
+@test("sslmode=verify-full is require")
+verifyFull() -> Result[unit, PgError]
+  val ca = testCa() match
+    Some(p) -> p
+    None -> return Ok(())
+  val c = pg.connect(testUrl(s"sslmode=verify-full&sslrootcert=$ca").get)?
+  assert(c.isTls)
+  c.close()
+
+@test("sslmode=require with another authority: the certificate is refused")
+requireUntrusted()
+  val ca = testCa() match
+    Some(p) -> p
+    None -> return
+  val other = ca.replace("ca.pem", "other.pem")
+  val r = pg.connect(testUrl(s"sslmode=require&sslrootcert=$other").get)
+  r match
+    Err(Tls(e)) -> assertEq(e.refusal().map(x -> x.message), Some("the certificate is not trusted"))
+    Err(e) -> fail(s"expected a refused certificate, found $e")
+    Ok(_) -> fail("expected a refused certificate, and it connected")
+  // With only the machine's authorities, too.
+  assert(pg.connect(testUrl("sslmode=require").get).err.get.toString().startsWith("TLS with the server failed: certificate refused"))
+
+@test("sslmode=require naming the server by its DNS name, which the certificate holds")
+requireByName() -> Result[unit, PgError]
+  val ca = testCa() match
+    Some(p) -> p
+    None -> return Ok(())
+  val c = pg.connect(testUrl(s"sslmode=require&sslrootcert=$ca").get.replace("127.0.0.1", "localhost"))?
+  assert(c.isTls)
+  c.close()
+
+@test("sslmode=disable: plain TCP")
+disabled() -> Result[unit, PgError]
+  val url = testUrl("sslmode=disable") match
+    Some(u) -> u
+    None -> return Ok(())
+  val c = pg.connect(url)?
+  assert(!c.isTls)
+  assertEq(serverSaysTls(c), Ok(false))
+  c.close()
+
+@test("sslmode=prefer: TLS where the certificate verifies, plain where it does not")
+preferred() -> Result[unit, PgError]
+  val ca = testCa() match
+    Some(p) -> p
+    None -> return Ok(())
+  val secured = pg.connect(testUrl(s"sslmode=prefer&sslrootcert=$ca").get)?
+  assert(secured.isTls)
+  assertEq(serverSaysTls(secured), Ok(true))
+  secured.close()?
+  // prefer is the default.
+  val plain = pg.connect(testUrl("").get)?
+  assert(!plain.isTls)
+  assertEq(serverSaysTls(plain), Ok(false))
+  plain.close()
+
+@test("an sslrootcert that cannot be read, and an unknown sslmode, are configuration errors")
+badSettings()
+  if testUrl().isEmpty then return
+  assert(pg.connect(testUrl("sslmode=require&sslrootcert=/no/such/file.pem").get).err.get.toString().startsWith("bad connection settings: sslrootcert: cannot read /no/such/file.pem"))
+  assertEq(pg.connect(testUrl("sslmode=verify-ca").get).err.map(e -> e.toString()), Some("bad connection settings: sslmode `verify-ca` is not one of disable, prefer, require and verify-full"))
+  assertEq(pg.connect(testUrl("sslmode=allow").get).err.map(e -> e.toString()), Some("bad connection settings: sslmode `allow` is not one of disable, prefer, require and verify-full"))

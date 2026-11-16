@@ -1,0 +1,260 @@
+module tests
+
+// Running statements: the simple and the extended protocol, the statement cache and a statement the
+// server invalidates, prepared statements, counts, the server's errors with their fields, notices,
+// and rows read into derived types.
+
+import avin.threads.Channel
+import avin.time.{Instant, millis}
+import dev.avinlang.pg
+import dev.avinlang.pg.{BadColumn, Closed, Connection, Diagnostic, FromRow, PgColumn, PgConfig, PgError, QueryResult, Server}
+
+@test("the simple protocol: several statements, their tags and rows, all in text")
+simpleProtocol() -> Result[unit, PgError]
+  val c = testConnection() match
+    Some(r) -> r?
+    None -> return Ok(())
+  val results = c.simpleQuery("create temp table t (id int, name text); insert into t values (1, 'a'), (2, null); select * from t order by id; update t set name = 'b'")?
+  assertEq(results.map(r -> r.tag), ["CREATE TABLE", "INSERT 0 2", "SELECT 2", "UPDATE 2"])
+  assertEq(results.map(r -> r.affected), [long(0), long(2), long(2), long(2)])
+  val rows = results(2).rows
+  assertEq(rows.map(r -> r.get[int]("id")), [Ok(1), Ok(2)])
+  assertEq(rows.map(r -> r.get[Option[string]]("name")), [Ok(Some("a")), Ok(None)])
+  // An empty query answers no result.
+  assertEq(c.simpleQuery("")?.length, 0)
+  assertEq(c.simpleQuery(";")?.length, 0)
+  c.close()
+
+@test("an error in a simple query stops it there; the connection goes on")
+simpleError() -> Result[unit, PgError]
+  val c = testConnection() match
+    Some(r) -> r?
+    None -> return Ok(())
+  c.simpleQuery("create temp table u (id int primary key)")?
+  val r = c.simpleQuery("insert into u values (1); select 1/0; insert into u values (2)")
+  assertEq(r.err.flatMap(e -> e.code), Some("22012"))
+  // The statements ran as one transaction, so the first insert is rolled back too.
+  assertEq(c.queryValue[long]("select count(*) from u"), Ok(long(0)))
+  assert(!c.inTransaction)
+  c.close()
+
+@test("the extended protocol: parameters, counts, and statements returning no rows")
+extendedProtocol() -> Result[unit, PgError]
+  val c = testConnection() match
+    Some(r) -> r?
+    None -> return Ok(())
+  assertEq(c.execute("create temp table items (id serial primary key, name text not null, price numeric)"), Ok(long(0)))
+  assertEq(c.execute("insert into items (name, price) values ($1, $2), ($3, $4)", "pen", BigDecimal("1.25"), "ink", BigDecimal("9")), Ok(long(2)))
+  assertEq(c.execute("update items set price = price * 2 where name = $1", "pen"), Ok(long(1)))
+  assertEq(c.execute("update items set price = 0 where name = $1", "nothing"), Ok(long(0)))
+  val rows = c.query("select name, price from items where price > $1 order by name", BigDecimal("1"))?
+  assertEq(rows.map(r -> r.get[string]("name")), [Ok("ink"), Ok("pen")])
+  assertEq(rows(1).get[BigDecimal]("price"), Ok(BigDecimal("2.50")))
+  assertEq(c.queryOne("select name from items where id = $1", 99)?, None)
+  assertEq(c.queryValue[long]("select count(*) from items"), Ok(long(2)))
+  assertEq(c.queryValue[long]("select 1 where false").err.map(e -> e.toString()), Some("cannot read column `#0`: the statement returned no rows"))
+  assertEq(c.execute("delete from items"), Ok(long(2)))
+  // A statement's parameters must all be given.
+  assertEq(c.query("select $1::int, $2::int", 1).err.map(e -> e.toString()), Some("bad connection settings: the statement has 2 parameters and 1 were given"))
+  c.close()
+
+@test("statements are prepared once and run again from the cache")
+statementCache() -> Result[unit, PgError]
+  val c = testConnection() match
+    Some(r) -> r?
+    None -> return Ok(())
+  val prepared = "select count(*) from pg_prepared_statements"
+  val base = c.cachedStatements
+  for i in 0 ..< 5
+    assertEq(c.queryValue[int]("select $1::int * 2", i), Ok(i * 2))
+  assertEq(c.cachedStatements, base + 1)
+  // The same text with parameters of other types is another statement.
+  assertEq(c.queryValue[long]("select $1::int * 2", long(4)), Ok(long(8)))
+  assertEq(c.cachedStatements, base + 2)
+  assertEq(c.queryValue[long](prepared), Ok(long(base + 3)))
+  c.close()
+
+@test("the cache keeps its size, closing the statements it drops")
+cacheEviction() -> Result[unit, PgError]
+  val url = testUrl("sslmode=disable&statement_cache_size=2") match
+    Some(u) -> u
+    None -> return Ok(())
+  val c = pg.connect(url)?
+  for i in 0 ..< 6
+    assertEq(c.queryValue[int](s"select $i"), Ok(i))
+    assert(c.cachedStatements <= 2)
+  // Each statement the cache dropped is closed on the server along with the next one prepared: the
+  // server holds the two cached and the one dropped by preparing the count.
+  assertEq(c.queryValue[long]("select count(*) from pg_prepared_statements"), Ok(long(3)))
+  assertEq(c.queryValue[long]("select count(*) from pg_prepared_statements"), Ok(long(3)))
+  assertEq(c.queryValue[long]("select count(*) + 0 from pg_prepared_statements"), Ok(long(3)))
+  c.close()
+
+@test("with no cache every statement is prepared unnamed")
+noCache() -> Result[unit, PgError]
+  val c = pg.connect(testUrl("sslmode=disable&statement_cache_size=0").get)?
+  assertEq(c.queryValue[int]("select $1::int", 3), Ok(3))
+  assertEq(c.queryValue[int]("select $1::int", 4), Ok(4))
+  assertEq(c.cachedStatements, 0)
+  assertEq(c.queryValue[long]("select count(*) from pg_prepared_statements"), Ok(long(0)))
+  c.close()
+
+@test("a cached statement the server invalidates by DDL is prepared again")
+invalidatedByDdl() -> Result[unit, PgError]
+  val c = testConnection() match
+    Some(r) -> r?
+    None -> return Ok(())
+  c.execute("create temp table shapes (id int)")?
+  c.execute("insert into shapes values (1)")?
+  assertEq(c.query("select * from shapes")?(0).length, 1)
+  c.execute("alter table shapes add column name text default 'x'")?
+  // The cached plan's row type changed: the statement is prepared afresh and runs.
+  val rows = c.query("select * from shapes")?
+  assertEq(rows(0).length, 2)
+  assertEq(rows(0).get[string]("name"), Ok("x"))
+  // Inside a transaction the failure would abort it, so it is answered, and the next run works.
+  c.execute("alter table shapes drop column name")?
+  val inside = c.transaction(tx -> tx.query("select * from shapes"))
+  assertEq(inside.err.flatMap(e -> e.code), Some("0A000"))
+  assertEq(c.query("select * from shapes")?(0).length, 1)
+  c.close()
+
+@test("named prepared statements: parameter types the server infers, run and deallocated")
+preparedStatements() -> Result[unit, PgError]
+  val c = testConnection() match
+    Some(r) -> r?
+    None -> return Ok(())
+  c.execute("create temp table kv (k text primary key, v bigint)")?
+  val insert = c.prepare("insert into kv values ($1, $2)")?
+  assertEq(insert.paramOids, [25, 20])
+  assertEq(insert.columns.length, 0)
+  // An int goes to the bigint parameter as a bigint; a string for it goes as text.
+  assertEq(c.execute(insert, "a", 1), Ok(long(1)))
+  assertEq(c.execute(insert, "b", "2"), Ok(long(1)))
+  val select = c.prepare("select v from kv where k = $1")?
+  assertEq(select.columns.map(col -> col.name), ["v"])
+  assertEq(c.query(select, "b")?(0).get[long]("v"), Ok(long(2)))
+  c.deallocate(select)?
+  assertEq(c.query(select, "b").err.flatMap(e -> e.code), Some("26000"))
+  assertEq(c.prepare("selec 1").err.flatMap(e -> e.code), Some("42601"))
+  c.close()
+
+@test("a unique violation's diagnostic: SQLSTATE, table, constraint and detail")
+uniqueViolation() -> Result[unit, PgError]
+  val c = testConnection() match
+    Some(r) -> r?
+    None -> return Ok(())
+  c.execute("create temp table people (email text constraint people_email_key unique)")?
+  c.execute("insert into people values ($1)", "ada@example.com")?
+  val e = c.execute("insert into people values ($1)", "ada@example.com").err.get
+  e match
+    Server(d) ->
+      assertEq(d.code, "23505")
+      assertEq(d.severity, "ERROR")
+      assertEq(d.table, Some("people"))
+      assertEq(d.constraint, Some("people_email_key"))
+      assertEq(d.detail, Some("Key (email)=(ada@example.com) already exists."))
+      assert(d.message.contains("duplicate key value violates unique constraint"))
+      assert(d.schema.isDefined)
+      assert(d.file.isDefined && d.line.isDefined && d.routine.isDefined)
+    _ -> fail(s"expected the server's error, found $e")
+  assertEq(e.code, Some("23505"))
+  assertEq(e.toString(), "the server answered ERROR 23505: duplicate key value violates unique constraint \"people_email_key\"")
+  // The connection is ready for the next statement.
+  assertEq(c.queryValue[long]("select count(*) from people"), Ok(long(1)))
+  c.close()
+
+@test("a syntax error's diagnostic: SQLSTATE and the position of the error")
+syntaxError() -> Result[unit, PgError]
+  val c = testConnection() match
+    Some(r) -> r?
+    None -> return Ok(())
+  val d = c.query("select 1 frm nowhere").err.get match
+    Server(d) -> d
+    other -> return Err(other)
+  assertEq(d.code, "42601")
+  assertEq(d.position, Some(14))
+  assertEq(d.message, "syntax error at or near \"nowhere\"")
+  // In the simple protocol too, and with a hint where the server gives one.
+  assertEq(c.simpleQuery("select 1 frm nowhere").err.flatMap(e -> e.code), Some("42601"))
+  val missing = c.query("select nosuchcolumn from pg_class").err.get match
+    Server(d) -> d
+    other -> return Err(other)
+  assertEq(missing.code, "42703")
+  assertEq(missing.position, Some(8))
+  val hinted = c.query("select length(1)").err.get match
+    Server(d) -> d
+    other -> return Err(other)
+  assertEq(hinted.code, "42883")
+  assert(hinted.hint.isDefined)
+  c.close()
+
+@test("notices and warnings go to the configured sink, and are dropped without one")
+notices() -> Result[unit, PgError]
+  val url = testUrl() match
+    Some(u) -> u
+    None -> return Ok(())
+  val seen = Channel[Diagnostic]()
+  val config = PgConfig.parse(url)? with { notices = Some(d -> seen.send(d)) }
+  val c = pg.connect(config)?
+  c.simpleQuery("do $$ begin raise notice 'hello %', 42; raise warning 'careful'; end $$")?
+  val first = seen.receive(millis(1000)).get
+  assertEq((first.severity, first.code, first.message), ("NOTICE", "00000", "hello 42"))
+  val second = seen.receive(millis(1000)).get
+  assertEq((second.severity, second.code, second.message), ("WARNING", "01000", "careful"))
+  // Through the extended protocol too.
+  c.execute("do $$ begin raise notice 'again'; end $$")?
+  assertEq(seen.receive(millis(1000)).map(d -> d.message), Some("again"))
+  c.close()?
+  val quiet = pg.connect(url)?
+  quiet.simpleQuery("do $$ begin raise notice 'nobody hears'; end $$")?
+  quiet.close()
+
+data Item(id: int, name: string, price: Option[BigDecimal]) derives FromRow
+
+data Stamp(@PgColumn("created_at") created: Instant, label: string = "none") derives FromRow
+
+@test("rows read into derived types: by column name, @PgColumn, defaults and Option")
+derivedRows() -> Result[unit, PgError]
+  val c = testConnection() match
+    Some(r) -> r?
+    None -> return Ok(())
+  val items = c.queryAs[Item]("select 2 as id, 'ink' as name, null::numeric as price union all select 1, 'pen', 1.5 order by id")?
+  assertEq(items, [Item(1, "pen", Some(BigDecimal("1.5"))), Item(2, "ink", None)])
+  // Columns may come in any order, and extra ones are left alone.
+  assertEq(c.queryAs[Item]("select 'x' as extra, 9.99 as price, 'cap' as name, 3 as id")?, [Item(3, "cap", Some(BigDecimal("9.99")))])
+  val stamp = c.queryOne("select 'epoch'::timestamptz as created_at")?.get.decode[Stamp]()
+  assertEq(stamp.map(s -> (s.created.epochMicros, s.label)), Ok((long(0), "none")))
+  assertEq(c.queryAs[Stamp]("select 'epoch'::timestamptz as created_at, 'set' as label")?(0).label, "set")
+  // A column absent, or of the wrong type, is a Column error naming it.
+  assertEq(c.queryAs[Item]("select 1 as id, 'x' as name").err, Some(BadColumn("price", "the result has no such column")))
+  assertEq(c.queryAs[Item]("select 'one' as id, 'x' as name, 1.0 as price").err, Some(BadColumn("id", "it holds text (text), which is not the type asked for")))
+  assertEq(c.queryAs[Stamp]("select 1 as created").err, Some(BadColumn("created_at", "the result has no such column")))
+  c.close()
+
+@test("a closed connection answers Closed, and closing again does nothing")
+closedConnection() -> Result[unit, PgError]
+  val c = testConnection() match
+    Some(r) -> r?
+    None -> return Ok(())
+  c.close()?
+  assert(c.isClosed)
+  assertEq(c.query("select 1").err, Some(Closed))
+  assertEq(c.simpleQuery("select 1").err, Some(Closed))
+  assertEq(c.close(), Ok(()))
+  Ok(())
+
+@test("a connection the server ends is broken, and says so")
+terminated() -> Result[unit, PgError]
+  val c = testConnection() match
+    Some(r) -> r?
+    None -> return Ok(())
+  val killer = testConnection().get?
+  assertEq(killer.queryValue[bool]("select pg_terminate_backend($1)", c.backendPid), Ok(true))
+  killer.close()?
+  val r = c.query("select 1")
+  assert(r.isErr)
+  assert(c.isBroken)
+  assertEq(c.query("select 1").err, Some(Closed))
+  _ = c.close()
+  Ok(())

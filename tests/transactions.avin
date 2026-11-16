@@ -1,0 +1,136 @@
+module tests
+
+// Transactions: committed on Ok, rolled back on Err and on cancellation, nested as savepoints; and a
+// statement cancelled when its thread is.
+
+import avin.threads.withTimeout
+import avin.time.{millis, monotonic}
+import dev.avinlang.pg
+import dev.avinlang.pg.{Auth, Connection, PgError, RolledBack}
+
+// A connection and a table of its own, `name`, which other connections see.
+private withTable(name: string) -> Option[Result[Connection, PgError]] = testConnection().map(r ->
+  val c = r?
+  c.simpleQuery(s"drop table if exists $name; create table $name (n int)")?
+  Ok(c))
+
+private countIn(c: Connection, table: string) -> Result[long, PgError] = c.queryValue[long](s"select count(*) from $table")
+
+@test("a transaction whose body answers Ok is committed, seen by another connection")
+commits() -> Result[unit, PgError]
+  val c = withTable("tx_commit") match
+    Some(r) -> r?
+    None -> return Ok(())
+  val answer = c.transaction(tx ->
+    tx.execute("insert into tx_commit values (1), (2)")?
+    assert(tx.inTransaction)
+    Ok("done"))
+  assertEq(answer, Ok("done"))
+  assert(!c.inTransaction)
+  val other = testConnection().get?
+  assertEq(countIn(other, "tx_commit"), Ok(long(2)))
+  other.close()?
+  c.simpleQuery("drop table tx_commit")?
+  c.close()
+
+@test("a transaction whose body answers Err is rolled back, and the error answered")
+rollsBack() -> Result[unit, PgError]
+  val c = withTable("tx_rollback") match
+    Some(r) -> r?
+    None -> return Ok(())
+  val answer = c.transaction(tx ->
+    tx.execute("insert into tx_rollback values (1)")?
+    Err(Auth("the body's own error")))
+  assertEq(answer.err, Some(Auth("the body's own error")))
+  assert(!c.inTransaction)
+  assertEq(countIn(c, "tx_rollback"), Ok(long(0)))
+  // A failing statement is the body's Err.
+  val failed = c.transaction(tx ->
+    tx.execute("insert into tx_rollback values (1)")?
+    tx.execute("insert into tx_rollback values ('x')")?
+    Ok(()))
+  assertEq(failed.err.flatMap(e -> e.code), Some("22P02"))
+  assertEq(countIn(c, "tx_rollback"), Ok(long(0)))
+  c.simpleQuery("drop table tx_rollback")?
+  c.close()
+
+@test("a body that answers Ok after a statement failed is rolled back as RolledBack")
+swallowedFailure() -> Result[unit, PgError]
+  val c = withTable("tx_swallow") match
+    Some(r) -> r?
+    None -> return Ok(())
+  val answer = c.transaction(tx ->
+    tx.execute("insert into tx_swallow values (1)")?
+    _ = tx.execute("select 1/0")
+    Ok(()))
+  assertEq(answer, Err(RolledBack))
+  assert(!c.inTransaction)
+  assertEq(countIn(c, "tx_swallow"), Ok(long(0)))
+  c.simpleQuery("drop table tx_swallow")?
+  c.close()
+
+@test("nested transactions are savepoints: an inner failure undoes only the inner work")
+nested() -> Result[unit, PgError]
+  val c = withTable("tx_nested") match
+    Some(r) -> r?
+    None -> return Ok(())
+  val answer = c.transaction(outer ->
+    outer.execute("insert into tx_nested values (1)")?
+    val inner = outer.transaction(tx ->
+      tx.execute("insert into tx_nested values (2)")?
+      tx.execute("insert into tx_nested values ('bad')")?
+      Ok(()))
+    assertEq(inner.err.flatMap(e -> e.code), Some("22P02"))
+    // The outer transaction goes on after the savepoint was rolled back to.
+    val kept = outer.transaction(tx ->
+      tx.execute("insert into tx_nested values (3)")?
+      tx.transaction(deeper -> deeper.execute("insert into tx_nested values (4)")))
+    assertEq(kept, Ok(long(1)))
+    outer.queryValue[long]("select count(*) from tx_nested"))
+  assertEq(answer, Ok(long(3)))
+  assertEq(c.query("select n from tx_nested order by n")?.map(r -> r.get[int](0)), [Ok(1), Ok(3), Ok(4)])
+  // An outer failure undoes the inner work that was released.
+  val undone = c.transaction(outer ->
+    outer.transaction(tx -> tx.execute("insert into tx_nested values (5)"))?
+    Err(Auth("stop")))
+  assertEq(undone.err, Some(Auth("stop")))
+  assertEq(countIn(c, "tx_nested"), Ok(long(3)))
+  c.simpleQuery("drop table tx_nested")?
+  c.close()
+
+@test("a statement whose thread is cancelled is cancelled on the server, and the connection goes on")
+cancelledStatement() -> Result[unit, PgError]
+  val c = testConnection() match
+    Some(r) -> r?
+    None -> return Ok(())
+  val started = monotonic()
+  val r = withTimeout(millis(300), _ -> c.query("select pg_sleep(30)"))
+  assert(r.isEmpty)
+  assert(!c.isBroken)
+  assertEq(c.queryValue[int]("select 7"), Ok(7))
+  assert((monotonic() - started).toSeconds < 10)
+  // The extended and the simple protocol alike.
+  assert(withTimeout(millis(300), _ -> c.simpleQuery("select pg_sleep(30)")).isEmpty)
+  assertEq(c.queryValue[string]("select 'still here'"), Ok("still here"))
+  assert((monotonic() - started).toSeconds < 10)
+  // A body that finishes in time is answered as it is.
+  assertEq(withTimeout(millis(5000), _ -> c.queryValue[int]("select 8")), Some(Ok(8)))
+  c.close()
+
+@test("a transaction whose thread is cancelled is rolled back")
+cancelledTransaction() -> Result[unit, PgError]
+  val c = withTable("tx_cancel") match
+    Some(r) -> r?
+    None -> return Ok(())
+  val r = withTimeout(millis(300), _ -> c.transaction(tx ->
+    tx.execute("insert into tx_cancel values (1)")?
+    tx.transaction(inner -> inner.query("select pg_sleep(30)"))))
+  assert(r.isEmpty)
+  assert(!c.isBroken)
+  assert(!c.inTransaction)
+  assertEq(countIn(c, "tx_cancel"), Ok(long(0)))
+  // The connection's next transaction starts afresh, not as a savepoint.
+  c.transaction(tx -> tx.execute("insert into tx_cancel values (2)"))?
+  assertEq(countIn(testConnection().get?, "tx_cancel"), Ok(long(1)))
+  c.simpleQuery("drop table tx_cancel")?
+  c.close()

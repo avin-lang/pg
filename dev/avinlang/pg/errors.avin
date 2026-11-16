@@ -1,0 +1,89 @@
+module dev.avinlang.pg
+
+import avin.io.IoError
+import avin.net.tls.TlsError
+
+// What the server says about an error or a notice: the fields of an `ErrorResponse` or a
+// `NoticeResponse`. `code` is the SQLSTATE (`23505` for a unique violation, `42601` for a syntax
+// error), `severity` is `ERROR`, `FATAL`, `PANIC`, `WARNING`, `NOTICE`, `DEBUG`, `INFO` or `LOG`, and
+// `position` is the 1-based character in the statement where the server found the error. The fields
+// the server leaves out are `None`.
+data Diagnostic(
+    severity: string,
+    code: string,
+    message: string,
+    detail: Option[string] = None,
+    hint: Option[string] = None,
+    position: Option[int] = None,
+    internalPosition: Option[int] = None,
+    internalQuery: Option[string] = None,
+    where: Option[string] = None,
+    schema: Option[string] = None,
+    table: Option[string] = None,
+    column: Option[string] = None,
+    dataType: Option[string] = None,
+    constraint: Option[string] = None,
+    file: Option[string] = None,
+    line: Option[int] = None,
+    routine: Option[string] = None
+)
+
+impl Display for Diagnostic
+  display(out: Writer, spec: FormatSpec) = out.writeField(s"$severity $code: $message", spec)
+
+// Why an operation on the database failed.
+data PgError
+  // The server refused the statement or the connection: what it said, SQLSTATE and all.
+  Server(diagnostic: Diagnostic)
+  // The connection beneath failed: it could not be made, broke, or timed out.
+  Io(error: IoError)
+  // TLS could not be set up: the certificate was refused, or the handshake failed.
+  Tls(error: TlsError)
+  // The connection asked for TLS and the server does not offer it.
+  TlsRefused
+  // Authentication failed on this end: the server asked for a password and none was given, asked for
+  // a method this client does not speak, or proved it does not know the password.
+  Auth(reason: string)
+  // The server sent something the protocol does not allow at that point.
+  Protocol(reason: string)
+  // A column could not be read as the type asked for: there is no such column, it is NULL where the
+  // type has no NULL, or it holds a value of another type.
+  BadColumn(column: string, reason: string)
+  // A connection URL or setting is not one this client understands.
+  Config(reason: string)
+  // A statement in the transaction failed, so it was rolled back although its body succeeded.
+  RolledBack
+  // The connection is closed, or broke earlier and cannot be used again.
+  Closed
+  // No pooled connection came free before the time to wait ran out.
+  PoolTimedOut
+  // The pool is closed.
+  PoolClosed
+
+impl PgError
+  // The server's SQLSTATE where the server refused the statement, or `None` for any other failure.
+  code -> Option[string] = self match
+    Server(d) -> Some(d.code)
+    _ -> None
+
+
+impl Error for PgError
+  // A sentence saying what went wrong, for a log; it never holds a password.
+  message -> string = self match
+    Server(d) -> s"the server answered ${d.severity} ${d.code}: ${d.message}"
+    Io(_) -> "the connection to the server failed"
+    Tls(_) -> "TLS with the server failed"
+    TlsRefused -> "the server does not accept TLS"
+    Auth(reason) -> s"authentication failed: $reason"
+    Protocol(reason) -> s"the server broke the protocol: $reason"
+    BadColumn(column, reason) -> s"cannot read column `$column`: $reason"
+    Config(reason) -> s"bad connection settings: $reason"
+    RolledBack -> "the transaction was rolled back: a statement in it failed"
+    Closed -> "the connection is closed"
+    PoolTimedOut -> "timed out waiting for a pooled connection"
+    PoolClosed -> "the pool is closed"
+
+  cause -> Option[Error] = self match
+    Io(e) -> Some(e)
+    Tls(e) -> Some(e)
+    _ -> None

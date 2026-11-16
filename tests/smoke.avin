@@ -1,0 +1,19 @@
+module tests
+
+import dev.avinlang.pg
+import dev.avinlang.pg.{PgError}
+
+@test("connects, runs a simple and an extended query, and closes")
+smoke() -> Result[unit, PgError]
+  val url = testUrl() match
+    Some(u) -> u
+    None -> return Ok(())
+  val c = pg.connect(url)?
+  val results = c.simpleQuery("select 1 as one, 'x' as two; select 2")?
+  println(results)
+  val rows = c.query("select $1::int + 1 as n, $2 as s", 41, "hi")?
+  println(rows)
+  assertEq(rows(0).get[int]("n"), Ok(42))
+  assertEq(rows(0).get[string]("s"), Ok("hi"))
+  c.close()?
+  Ok(())
