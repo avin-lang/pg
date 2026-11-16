@@ -193,7 +193,7 @@ refused.
 
 ## Tests
 
-The tests run against a private server the package starts for them, on port 55432:
+The tests run against a private server the package starts for them, on port 55432 (`PG_TEST_PORT` chooses another when the cluster is first made):
 
 ```zsh
 zsh scripts/test-db.zsh start

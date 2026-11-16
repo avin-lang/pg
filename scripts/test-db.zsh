@@ -1,6 +1,7 @@
 #!/bin/zsh
 # A private PostgreSQL server for the package's tests, run as the current user from a directory of
-# its own, on port 55432 with no Unix socket, so it touches no other server on the machine.
+# its own, on port 55432 (or $PG_TEST_PORT when the cluster is made; the directory remembers it)
+# with no Unix socket, so it touches no other server on the machine.
 #
 #   scripts/test-db.zsh start [dir]   makes the cluster on first use, then starts it
 #   scripts/test-db.zsh stop [dir]    stops it
@@ -22,14 +23,19 @@ setopt NO_NOMATCH
 
 action=${1:-start}
 root=${2:-${PG_TEST_DIR:-${0:A:h:h}/.pg-test}}
-port=55432
 data=$root/data
+if [[ -f $root/port ]]; then
+  port=$(<$root/port)
+else
+  port=${PG_TEST_PORT:-55432}
+fi
 bin=/opt/homebrew/bin
 
 case $action in
   start)
     mkdir -p $root
     if [[ ! -f $data/PG_VERSION ]]; then
+      print -r -- $port > $root/port
       print -r -- pgtest > $root/pwfile
       $bin/initdb -D $data -U pgtest --auth=scram-sha-256 --pwfile=$root/pwfile -E UTF8 --locale=C > $root/initdb.log
       cd $root
