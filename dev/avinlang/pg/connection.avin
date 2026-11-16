@@ -8,6 +8,7 @@ import avin.io
 import avin.io.IoError
 import avin.net.{ByteStream, TcpStream}
 import avin.net.tls.{TlsClient, TlsStream}
+import avin.threads.Readiness
 import avin.time.{Duration, monotonic, seconds}
 
 // A statement prepared on a connection: its name there, its text, the types of its parameters as
@@ -74,7 +75,7 @@ class Connection(
   private val config: PgConfig,
   // Whether the connection is encrypted.
   val isTls: bool
-)
+): Readiness
   private var reader = MessageReader(stream)
   private var pid = 0
   private var secret = 0
@@ -139,6 +140,46 @@ class Connection(
     val answered = simple("")
     if stream.setTimeout(Duration(0)).isErr then broken = true
     answered
+
+  // ---- Notifications ----
+
+  // Waits at most `timeout` while the connection is idle for a notification on a channel it has
+  // LISTENed to, and answers it, or `None` where none came in time. A timeout of zero or less reads
+  // only what has already arrived. A notification that arrives while a statement runs goes to the
+  // configuration's `notifications` hook instead, and is dropped without one, so a connection that
+  // both runs statements and waits sets the hook, or a `Listener` is used. Notices and parameter
+  // changes that arrive meanwhile are dealt with as they are during a statement. The server ending
+  // the connection breaks it and answers the error it sent, `Server` with SQLSTATE `57P01` where an
+  // administrator terminated it.
+  waitForNotification(timeout: Duration) -> Result[Option[Notification], PgError]
+    usable()?
+    val deadline = monotonic() + timeout
+    while true
+      if !readable()
+        val left = deadline - monotonic()
+        if left.micros <= 0 then return Ok(None)
+        val arrived = select
+          stream.readable() -> true
+          after left -> false
+        if !arrived then return Ok(None)
+      val m = reader.next() match
+        Ok(m) -> m
+        Err(e) ->
+          broken = true
+          return Err(e)
+      heard = monotonic()
+      m.kind match
+        'A' -> return Ok(Some(notificationOf(m)))
+        'E' -> return broke(Server(diagnosticOf(m)))
+        _ -> if !asynchronous(m) then return broke(Protocol(s"unexpected message `${m.kind}` while idle"))
+    Ok(None)
+
+  // Whether a read would answer without waiting: a message is buffered or bytes have arrived, or the
+  // connection has ended. A `select` waits for a notification with a `connection.readable()` arm,
+  // then reads it with `waitForNotification`; only the thread that owns the connection may.
+  override readable() -> bool = reader.hasBuffered || stream.readable()
+
+  override readinessDescriptor() -> int = stream.readinessDescriptor()
 
   // ---- Running statements ----
 
@@ -691,9 +732,8 @@ class Connection(
     broken = true
     Err(e)
 
-  // The next message, with the ones that can come at any time dealt with on the way: a notice goes
-  // to the configuration's sink, a parameter's new value is kept, a notification is dropped. A
-  // failure to read breaks the connection.
+  // The next message, with the ones that can come at any time dealt with on the way. A failure to
+  // read breaks the connection.
   private receive() -> Result[Message, PgError]
     while true
       val m = reader.next() match
@@ -702,18 +742,25 @@ class Connection(
           broken = true
           return Err(e)
       heard = monotonic()
-      m.kind match
-        'N' ->
-          config.notices match
-            Some(sink) -> sink(diagnosticOf(m))
-            None -> ()
-        'S' ->
-          val r = In(m.body)
-          val name = r.cstring()
-          parameters = parameters.updated(name, r.cstring())
-        'A' -> ()
-        _ -> return Ok(m)
+      if !asynchronous(m) then return Ok(m)
     Err(Protocol("unreachable"))
+
+  // Deals with `m` where it is a message that can come at any time, and answers whether it was: a
+  // notice goes to the configuration's sink, a parameter's new value is kept, a notification goes to
+  // the configuration's hook, each dropped where there is none.
+  private asynchronous(m: Message) -> bool = m.kind match
+    'N' ->
+      if config.notices is Some(sink) then sink(diagnosticOf(m))
+      true
+    'S' ->
+      val r = In(m.body)
+      val name = r.cstring()
+      parameters = parameters.updated(name, r.cstring())
+      true
+    'A' ->
+      if config.notifications is Some(hook) then hook(notificationOf(m))
+      true
+    _ -> false
 
   // Sends `out` and reads the answer up to ReadyForQuery, giving each message other than an error to
   // `handle` with whether an error has already come. The first error is the answer; a protocol

@@ -364,3 +364,73 @@ keeps what its statements before the cancelled one committed, and the ones alrea
 still run. A thread cancelled while a write is under way may have sent half a message, so the
 connection is broken at once rather than drained to the limit; this holds for single statements
 too.
+
+## LISTEN/NOTIFY: a `Listener` with a connection and a thread of its own
+
+Settled on the user's delegation 2026-11-16. A `Listener` owns a dedicated connection on a
+lightweight thread of its own, which waits in one `select` on the connection (`Connection` is a
+`Readiness`), on a command channel (`listen`, `unlisten`, `unlistenAll`, `channels`, `close`, each
+answered on a reply channel, so any thread may call them), and, while an event is held back, on room
+in the events channel. It delivers `ListenEvent`s: `Notified(Notification(channel, payload, pid))`,
+`Dropped(count)`, `Disconnected(error)` and `Reconnected(attempts)`, in the order they happened.
+`Listener.open` connects and LISTENs before answering, so a bad password or an unreachable server is
+the caller's error. Channel names are quoted identifiers, `"` doubled, so they are used exactly as
+written; an empty name or one holding a NUL is refused on this side with `Config` (the first is a
+server syntax error, the second cannot be sent), which also means a channel remembered while
+disconnected can never be refused on reconnecting. A name over the server's 63 bytes is truncated by
+the server, as every identifier is. Alternatives weighed: pgx's shape alone,
+`Conn.WaitForNotification(ctx)` on a connection the program drives (kept as
+`Connection.waitForNotification`, but a program then writes the reconnect and the runtime LISTEN
+itself), and a listener that shares a pooled connection (a pooled connection is reset and lent to
+others, so its LISTENs would not survive).
+
+## Notifications on an ordinary connection go to a hook; a wait answers those that arrive idle
+
+Settled on the user's delegation 2026-11-16. `PgConfig.notifications: Option[@sendable
+(Notification) -> unit]` is pgx's `OnNotification`: each notification a connection reads while it
+runs a statement is handed to it, on that thread, and dropped without one, as before. It never
+disturbs the statement. `Connection.waitForNotification(timeout)` reads while the connection is idle
+and answers the first notification, `None` at the timeout, and the server's error where it ends the
+connection (`57P01` when an administrator terminates it), which breaks the connection; a
+notification it reads is answered and not also given to the hook. **Review with the user**: pgx's
+`Conn` also keeps the notifications read during statements in an unbounded slice that
+`WaitForNotification` drains first; here they go to the hook or are dropped, so memory stays bounded
+on a connection that LISTENs and never waits, at the price that a program mixing statements and
+waits on one connection must set the hook (or use a `Listener`, which does).
+
+## A listener's back-pressure: a bounded queue that drops and counts
+
+Settled on the user's delegation 2026-11-16. The events wait in a channel of `capacity` (default
+1024). While it is full, further notifications are dropped and counted, in `listener.dropped` and in
+a `Dropped(count)` event that takes their place in the order and is delivered as soon as there is
+room, without waiting for another notification to carry it. Control events (`Disconnected`,
+`Reconnected`) are never dropped: they wait in a small list in front of the queue, and a second gap
+while the consumer has not yet been told of the first merges into it, so that list stays at a few
+entries however often the connection drops. The notifications a LISTEN's own round trip reads are
+kept up to `capacity` and go through the same path. **Review with the user**: the alternatives were
+blocking the listener while the queue is full (the server then queues the notifications, up to its
+8 GB `max_notify_queue_pages`, past which every NOTIFY in the database fails, so one slow consumer
+would break every sender), and dropping the oldest instead of the newest (keeps the freshest, but
+reorders what the consumer sees around the gap).
+
+## A listener reconnects with a doubling backoff and reports the gap
+
+Settled on the user's delegation 2026-11-16. Where the connection fails, the listener closes it,
+delivers `Disconnected(error)`, tries again at once, then after `minBackoff` (100 ms) doubling to
+`maxBackoff` (30 s), serving commands meanwhile: a `listen` or `unlisten` while disconnected is
+remembered and answered `Ok`, and made on reconnecting. Once connected it LISTENs to every channel
+again and delivers `Reconnected(attempts)`. The server keeps no notifications for a listener that is
+not connected, so the two events bound what was lost. A LISTEN that breaks the connection counts as
+done, the reconnection making it. No jitter: one listener per process is the usual shape. It retries
+for ever, until closed.
+
+## Delivery to an actor: asks with a window of unanswered events
+
+Settled on the user's delegation 2026-11-16. Actor mailboxes are unbounded, so `Listener.toActor`
+follows the actors chapter's rule for a producer that must not outrun its consumer: each event goes
+as the message `make(event, ack)`, an ask, and the actor tells `ack` once it has handled it. At most
+`window` (16) asks are unanswered; past that the forwarding thread waits, the listener's queue fills
+and drops as `open`'s does. An ask unanswered for an hour counts as answered. The listener stops when
+the actor ends (watched through `ended()`), and the forwarder stops waiting on an ended actor's asks.
+**Review with the user**: the ack is a burden on the actor's code; the alternative, plain `tell`
+with no bound, breaks the back-pressure requirement for any actor slower than its notifications.

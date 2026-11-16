@@ -1,0 +1,377 @@
+module dev.avinlang.pg
+
+// LISTEN and NOTIFY: a listener that keeps a connection of its own LISTENing on channels and
+// delivers what is sent on them to a channel the program receives from, or to an actor.
+
+import avin.actors.{ActorRef, AskError, Ended}
+import avin.threads.{Atomic as AtomicCell, Channel, Future, Thread, spawn}
+import avin.time.{Duration, millis, monotonic, seconds}
+
+// A notification: `payload`, sent on `channel` by `NOTIFY` or `pg_notify`, by the server process
+// `pid` (the sender's `backendPid`). The payload is empty where none was given.
+data Notification(channel: string, payload: string, pid: int)
+
+// What a listener delivers, in the order it happened.
+data ListenEvent
+  // A notification on a channel the listener LISTENs to.
+  Notified(notification: Notification)
+  // `count` notifications were dropped because the consumer had not taken the ones before them and
+  // the listener's queue was full.
+  Dropped(count: long)
+  // The listener's connection was lost with `error`. Notifications sent from now until the
+  // `Reconnected` that follows are lost: the server keeps none for a listener that is not there.
+  Disconnected(error: PgError)
+  // The listener connected again and LISTENs to its channels again, after `attempts` attempts.
+  Reconnected(attempts: int)
+
+// A connection that LISTENs to channels and delivers each notification sent on them, made by
+// `Listener.open` or `Listener.toActor`. A thread of its own owns the connection, so the listener may
+// be shared between threads and actors, and `listen` and `unlisten` may be called from any of them.
+//
+//     val listener = Listener.open(config, ["orders"])?
+//     for event in listener.events
+//       if event is Notified(n) then println(s"${n.channel}: ${n.payload}")
+//
+// The events wait in a queue of `capacity`; where the consumer falls that far behind, further
+// notifications are dropped and counted rather than kept, a `Dropped` event saying how many once
+// there is room again, so a slow consumer never makes the listener's memory grow. Where the
+// connection is lost, the listener says so with `Disconnected`, connects again with a backoff that
+// doubles from `minBackoff` to `maxBackoff`, LISTENs to its channels again and says `Reconnected`.
+class Listener(
+  private val commands: Channel[ListenCommand],
+  private val finished: Channel[unit],
+  private val thread: Thread[unit],
+  private val lost: AtomicCell[long],
+  // The events, closed once the listener is closed and every event before is received. For a
+  // listener made by `toActor`, they go to the actor instead and this is not for the program.
+  val events: Channel[ListenEvent]
+): Sendable
+  // LISTENs to `channel` as well, from now on. The name is used as it is written, quoted, so
+  // `orders` and `Orders` are two channels; an empty name, or one holding a NUL, fails with
+  // `Config`. LISTENing to a channel already listened to does nothing. While the listener is
+  // reconnecting, the channel is remembered and LISTENed to once it is connected again.
+  listen(channel: string) -> Result[unit, PgError] = asked(r -> Listen(channel, r))
+
+  // Stops LISTENing to `channel`. Notifications already on their way may still arrive.
+  unlisten(channel: string) -> Result[unit, PgError] = asked(r -> Unlisten(channel, r))
+
+  // Stops LISTENing to every channel.
+  unlistenAll() -> Result[unit, PgError] = asked(r -> UnlistenAll(r))
+
+  // The channels the listener LISTENs to, in the order they were first listened to.
+  channels() -> Result[Vector[string], PgError]
+    val reply = Channel[Vector[string]](1)
+    commands.send(Channels(reply))
+    select
+      reply.receive() as Some(names) -> Ok(names)
+      finished.receive() as None -> reply.tryReceive().map(n -> Ok(n)).getOrElse(Err(Closed))
+
+  // How many notifications have been dropped since the listener was opened, because its consumer
+  // fell behind.
+  dropped -> long = lost.load()
+
+  // Closes the listener: its connection is closed and its events channel too, once the events
+  // already delivered are received. Every call after fails with `Closed`; closing again does
+  // nothing.
+  close()
+    commands.send(Stop)
+    thread.join()
+
+  // Sends the command `make` builds around a reply channel and waits for the reply, or fails with
+  // `Closed` where the listener has ended.
+  private asked(make: (Channel[Result[unit, PgError]]) -> ListenCommand) -> Result[unit, PgError]
+    val reply = Channel[Result[unit, PgError]](1)
+    commands.send(make(reply))
+    select
+      reply.receive() as Some(r) -> r
+      finished.receive() as None -> reply.tryReceive().getOrElse(Err(Closed))
+
+object Listener
+  // A listener with the settings `config` LISTENing to `channels`, delivering to its `events`
+  // channel. It connects and LISTENs before it answers, failing as `connect` does, or where the
+  // server refuses a LISTEN. The configuration's own `notifications` hook is not used.
+  open(
+      config: PgConfig,
+      channels: Vector[string],
+      capacity: int = 1024,
+      minBackoff: Duration = millis(100),
+      maxBackoff: Duration = seconds(30)
+  ) -> Result[Listener, PgError] = started(config, channels, capacity, minBackoff, maxBackoff)
+
+  // A listener that delivers each event to `actor` as the message `make(event, ack)`. The actor
+  // replies to `ack` once it has handled the event; at most `window` events wait for their replies,
+  // so an actor that falls behind does not see its mailbox grow, and the listener's queue of
+  // `capacity` fills and drops as `open`'s does. The listener closes itself once the actor has
+  // ended.
+  //
+  //     Listener.toActor(config, ["orders"], orders, (e, ack) -> Event(e, ack))?
+  toActor[M: Sendable](
+      config: PgConfig,
+      channels: Vector[string],
+      actor: ActorRef[M],
+      make: @sendable (ListenEvent, ActorRef[unit]) -> M,
+      window: int = 16,
+      capacity: int = 1024,
+      minBackoff: Duration = millis(100),
+      maxBackoff: Duration = seconds(30)
+  ) -> Result[Listener, PgError]
+    val listener = started(config, channels, capacity, minBackoff, maxBackoff)?
+    val events = listener.events
+    val commands = listener.commands
+    actor.ended().onComplete(_ -> commands.send(Stop))
+    _ = spawn(() -> forward(events, actor, make, if window < 1 then 1 else window))
+    Ok(listener)
+
+  private started(
+      config: PgConfig,
+      channels: Vector[string],
+      capacity: int,
+      minBackoff: Duration,
+      maxBackoff: Duration
+  ) -> Result[Listener, PgError]
+    for c in channels
+      checked(c)?
+    val size = if capacity < 1 then 1 else capacity
+    val commands = Channel[ListenCommand]()
+    val events = Channel[ListenEvent](size)
+    val finished = Channel[unit]()
+    val lost = AtomicCell[long](0)
+    val ready = Channel[Result[unit, PgError]](1)
+    val thread = spawn(() ->
+      ListenLoop(config, channels.distinct, commands, events, size, lost, minBackoff, maxBackoff).run(ready)
+      events.close()
+      finished.close())
+    ready.receive() match
+      Some(Ok(_)) -> Ok(Listener(commands, finished, thread, lost, events))
+      Some(Err(e)) ->
+        thread.join()
+        Err(e)
+      None ->
+        thread.join()
+        Err(Closed)
+
+// How long the listener waits for an actor's reply before counting the event as handled.
+private val AckTimeout: Duration = seconds(3600)
+
+// Delivers `events` to `actor` as `make` builds its messages, keeping at most `window` unanswered,
+// until the events end or the actor does. The listener is stopped by the actor's end itself.
+private forward[M: Sendable](
+    events: Channel[ListenEvent],
+    actor: ActorRef[M],
+    make: @sendable (ListenEvent, ActorRef[unit]) -> M,
+    window: int
+)
+  val ended = actor.ended().map(_ -> false)
+  val waiting = Deque[Future[bool]]()
+  for event in events
+    if waiting.size >= window && !Future.first([waiting.removeHead(), ended]).await() then return
+    waiting.append(actor.ask(r -> make(event, r), AckTimeout).map(r -> !(r is Err(Ended))))
+
+// What a listener's thread is asked to do.
+private data ListenCommand
+  Listen(channel: string, reply: Channel[Result[unit, PgError]])
+  Unlisten(channel: string, reply: Channel[Result[unit, PgError]])
+  UnlistenAll(reply: Channel[Result[unit, PgError]])
+  Channels(reply: Channel[Vector[string]])
+  Stop
+
+// `channel` where it can be a channel's name.
+private checked(channel: string) -> Result[unit, PgError]
+  if channel == "" then return Err(Config("a channel's name is empty"))
+  if channel.contains("\u{0}") then return Err(Config("a channel's name holds a NUL"))
+  Ok(())
+
+// `name` as a quoted identifier.
+private quotedName(name: string) -> string = "\"" + name.replace("\"", "\"\"") + "\""
+
+// The fields of a NotificationResponse.
+private notificationOf(m: Message) -> Notification
+  val r = In(m.body)
+  val pid = r.int32()
+  val channel = r.cstring()
+  Notification(channel, r.cstring(), pid)
+
+// The hook a listener's connection is made with: keeps each notification read while a statement
+// runs in `caught`, up to `capacity`, and counts the rest in `overflow`.
+private catcher(
+    caught: AtomicCell[Vector[Notification]],
+    overflow: AtomicCell[long],
+    capacity: int
+) -> @sendable (Notification) -> unit = n ->
+  if caught.load().length < capacity then
+    _ = caught.update(v -> v :+ n)
+  else
+    _ = overflow.add(1)
+
+// The state of a listener's thread, which owns its connection.
+private class ListenLoop(
+    config: PgConfig,
+    private var names: Vector[string],
+    private val commands: Channel[ListenCommand],
+    private val events: Channel[ListenEvent],
+    private val capacity: int,
+    private val lost: AtomicCell[long],
+    private val minBackoff: Duration,
+    private val maxBackoff: Duration
+)
+  // Notifications the connection read while it ran a LISTEN or UNLISTEN, delivered after it, and how
+  // many did not fit.
+  private val caught = AtomicCell[Vector[Notification]]([])
+  private val overflow = AtomicCell[long](0)
+  private val settings = config with {notifications = Some(catcher(caught, overflow, capacity))}
+  private var conn: Option[Connection] = None
+  // Events not yet delivered, the oldest first, and how many notifications were dropped after them.
+  private var pending: Vector[ListenEvent] = []
+  private var unsent: long = 0
+  private var stopping = false
+  private var attempts = 0
+  private var backoff = Duration(0)
+  private var nextTry = monotonic()
+
+  // Connects, answering on `ready` whether it could, then serves until stopped.
+  run(ready: Channel[Result[unit, PgError]])
+    ready.send(connected())
+    if conn.isEmpty then return
+    deliverCaught()
+    while !stopping
+      conn match
+        Some(c) -> serve(c)
+        None -> wait()
+    if conn is Some(c) then _ = c.close()
+
+  // Waits for a notification, a command, or room for an undelivered event.
+  private serve(c: Connection)
+    next() match
+      Some(event) -> select
+        c.readable() -> read(c)
+        commands.receive() as Some(command) -> handle(command)
+        events.send(event) -> delivered()
+      None -> select
+        c.readable() -> read(c)
+        commands.receive() as Some(command) -> handle(command)
+
+  // Waits until it is time to connect again, serving commands meanwhile, then tries.
+  private wait()
+    val left = nextTry - monotonic()
+    next() match
+      Some(event) -> select
+        commands.receive() as Some(command) -> handle(command)
+        events.send(event) -> delivered()
+        after left -> reconnect()
+      None -> select
+        commands.receive() as Some(command) -> handle(command)
+        after left -> reconnect()
+
+  private read(c: Connection) = c.waitForNotification(Duration(0)) match
+    Ok(Some(n)) -> deliver(n)
+    Ok(None) -> ()
+    Err(e) -> disconnected(e)
+
+  private handle(command: ListenCommand) = command match
+    Listen(name, reply) -> reply.send(changed(name, true))
+    Unlisten(name, reply) -> reply.send(changed(name, false))
+    UnlistenAll(reply) ->
+      val answer = if conn is Some(c) then statement(c, "unlisten *") else Ok(())
+      if answer.isOk then names = []
+      reply.send(answer)
+    Channels(reply) -> reply.send(names)
+    Stop -> stopping = true
+
+  // LISTENs to `name` or stops, and remembers it. Where the connection breaks meanwhile, the change
+  // stands and is made when it is connected again.
+  private changed(name: string, adding: bool) -> Result[unit, PgError]
+    checked(name)?
+    val sql = (if adding then "listen " else "unlisten ") + quotedName(name)
+    val answer = if conn is Some(c) then statement(c, sql) else Ok(())
+    if answer.isOk
+      names = if adding then (if names.contains(name) then names else names :+ name) else names.filter(n -> n != name)
+    answer
+
+  // Runs `sql` on `c` and delivers what it caught. Where `c` broke, the listener reconnects and the
+  // statement counts as done, the reconnection making it.
+  private statement(c: Connection, sql: string) -> Result[unit, PgError]
+    val answer = c.simpleQuery(sql)
+    deliverCaught()
+    answer match
+      Ok(_) -> Ok(())
+      Err(e) if c.isBroken ->
+        disconnected(e)
+        Ok(())
+      Err(e) -> Err(e)
+
+  // Delivers the notifications the connection read while it ran a statement.
+  private deliverCaught()
+    for n in caught.swap([])
+      deliver(n)
+    val missed = overflow.swap(0)
+    if missed > 0 then drop(missed)
+
+  // The first connection: connects and LISTENs to every channel.
+  private connected() -> Result[unit, PgError]
+    val c = connect(settings)?
+    for name in names
+      c.simpleQuery("listen " + quotedName(name)) match
+        Ok(_) -> ()
+        Err(e) ->
+          _ = c.close()
+          return Err(e)
+    conn = Some(c)
+    Ok(())
+
+  private reconnect()
+    attempts += 1
+    connected() match
+      Ok(_) ->
+        backoff = Duration(0)
+        announce(Reconnected(attempts))
+        deliverCaught()
+      Err(_) ->
+        backoff = if backoff.micros == 0 then minBackoff elif backoff + backoff > maxBackoff then maxBackoff else backoff + backoff
+        nextTry = monotonic() + backoff
+
+  // The connection was lost: says so, and tries again at once, then with the backoff.
+  private disconnected(e: PgError)
+    if conn is Some(c) then _ = c.close()
+    conn = None
+    attempts = 0
+    backoff = Duration(0)
+    nextTry = monotonic()
+    // A gap the consumer has not yet been told the end of grows to take this one in: what was
+    // dropped after it is lost in the gap anyway.
+    val open = pending.indexWhere(p -> p is Disconnected(_))
+    if open >= 0
+      pending = pending.take(open + 1)
+      unsent = 0
+    else announce(Disconnected(e))
+
+  // Queues `event` behind those not yet delivered.
+  private announce(event: ListenEvent)
+    if unsent > 0
+      pending = pending :+ Dropped(unsent)
+      unsent = 0
+    pending = pending :+ event
+    flush()
+
+  // Delivers `n`, or drops it where the queue is full.
+  private deliver(n: Notification)
+    flush()
+    if pending.isEmpty && unsent == 0 && events.trySend(Notified(n)) then return
+    drop(1)
+
+  private drop(count: long)
+    unsent += count
+    lost.add(count)
+
+  // Delivers what was held back, while there is room.
+  private flush()
+    while !pending.isEmpty && events.trySend(pending(0))
+      pending = pending.drop(1)
+    if pending.isEmpty && unsent > 0 && events.trySend(Dropped(unsent)) then unsent = 0
+
+  // The next event held back, if any.
+  private next() -> Option[ListenEvent] =
+    if !pending.isEmpty then Some(pending(0)) elif unsent > 0 then Some(Dropped(unsent)) else None
+
+  // The event `next` answered was delivered.
+  private delivered()
+    if !pending.isEmpty then pending = pending.drop(1) else unsent = 0

@@ -22,6 +22,9 @@ data SslMode
 // - `statementCacheSize` is how many statements a connection keeps prepared; 0 prepares each
 //   statement unnamed, every time.
 // - `notices` receives each notice and warning the server sends; without it they are dropped.
+// - `notifications` receives each notification a connection reads while it runs a statement, on the
+//   thread running it; without it they are dropped. `Connection.waitForNotification` answers those
+//   that arrive while the connection is idle, and a `Listener` delivers every one.
 // - `connectTimeout` limits each wait while connecting and authenticating.
 // - `queryTracer`, `prepareTracer`, `connectTracer`, `batchTracer` and `poolTracer` watch what
 //   connections made with these settings do, and what a pool made with them does (`tracing.avin`).
@@ -39,6 +42,7 @@ data PgConfig(
     connectTimeout: Option[Duration] = None,
     statementCacheSize: int = 100,
     notices: Option[@sendable (Diagnostic) -> unit] = None,
+    notifications: Option[@sendable (Notification) -> unit] = None,
     queryTracer: Option[QueryTracer] = None,
     prepareTracer: Option[PrepareTracer] = None,
     connectTracer: Option[ConnectTracer] = None,
