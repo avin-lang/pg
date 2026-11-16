@@ -36,6 +36,10 @@ class PgPool(private val pool: Pool[Connection, PgError]): Sendable
   execute(sql: string, params: ToPg*) -> Result[long, PgError] =
     flattened(pool.lease(l -> lent(l, c -> c.execute(sql, params*))))
 
+  // Runs the statements of `batch` together on a pooled connection (`Connection.sendBatch`).
+  sendBatch(batch: Batch, mode: BatchMode = Atomic) -> Result[BatchResults, PgError] =
+    flattened(pool.lease(l -> lent(l, c -> c.sendBatch(batch, mode))))
+
   // Makes connections until the pool holds its `minIdle`.
   warm() -> Result[unit, PgError] = pool.warm().mapErr(poolFailure)
 

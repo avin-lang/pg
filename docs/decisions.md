@@ -126,3 +126,74 @@ transaction is rolled back (and let go if that fails); `validate` lends only a c
 open, idle, and has nothing unread from the server, which catches one the server ended while it sat
 idle. Ordinary use, one connection per request with a transaction inside, needs one pooled resource
 at a time.
+
+## Batches: an immutable `Batch`, read eagerly into `BatchResults`
+
+`Batch` is plain data: `queue` answers a new batch with one more statement, so a batch is sendable
+and can be built on one thread and run on a pooled connection's. `sendBatch` reads every answer
+before it returns, into `BatchResults` (plain data, one `Result[QueryResult, PgError]` per
+statement), and `BatchResults.reader()` reads them in order as each statement's kind asks
+(`execute`, `query`, `queryOne`, `queryAs`, `queryValue`), much as pgx's `BatchResults` does. Reading
+eagerly means the connection is never left in the middle of a batch while the program reads, and a
+pooled body can give the results back. Alternatives weighed: a mutable builder (`b.queue(…)` with no
+reassignment, as in pgx), which would not be sendable; and pgx's lazy reader over the connection,
+which keeps every answer's rows out of memory at once but ties the connection to the reader until it
+is closed. **Review with the user**: whether a lazy, streaming reader is wanted for batches whose
+answers are too big to hold.
+
+## A batch is one implicit transaction by default; `Independent` syncs each statement
+
+`Atomic` (the default) sends every statement's Bind and Execute with a single Sync at the end, as
+pgx does: the batch is one implicit transaction, a failure fails that statement and the server skips
+the rest (`Skipped`), and what ran before it is rolled back. `Independent` ends each statement with a
+Sync of its own, so each outside a transaction is committed or fails alone. Inside
+`transaction(f)` both join the open transaction, and a failure leaves it failed (`25P02` for the
+statements after it in an independent batch). Alternatives weighed: offering only the atomic form
+(pgx), or making independence the default (fewer surprises for a list of unrelated writes, but
+weaker than what pgx users expect).
+
+## Statements are prepared first, together; a refused one is sent unprepared
+
+A batch prepares the statements the cache does not hold in one round trip before it runs (each Parse
+and Describe with its own Sync, so a refusal is refused alone), because a parameter's binary
+encoding depends on the type the server infers. A statement the server refuses to prepare, most
+often one on a table an earlier statement of the batch creates, is not failed then: it is sent in
+its place unprepared (Parse, Bind with text parameters, Describe of the portal, Execute) and its
+rows are read as text, so a real error fails it where it stands and the rest of the batch follows
+the protocol's rules. Inside a transaction the preparing is wrapped in `SAVEPOINT pg_batch` and
+rolled back to, so a refused Parse does not fail the transaction (prepared statements outlive the
+rollback). Parameters that do not fit a prepared statement (a `Config` error found before anything is
+sent) fail an atomic batch before any of it runs, every other statement answering `Skipped`; an
+independent batch fails only that statement. A batch of more distinct statements than the cache
+holds keeps them all while it runs and trims the cache after; with no cache they are closed with the
+next statement prepared. A cached statement made stale by DDL fails its statement; an atomic batch
+outside a transaction, which kept nothing, is then run once more with the statement prepared afresh,
+as a single statement is. Alternatives weighed: pgx's rule, where a statement that cannot be
+prepared fails the whole batch (so a batch cannot create a table and use it); and preparing inline
+in the same pipeline, which needs the parameter types before they are known. **Review with the
+user**: the unprepared fallback is invisible except in its text encoding of parameters.
+
+## Batches are sent a 32 KiB window at a time
+
+The server stops reading while it cannot write, so a client that writes a whole large batch before
+reading deadlocks once both directions' socket buffers fill. avin's streams belong to one thread at
+a time and have no non-blocking write, so a writer thread and a reader thread cannot share one; the
+batch instead sends a window of at most 32 KiB of statements (one at least), followed by a Flush
+(the server buffers its answers otherwise), reads every answer to it, and only then sends the next.
+The bytes written ahead of what is read stay well under the 128 KiB a socket buffers by default at
+each end, so no write waits on a server that is itself waiting. It costs one round trip per window,
+about a thousand small statements. Alternatives weighed: a writer/reader split on two lightweight
+threads (needs a stream that can be read and written from two threads, which avin does not offer),
+and a non-blocking write that reads when the socket is full (pgx's way; needs a writable-readiness
+or partial-write primitive). **Review with the user**: whether `avin.net` should grow either, which
+would let the whole batch be in flight at once.
+
+## A cancelled batch: Sync, drain every ReadyForQuery owed; a cut write breaks the connection
+
+A batch keeps count of the ReadyForQuery messages owed and whether messages are out since the last
+Sync. A cancelled batch sends the CancelRequest, a Sync where one is missing, and reads until
+nothing is owed, within the drain limit; an atomic batch then has kept nothing. An independent batch
+keeps what its statements before the cancelled one committed, and the ones already sent after it
+still run. A thread cancelled while a write is under way may have sent half a message, so the
+connection is broken at once rather than drained to the limit; this holds for single statements
+too.

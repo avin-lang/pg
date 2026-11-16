@@ -44,6 +44,15 @@ private paramOf(p: ToPg) -> Typed = Typed(p.pgOid, p.toPg)
 // connection is given up as broken.
 private val DrainLimit: Duration = 30.seconds
 
+// How many bytes of a batch are sent ahead of the answers read: well under what a socket's buffers
+// hold at either end, so the server, which stops reading while it cannot write, never leaves a write
+// of the client's waiting.
+private val PipelineWindow = 32768
+
+// A distinct statement a batch runs: its cache key (empty for a statement the program prepared), its
+// text and parameter types, and the statement itself where it is already prepared.
+private data Plan(key: string, sql: string, oids: Vector[int], known: Option[Statement])
+
 // The SSLRequest and CancelRequest codes, which take the place of a startup message's version.
 private val SslRequestCode = 80877103
 private val CancelRequestCode = 80877102
@@ -76,6 +85,13 @@ class Connection(
   private var closed = false
   // Set while a request's answer is being read, so a cancellation in the middle knows to drain it.
   private var awaiting = false
+  // While an answer is being read: how many ReadyForQuery messages are still owed, one for each Sync
+  // or simple query sent, and whether messages have been sent since the last Sync.
+  private var owed = 0
+  private var unsynced = false
+  // Set while bytes are being written, so a cancellation in the middle of a write knows the stream
+  // may hold half a message.
+  private var writing = false
   private var parameters = HashMap.empty[string, string]()
   private var cache = HashMap.empty[string, Statement]()
   // Cache keys, the least recently used first.
@@ -239,6 +255,275 @@ class Connection(
     if !broken then _ = stream.write(Out().begin('X').close().toArray())
     stream.close().mapErr(e -> Io(e))
 
+  // ---- Batches ----
+
+  // Runs the statements queued in `batch`, sent together rather than a round trip each, and answers
+  // each one's result in the order they were queued. Statements not yet prepared are prepared first,
+  // together, in one more round trip, and kept in the statement cache.
+  //
+  // `Atomic`, the default, runs the statements as one implicit transaction: a statement that fails
+  // answers its error, those after it are not run and answer `Skipped`, and what those before it did
+  // is rolled back. `Independent` runs each statement as a transaction of its own, so a failure is
+  // that statement's alone. Inside `transaction(f)` the statements belong to that transaction either
+  // way, and a failure leaves it failed. The answer is an `Err` only where the batch could not be run
+  // at all: the connection is closed, or broke.
+  sendBatch(batch: Batch, mode: BatchMode = Atomic) -> Result[BatchResults, PgError]
+    usable()?
+    if batch.isEmpty then return Ok(BatchResults([]))
+    val wasIdle = status == 'I'
+    val (results, stale) = pipelined(batch.items, mode)?
+    // A cached statement the server no longer accepts failed a batch that kept nothing, so the batch
+    // is run again, the statement prepared afresh.
+    if stale && mode == Atomic && wasIdle && status == 'I' then return pipelined(batch.items, mode).map(r -> r.0)
+    Ok(results)
+
+  // Prepares the statements `items` need that are not prepared, then runs the items; answers their
+  // results, and whether a cached statement among them was refused as stale, and so dropped from the
+  // cache.
+  private pipelined(items: Vector[BatchItem], mode: BatchMode) -> Result[(BatchResults, bool), PgError]
+    awaiting = true
+    owed = 0
+    unsynced = false
+    defer
+      if awaiting && !broken then recover()
+    // One plan for each distinct statement, and the plan each item runs.
+    val plans = Buffer[Plan]()
+    val planOf = Buffer[int]()
+    var keys = HashMap.empty[string, int]()
+    for item in items
+      item.statement match
+        Some(s) ->
+          plans.addOne(Plan("", s.sql, [], Some(s)))
+          planOf.addOne(plans.length - 1)
+        None ->
+          val oids = item.params.map(p -> p.oid)
+          val key = cacheKey(item.sql, oids)
+          keys.get(key) match
+            Some(i) -> planOf.addOne(i)
+            None ->
+              val known = cache.get(key)
+              if known.isDefined then order = order.filter(k -> k != key) :+ key
+              keys = keys.updated(key, plans.length)
+              planOf.addOne(plans.length)
+              plans.addOne(Plan(key, item.sql, oids, known))
+    val statements = prepared(plans.toVector)?
+    // Each item's messages, or why it cannot be sent. An item whose statement could not be prepared,
+    // perhaps because it names a table an earlier item makes, is sent unprepared, its parameters as
+    // text: where it fails, it fails where it stands among the others.
+    val results = Buffer[Result[QueryResult, PgError]]()
+    val sent = Buffer[(int, Option[Statement])]()
+    val units = Buffer[Vector[byte]]()
+    var refused = false
+    for i in 0 ..< items.length
+      results.addOne(Err(Skipped))
+      if !refused
+        val out = Out()
+        val statement = statements(planOf(i))
+        val made = statement match
+          Some(s) -> bindAndExecute(out, s, items(i).params)
+          None -> parseAndExecute(out, plans(planOf(i)), items(i).params)
+        made match
+          Ok(_) ->
+            if mode == Independent then out.begin('S').close()
+            units.addOne(out.toVector())
+            sent.addOne((i, statement))
+          Err(e) ->
+            results(i) = Err(e)
+            // One that cannot be sent fails an atomic batch before any of it runs.
+            if mode == Atomic then refused = true
+    var stale = false
+    if !refused
+      pipeline(units.toVector, mode == Independent, u ->
+        val (i, s) = sent(u)
+        val r = executed(s, mode == Independent)?
+        results(i) = r
+        r match
+          Err(Server(d)) ->
+            val plan = plans(planOf(i))
+            if isStale(d) && plan.key != ""
+              forget(plan.key)
+              stale = true
+          _ -> ()
+        Ok(r.isOk || mode == Independent))?
+    awaiting = false
+    while order.length > config.statementCacheSize
+      forget(order(0))
+    Ok((BatchResults(results.toVector), stale))
+
+  // The statement for each of `plans`: the one already prepared, or the one prepared now, together,
+  // each Parse and Describe with a Sync of its own, so one the server refuses is refused alone; or
+  // `None` where the server refuses it. Inside a transaction the preparing is done in a savepoint,
+  // rolled back to after it, so a refusal does not leave the transaction failed. What is prepared now
+  // is cached, or, where the cache holds nothing, closed with the next statement prepared.
+  private prepared(plans: Vector[Plan]) -> Result[Vector[Option[Statement]], PgError]
+    val statements = Buffer[Option[Statement]]()
+    val fresh = Buffer[int]()
+    val names = Buffer[string]()
+    val units = Buffer[Vector[byte]]()
+    val guarded = status == 'T'
+    if guarded then units.addOne(Out().begin('Q').cstring("SAVEPOINT pg_batch").close().toVector())
+    for p in plans
+      p.known match
+        Some(s) -> statements.addOne(Some(s))
+        None ->
+          counter += 1
+          val name = if config.statementCacheSize == 0 then s"pgb_$counter" else s"pgs_$counter"
+          val out = Out()
+          if names.length == 0
+            for old in evicted
+              out.begin('C').byte1(int('S')).cstring(old).close()
+            evicted = []
+          out.begin('P').cstring(name).cstring(p.sql).int16(p.oids.length)
+          for oid in p.oids
+            out.int32(oid)
+          out.close()
+          out.begin('D').byte1(int('S')).cstring(name).close()
+          out.begin('S').close()
+          fresh.addOne(statements.length)
+          names.addOne(name)
+          units.addOne(out.toVector())
+          statements.addOne(None)
+    if names.length == 0 then return Ok(statements.toVector)
+    if guarded then units.addOne(
+      Out().begin('Q').cstring("ROLLBACK TO SAVEPOINT pg_batch; RELEASE SAVEPOINT pg_batch").close().toVector()
+    )
+    val first = if guarded then 1 else 0
+    pipeline(units.toVector, true, u ->
+      val j = u - first
+      if 0 <= j < names.length
+        statements(fresh(j)) = described(names(j), plans(fresh(j)).sql)?
+      else
+        queried()?
+      Ok(true))?
+    for j in 0 ..< fresh.length
+      val key = plans(fresh(j)).key
+      statements(fresh(j)) match
+        Some(s) ->
+          if config.statementCacheSize == 0
+            evicted = evicted :+ s.name
+          else
+            cache = cache.updated(key, s)
+            order = order :+ key
+        None -> evicted = evicted :+ names(j)
+    Ok(statements.toVector)
+
+  // Reads the answer to a simple query up to its ReadyForQuery, its rows and its errors let go.
+  private queried() -> Result[unit, PgError]
+    while true
+      val m = receive()?
+      m.kind match
+        'Z' ->
+          ready(m)
+          return Ok(())
+        'C' | 'E' | 'T' | 'D' | 'I' -> ()
+        _ -> return broke(Protocol(s"unexpected message `${m.kind}` answering a query"))
+    Ok(())
+
+  // Sends `units` a window at a time and gives the index of each to `answer` to read its answer,
+  // which says whether to go on. A window is as many units as fit in `PipelineWindow` bytes, one at
+  // least, and the next is sent only once every answer to the last is read: the server stops reading
+  // while it cannot write, so the bytes sent ahead of what is read are kept below what the sockets
+  // between the two ends can hold. Units `synced` end with a Sync of their own; the others are
+  // followed by a Flush between windows and a Sync after the last, or after the one whose answer
+  // stops them, the rest not being sent.
+  private pipeline(
+      units: Vector[Vector[byte]],
+      synced: bool,
+      answer: (int) -> Result[bool, PgError]
+  ) -> Result[unit, PgError]
+    var next = 0
+    var done = 0
+    while done < units.length
+      val out = Out()
+      while next < units.length && (next == done || out.length + units(next).length <= PipelineWindow)
+        out.raw(units(next))
+        next += 1
+      val last = next == units.length
+      if synced
+        owed += next - done
+      else
+        out.begin(if last then 'S' else 'H').close()
+        if last then owed += 1
+        unsynced = !last
+      send(out)?
+      while done < next
+        if !answer(done)?
+          if unsynced
+            send(Out().begin('S').close())?
+            unsynced = false
+            owed += 1
+          return settle()
+        done += 1
+    settle()
+
+  // Reads the answer to a Parse and Describe of `name`, up to its ReadyForQuery: the statement, or
+  // `None` where the server refused it.
+  private described(name: string, sql: string) -> Result[Option[Statement], PgError]
+    var paramOids: Vector[int] = []
+    var columns: Vector[Column] = []
+    var failed = false
+    while true
+      val m = receive()?
+      m.kind match
+        '1' | '3' | 'n' -> ()
+        't' ->
+          val r = In(m.body)
+          val n = r.int16()
+          paramOids = Vector.tabulate(n, _ -> r.int32())
+        'T' -> describe(m) match
+          Ok(cs) -> columns = cs.map(c -> c.0)
+          Err(e) -> return broke(e)
+        'E' -> failed = true
+        'Z' ->
+          ready(m)
+          return Ok(if failed then None else Some(Statement(name, sql, paramOids, columns)))
+        _ -> return broke(Protocol(s"unexpected message `${m.kind}` answering Parse"))
+    Err(Protocol("unreachable"))
+
+  // Reads the answer to a Bind and Execute of `statement`, or, where it is `None`, to a Parse, Bind,
+  // Describe and Execute of an unprepared one: its rows and command tag, or the server's error; and,
+  // where `synced`, the ReadyForQuery after it.
+  private executed(statement: Option[Statement], synced: bool) -> Result[Result[QueryResult, PgError], PgError]
+    val rows = Buffer[Row]()
+    var columns = statement.map(s -> s.columns).getOrElse([])
+    var answer: Option[Result[QueryResult, PgError]] = None
+    while answer.isEmpty
+      val m = receive()?
+      m.kind match
+        '1' | '2' | 'n' -> ()
+        'T' -> describe(m) match
+          Ok(cs) -> columns = cs.map(c -> c.0)
+          Err(e) -> return broke(e)
+        'D' ->
+          val row = if statement.isDefined then binaryRow(columns, m) else textRow(columns, m)
+          row match
+            Ok(r) -> rows.addOne(r)
+            Err(e) -> return broke(e)
+        'C' -> answer = Some(Ok(QueryResult(In(m.body).cstring(), rows.toVector)))
+        'I' -> answer = Some(Ok(QueryResult("", [])))
+        'E' -> answer = Some(Err(Server(diagnosticOf(m))))
+        _ -> return broke(Protocol(s"unexpected message `${m.kind}` answering Execute"))
+    if synced then settleOne()?
+    Ok(answer.get)
+
+  // Reads the ReadyForQuery that ends the answer just read.
+  private settleOne() -> Result[unit, PgError]
+    val m = receive()?
+    if m.kind != 'Z' then return broke(Protocol(s"unexpected message `${m.kind}` before ReadyForQuery"))
+    ready(m)
+    Ok(())
+
+  // Reads every ReadyForQuery still owed.
+  private settle() -> Result[unit, PgError]
+    while owed > 0
+      settleOne()?
+    Ok(())
+
+  // A ReadyForQuery read: the transaction status it reports, and one fewer owed.
+  private ready(m: Message)
+    status = char(In(m.body).byte1())
+    owed -= 1
+
   // ---- The extended protocol ----
 
   // Runs `sql` through the statement cache, retrying once a statement the server no longer accepts
@@ -316,30 +601,8 @@ class Connection(
   // Binds `params` to `statement`, runs it, and reads its rows.
   private runPrepared(statement: Statement, params: Vector[Typed]) -> Result[QueryResult, PgError]
     usable()?
-    if params.length != statement.paramOids.length
-      return Err(Config(s"the statement has ${statement.paramOids.length} parameters and ${params.length} were given"))
     val out = Out()
-    out.begin('B').cstring("").cstring(statement.name)
-    val encoded = Buffer[(bool, Option[Vector[byte]])]()
-    var i = 0
-    while i < params.length
-      encoded.addOne(
-        encodeFor(statement.paramOids(i), params(i).value).mapErr(e -> Config(s"parameter $$${i + 1}: $e"))?
-      )
-      i += 1
-    out.int16(encoded.length)
-    for (binary, _) in encoded
-      out.int16(if binary then 1 else 0)
-    out.int16(encoded.length)
-    for (_, bytes) in encoded
-      bytes match
-        Some(b) -> out.int32(b.length).raw(b)
-        None -> out.int32(-1)
-    out.int16(statement.columns.length)
-    for c in statement.columns
-      out.int16(if binaryType(c.typeOid) then 1 else 0)
-    out.close()
-    out.begin('E').cstring("").int32(0).close()
+    bindAndExecute(out, statement, params)?
     out.begin('S').close()
     val rows = Buffer[Row]()
     var tag = ""
@@ -363,11 +626,20 @@ class Connection(
   private usable() -> Result[unit, PgError] = if closed || broken then Err(Closed) else Ok(())
 
   // Sends `out`; a failure breaks the connection.
-  private send(out: Out) -> Result[unit, PgError] = stream.write(out.toArray()) match
-    Ok(_) -> Ok(())
-    Err(e) ->
-      broken = true
-      Err(Io(e))
+  private send(out: Out) -> Result[unit, PgError]
+    writing = true
+    val written = stream.write(out.toArray())
+    writing = false
+    written match
+      Ok(_) -> Ok(())
+      Err(e) ->
+        broken = true
+        Err(Io(e))
+
+  // Fails with `e` and breaks the connection, as an answer the protocol does not allow does.
+  private broke[T](e: PgError) -> Result[T, PgError]
+    broken = true
+    Err(e)
 
   // The next message, with the ones that can come at any time dealt with on the way: a notice goes
   // to the configuration's sink, a parameter's new value is kept, a notification is dropped. A
@@ -398,6 +670,8 @@ class Connection(
   // server is asked to cancel and the answer is read to its end.
   private exchange(out: Out, handle: (Message, bool) -> Result[unit, PgError]) -> Result[unit, PgError]
     awaiting = true
+    owed = 1
+    unsynced = false
     defer
       if awaiting && !broken then recover()
     send(out)?
@@ -407,6 +681,7 @@ class Connection(
       m.kind match
         'Z' ->
           status = char(In(m.body).byte1())
+          owed = 0
           awaiting = false
           return failure match
             Some(e) -> Err(e)
@@ -421,20 +696,27 @@ class Connection(
     Ok(())
 
   // A request's answer was left unread by a cancelled thread: asks the server to cancel the request,
-  // then reads the rest of the answer, waiting at most `DrainLimit`. Where that fails the connection
-  // is broken.
+  // ends a pipeline left open with a Sync, then reads the rest of the answer, up to every
+  // ReadyForQuery still owed, waiting at most `DrainLimit` for each read. Where that fails, or the
+  // thread was cancelled in the middle of a write, the connection is broken.
   private recover()
+    awaiting = false
+    if writing
+      writing = false
+      broken = true
+      return
     cancelRequest()
     _ = stream.setTimeout(DrainLimit)
-    var drained = false
-    while !broken && !drained
+    if unsynced && send(Out().begin('S').close()).isOk then owed += 1
+    unsynced = false
+    while !broken && owed > 0
       reader.next() match
         Ok(m) ->
           if m.kind == 'Z'
             status = char(In(m.body).byte1())
-            drained = true
+            owed -= 1
         Err(_) -> broken = true
-    awaiting = false
+    owed = 0
     if stream.setTimeout(Duration(0)).isErr then broken = true
 
   // Asks the server, on a connection of its own, to cancel what this connection is running.
@@ -563,6 +845,57 @@ private binaryRow(columns: Vector[Column], m: Message) -> Result[Row, PgError] =
 )
 
 private textRow(columns: Vector[Column], m: Message) -> Result[Row, PgError] = rowOf(columns, m, _ -> false)
+
+// Writes to `out` a Bind of `params` to `statement`, in the unnamed portal, and an Execute of all its
+// rows. A parameter that cannot be sent as its type, or a count of them the statement does not take,
+// is a `Config` error, and nothing is written.
+private bindAndExecute(out: Out, statement: Statement, params: Vector[Typed]) -> Result[unit, PgError]
+  if params.length != statement.paramOids.length
+    return Err(Config(s"the statement has ${statement.paramOids.length} parameters and ${params.length} were given"))
+  val encoded = Buffer[(bool, Option[Vector[byte]])]()
+  var i = 0
+  while i < params.length
+    encoded.addOne(encodeFor(statement.paramOids(i), params(i).value).mapErr(e -> Config(s"parameter $$${i + 1}: $e"))?)
+    i += 1
+  out.begin('B').cstring("").cstring(statement.name)
+  out.int16(encoded.length)
+  for (binary, _) in encoded
+    out.int16(if binary then 1 else 0)
+  out.int16(encoded.length)
+  for (_, bytes) in encoded
+    bytes match
+      Some(b) -> out.int32(b.length).raw(b)
+      None -> out.int32(-1)
+  out.int16(statement.columns.length)
+  for c in statement.columns
+    out.int16(if binaryType(c.typeOid) then 1 else 0)
+  out.close()
+  out.begin('E').cstring("").int32(0).close()
+  Ok(())
+
+// Writes to `out` the messages that run `plan` unprepared: a Parse of the unnamed statement, a Bind of
+// `params` as text with every column asked for as text, a Describe of the portal, so the rows can be
+// read, and an Execute.
+private parseAndExecute(out: Out, plan: Plan, params: Vector[Typed]) -> Result[unit, PgError]
+  val texts = Buffer[Option[Vector[byte]]]()
+  var i = 0
+  while i < params.length
+    val v = params(i).value
+    texts.addOne(if v == PgNull then None else Some(textOf(v).mapErr(e -> Config(s"parameter $$${i + 1}: $e"))?.bytes))
+    i += 1
+  out.begin('P').cstring("").cstring(plan.sql).int16(plan.oids.length)
+  for oid in plan.oids
+    out.int32(oid)
+  out.close()
+  out.begin('B').cstring("").cstring("").int16(0).int16(texts.length)
+  for t in texts
+    t match
+      Some(b) -> out.int32(b.length).raw(b)
+      None -> out.int32(-1)
+  out.int16(0).close()
+  out.begin('D').byte1(int('P')).cstring("").close()
+  out.begin('E').cstring("").int32(0).close()
+  Ok(())
 
 // A parameter's value as type `oid` goes in a Bind: in binary where the client writes that type so,
 // as text otherwise, and `None` for NULL.
