@@ -46,10 +46,37 @@ The user, password and database are percent-decoded. Left out, the host is `loca
 | `sslmode` | `disable`, `prefer` (the default), `require`, `verify-full` | see TLS below |
 | `sslrootcert` | a file of PEM certificates | authorities trusted beside the machine's own |
 | `application_name` | text | shown in `pg_stat_activity` |
-| `connect_timeout` | whole seconds; `0` is none | each wait while connecting |
+| `connect_timeout` | whole seconds; `0` is none | the whole connection to each server: name lookup, TCP, TLS, authentication |
 | `statement_cache_size` | a count, default 100; `0` caches nothing | see Statements |
+| `target_session_attrs` | `any` (the default), `read-write`, `read-only`, `primary`, `standby`, `prefer-standby` | see Several servers |
+| `pgbouncer` | `true`, `false` (the default) | see PgBouncer |
 
-Any other option is refused with `Config`, so a misspelt one is not silently ignored.
+Any other option is refused with `Config`, so a misspelt one is not silently ignored. libpq's keyword
+form is read too, `host=db1,db2 port=5432 user=app dbname=shop sslmode=require`: each
+`keyword=value`, a value with spaces in single quotes; the keywords are `host`, `port`, `user`,
+`password`, `dbname` and the options above.
+
+A connection that takes longer than `connect_timeout` fails with `Io`, its error's kind `TimedOut`,
+wherever it had got to. Without one (the default), a connection waits as long as the network does.
+
+### Several servers
+
+A host list names several servers, tried in order, each within `connect_timeout`: in a URL, each host
+with its own port (5432 where it has none); in the keyword form, `port` lists one port for every host
+or gives one for all. `target_session_attrs` says which kind of server will do, read from what the
+server reports as it starts (or, from a server older than 14, by asking it): `read-write` passes over
+a standby or a server read-only by default, `read-only` the reverse, `primary` takes any server not
+in hot standby and `standby` only one that is, and `prefer-standby` takes a standby where one answers
+and the first server that connected otherwise. Where no server will do, the answer is the last one's
+failure: `NoTarget(reason)` for one of the wrong kind.
+
+```avin
+val config = PgConfig.parse("postgres://app@db1:5432,db2:5433/shop?target_session_attrs=read-write")?
+assertEq(config.servers, [Host("db1", 5432), Host("db2", 5433)])
+```
+
+`PgConfig`'s `hosts` holds the list (`servers` is it, or `host` at `port` where it is empty), and
+`targetSessionAttrs` the kind.
 
 **TLS.** The TLS client always checks the server's certificate against the trusted authorities and
 the host name. So `require` and `verify-full` are the same: TLS with a verified certificate, or no
@@ -133,8 +160,27 @@ db.execute("insert into users values ($1)", "ada@example.com") match
 ```
 
 The others: `Io` (the connection could not be made, broke or timed out), `Tls`, `TlsRefused`, `Auth`,
-`Protocol`, `BadColumn`, `Config`, `RolledBack`, `Closed`, `PoolTimedOut`, `PoolBusy` and `PoolClosed`. A
-connection that broke is `isBroken`, and answers `Closed` from then on.
+`Protocol`, `BadColumn`, `Config`, `RolledBack`, `Closed`, `PoolTimedOut`, `PoolBusy`, `PoolClosed`,
+`NotSent` and `NoTarget`. A connection that broke is `isBroken`, and answers `Closed` from then on.
+
+**What is safe to run again.** `e.safeToRetry` is true where the statement certainly never reached the
+server: `NotSent(failure)`, which a connection answers where the server had already ended its session
+(restarting, say) or the connection had broken before the statement was sent, and a pool answers
+where it could not make a connection; and `Closed`. Any other failure may have come after the server
+had the statement, so a statement that changes data may have run. Nothing in the driver runs a
+statement again by itself; a caller that wants to does it where `safeToRetry` allows:
+
+```avin
+// Runs `f` once more where its first run failed before its statement reached the server.
+retried[T](f: () -> Result[T, PgError]) -> Result[T, PgError] = f() match
+  Err(e) if e.safeToRetry -> f()
+  other -> other
+
+val added = retried(() -> pool.execute("insert into events values ($1)", 7))?
+```
+
+Inside a transaction, the end of the session loses the transaction, so the failure is not
+`NotSent` even where the statement was not sent: the whole transaction is the thing to run again.
 
 Notices and warnings the server sends go to `PgConfig`'s `notices`, a function given each
 `Diagnostic`; without one they are dropped.
@@ -171,6 +217,22 @@ import dev.avinlang.pg.PgPool
 val pool = PgPool.open("postgres://app:secret@localhost/shop", maxSize = 8)?
 val names = pool.use(c -> c.query("select name from customers"))?
 pool.close()
+```
+
+A pool outlives a server restart. A connection the server ended while it sat idle is let go before
+it would be lent; while the server is down, each caller fails at once with `NotSent`, safe to run
+again; once the server is back, new connections are made as callers ask.
+
+### PgBouncer
+
+Behind PgBouncer in transaction mode, each transaction may run on another server connection, so a
+statement prepared under a name on one may not exist on the next. `pgbouncer=true` (`PgConfig`'s
+`pgbouncer`) keeps to what that mode allows: no statement is prepared under a name and nothing is
+cached; each statement is parsed unnamed, bound, described and run in one round trip, its rows sent
+as text; batches send each statement the same way. `prepare` is refused with `Config`.
+
+```avin
+val bounced = PgPool.open("postgres://app:secret@localhost:6432/shop?pgbouncer=true", maxSize = 8)?
 ```
 
 ### A pool for a server
@@ -363,3 +425,13 @@ zsh scripts/test-db.zsh start
 
 then export what it prints (`PG_TEST_URL`, `PG_TEST_CA`) and run `avin test .`. Without
 `PG_TEST_URL` the tests that need a server say so and pass. `zsh scripts/test-db.zsh stop` stops it.
+
+The tests of several servers and of a server restart need a second server of their own, which they
+make read-only by default and stop and start:
+
+```zsh
+PG_TEST_PORT=55433 zsh scripts/test-db.zsh start .pg-test-2
+```
+
+with `PG_TEST_URL2` set to the URL it prints and `PG_TEST_DIR2` to its directory. Without them those
+tests say so and pass.

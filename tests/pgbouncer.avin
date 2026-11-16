@@ -1,0 +1,156 @@
+module tests
+
+// `pgbouncer`: no statement is prepared under a name, each runs unnamed in one round trip, and
+// nothing is cached, so a connection pooler in transaction mode may hand each transaction to another
+// server connection. There is no PgBouncer here, so the behaviour is tried against the server
+// itself: the server's own list of prepared statements stays empty, and a scripted server shows a
+// statement is one round trip.
+
+import avin.threads.scope
+import dev.avinlang.pg
+import dev.avinlang.pg.{Atomic, Batch, Config, Connection, Independent, PgConfig, PgError, PgPool, Server, Skipped}
+
+// A connection to the test server with `pgbouncer` on, or `None` where there is no server.
+private bouncerConnection() -> Option[Result[Connection, PgError]] =
+  testUrl("sslmode=disable&pgbouncer=true").map(u -> pg.connect(u))
+
+// How many statements the session has prepared under a name.
+private namedStatements(c: Connection) -> Result[int, PgError] =
+  c.queryValue[int]("select count(*)::int4 from pg_prepared_statements")
+
+@test("under pgbouncer, statements of every kind of parameter run, and nothing is prepared under a name")
+bouncerQueries() -> Result[unit, PgError]
+  val c = bouncerConnection() match
+    Some(r) -> r?
+    None -> return Ok(())
+  assertEq(c.queryValue[int]("select $1::int4 + 1", 41)?, 42)
+  assertEq(c.queryValue[string]("select $1::text || '!'", "héllo ☕")?, "héllo ☕!")
+  assertEq(c.queryValue[bool]("select not $1::bool", false)?, true)
+  val big: long = 4000000000
+  assertEq(c.queryValue[long]("select $1::int8 * 2", big)?, big * 2)
+  assertEq(
+    c.queryValue[Vector[byte]]("select $1::bytea", [byte(0), byte(255), byte(10)])?,
+    [byte(0), byte(255), byte(10)]
+  )
+  val none: Option[int] = None
+  assertEq(c.queryValue[Option[int]]("select $1::int4", none)?, None)
+  assertEq(c.queryValue[string]("select $1::text", "")?, "")
+  // The same statement again, many times: still nothing cached or prepared.
+  for i in 0 ..< 50
+    assertEq(c.queryValue[int]("select $1::int4", i)?, i)
+  val rows = c.query("select g, g::text from generate_series(1, 3) g")?
+  assertEq(rows.map(r -> r.get[string](1).ok.get), ["1", "2", "3"])
+  assertEq(c.execute("select 1 from generate_series(1, 7)")?, long(7))
+  assertEq(c.cachedStatements, 0)
+  assertEq(namedStatements(c)?, 0)
+  c.close()
+
+@test("under pgbouncer a server error is answered and the connection goes on; prepare is refused")
+bouncerErrors() -> Result[unit, PgError]
+  val c = bouncerConnection() match
+    Some(r) -> r?
+    None -> return Ok(())
+  c.query("selec 1") match
+    Err(Server(d)) -> assertEq(d.code, "42601")
+    _ -> assert(false, "not Server")
+  c.queryValue[int]("select 1 / $1::int4", 0) match
+    Err(Server(d)) -> assertEq(d.code, "22012")
+    _ -> assert(false, "not Server")
+  assertEq(c.prepare("select 1").err, Some(Config("statements are not prepared under `pgbouncer`")))
+  assertEq(c.queryValue[int]("select 2")?, 2)
+  assert(c.isHealthy)
+  c.close()
+
+@test("under pgbouncer, batches atomic and independent, failures and all, prepare nothing under a name")
+bouncerBatches() -> Result[unit, PgError]
+  val c = bouncerConnection() match
+    Some(r) -> r?
+    None -> return Ok(())
+  c.simpleQuery("create temp table b (n int4 primary key)")?
+  val ok = c.sendBatch(
+    Batch().queue(
+      "insert into b values ($1)",
+      1
+    ).queue("insert into b values ($1)", 2).queue("select n from b order by n")
+  )?
+  assertEq(ok.get(2)?.rows.map(r -> r.get[int](0).ok.get), [1, 2])
+  // Atomic: the failure, the rest skipped, the whole rolled back.
+  val atomic = c.sendBatch(
+    Batch().queue("insert into b values ($1)", 3).queue("insert into b values ($1)", 1).queue("select 1"),
+    Atomic
+  )?
+  assert(atomic.get(0).isOk)
+  assertEq(atomic.get(1).err.flatMap(e -> e.code), Some("23505"))
+  assertEq(atomic.get(2).err, Some(Skipped))
+  assertEq(c.queryValue[int]("select count(*)::int4 from b")?, 2)
+  // Independent: each its own.
+  val independent = c.sendBatch(
+    Batch().queue(
+      "insert into b values ($1)",
+      3
+    ).queue("insert into b values ($1)", 1).queue("insert into b values ($1)", 4),
+    Independent
+  )?
+  assertEq((independent.get(0).isOk, independent.get(1).isErr, independent.get(2).isOk), (true, true, true))
+  assertEq(c.queryValue[int]("select count(*)::int4 from b")?, 4)
+  // A batch whose statements repeat, more than fits one window.
+  var big = Batch()
+  for i in 0 ..< 2000
+    big = big.queue("select $1::int4", i)
+  val many = c.sendBatch(big)?
+  assertEq(many.get(1999)?.rows(0).get[int](0)?, 1999)
+  assertEq(c.cachedStatements, 0)
+  assertEq(namedStatements(c)?, 0)
+  c.close()
+
+@test("under pgbouncer, transactions commit and roll back")
+bouncerTransactions() -> Result[unit, PgError]
+  val c = bouncerConnection() match
+    Some(r) -> r?
+    None -> return Ok(())
+  c.simpleQuery("create temp table t (n int4)")?
+  c.transaction(tx -> tx.execute("insert into t values ($1)", 1))?
+  assert(c.transaction(tx ->
+    tx.execute("insert into t values ($1)", 2)?
+    tx.execute("insert into nowhere values (1)")).isErr)
+  assertEq(c.queryValue[int]("select count(*)::int4 from t")?, 1)
+  assertEq(namedStatements(c)?, 0)
+  c.close()
+
+@test("under pgbouncer a statement is one round trip: Parse, Bind, Describe, Execute and Sync together")
+bouncerOneTrip() -> Result[unit, PgError]
+  val column = cstr("n") ++ int32(0) ++ [
+    byte(0),
+    byte(0)
+  ] ++ int32(23) ++ [byte(0), byte(4)] ++ int32(-1) ++ [byte(0), byte(0)]
+  val described = msg('T', [byte(0), byte(1)] ++ column)
+  val row = msg('D', [byte(0), byte(1)] ++ int32(2) ++ "42".bytes)
+  val answer = msg('1', []) ++ msg('2', []) ++ described ++ row ++ msg('C', cstr("SELECT 1")) ++ ready
+  // The script reads all five messages before it answers: a client that waited for an answer to
+  // its Parse first would wait for ever, and the script give up.
+  val steps = [ReadUntyped, Send(started), ReadTyped, ReadTyped, ReadTyped, ReadTyped, ReadTyped, Send(answer)]
+  val r = withServer(steps, port ->
+    pg.connect(config(port) with {pgbouncer = true}).flatMap(c ->
+      val v = c.queryValue[int]("select $1::int4", 42)
+      _ = c.close()
+      v))
+  assertEq(r, Ok(42))
+  Ok(())
+
+@test("a pool under pgbouncer serves many threads, none preparing a named statement")
+bouncerPool() -> Result[unit, PgError]
+  val url = testUrl("sslmode=disable&pgbouncer=true") match
+    Some(u) -> u
+    None -> return Ok(())
+  val db = PgPool.open(url, maxSize = 5)?
+  val answers = scope(s ->
+    val threads = (0 ..< 500).map(i -> s.spawn(() -> db.use(c -> c.queryValue[int]("select $1::int4 * 2", i))))
+    threads.map(t -> t.join()))
+  assertEq(answers.count(a -> a.isOk), 500)
+  assert((0 ..< 500).forall(i -> answers(i) == Ok(i * 2)))
+  val named = scope(s ->
+    val threads = (0 ..< 5).map(_ -> s.spawn(() -> db.use(c -> namedStatements(c))))
+    threads.map(t -> t.join()))
+  assert(named.forall(n -> n == Ok(0)))
+  db.close()
+  Ok(())

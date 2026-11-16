@@ -364,3 +364,81 @@ keeps what its statements before the cancelled one committed, and the ones alrea
 still run. A thread cancelled while a write is under way may have sent half a message, so the
 connection is broken at once rather than drained to the limit; this holds for single statements
 too.
+
+## `connectTimeout` is one deadline per server, over the whole connection
+
+Settled on the user's delegation 2026-11-16 (branch `resilience`). The timeout used to be set on the
+socket once it was connected, so the TCP connect itself had no limit (75 s or more against an address
+that drops packets), and each later wait had the whole timeout again, so a server answering a little
+at a time could take any time. Now each server's attempt (name lookup, TCP, TLS, authentication, and
+checking the kind of server) runs inside `withTimeout`, which cancels it wherever it is and closes
+what it opened; the answer is `Io` with kind `TimedOut`. The socket timeout is still set too. A
+duration of zero or less is none, as libpq reads `connect_timeout=0`. In a host list each server
+gets the whole timeout afresh, as in libpq. Alternatives weighed: a deadline threaded through every
+read (much more code in `connection.avin`), and a connect primitive with a timeout in `avin.net`
+(covers TCP only). **Review with the user**: the default stays `None`, as in libpq and pgx, so a
+connection waits as long as the network does; a server might prefer a default such as 10 s.
+
+## A dead connection is found before the statement is sent: `NotSent` and `safeToRetry`
+
+Settled on the user's delegation 2026-11-16 (branch `resilience`). When the server ends a session
+(a restart sends FATAL `57P01`, then closes) the client finds out only when it next reads. So between
+requests a connection first reads what the server has sent unasked, from its own buffer and from the
+socket, never waiting: a notice or a parameter is dealt with as usual, while an error or the end of
+the connection breaks it, and the statement is not sent. Outside a transaction that failure is
+`NotSent(failure)`; inside one it is the failure itself, since the transaction is lost and the
+statement alone is not the thing to run again. `PgError.safeToRetry` is true for `NotSent` and for
+`Closed` only: pgx's `SafeToRetry` means the same, that nothing reached the server. A pool answers a
+connection it could not make as `NotSent` where the server could not be reached (`Io`) or answered
+that it is starting, stopping (class `57P`) or cannot take the connection (class `08`); a wrong
+password and other refusals answer as they are. Nothing in the driver runs a statement again by
+itself. The same check made `isHealthy` read the reader's buffer too: an end of session that arrived
+in the same read as the last answer was buffered, and a pool would have lent that connection.
+**Review with the user**: retry semantics. `PoolTimedOut` and `PoolBusy` are not counted as safe
+although nothing ran, since running again into an overloaded pool is the wrong reflex; and the pool
+does not retry even a `NotSent` statement on another connection, though it safely could, so a
+caller sees every failure (pgx's pool does not retry either; `database/sql` does, once, on
+`ErrBadConn`).
+
+## Several servers: `hosts`, libpq's lists, and `targetSessionAttrs`
+
+Settled on the user's delegation 2026-11-16 (branch `resilience`). `PgConfig.hosts: Vector[Host]`,
+`Host(name, port = 5432)`, empty by default so `host` and `port` keep their meaning; `servers` is the
+list either way, and parsing a list also sets `host` and `port` to its first. A URL lists
+`host:port` entries (libpq's form); `PgConfig.parse` also reads libpq's keyword form, where `port`
+lists one per host or gives one for all, since the brief named `host=a,b port=x,y`. Servers are
+tried in order, each within `connectTimeout`; where none will do, the answer is the last server's
+failure, as `TcpStream.connect` answers for a name with several addresses. The kind of server is
+read from the `in_hot_standby` and `default_transaction_read_only` the server reports at startup
+(version 14 and later), or asked with one query otherwise; `read-only` is a standby or read-only by
+default, as libpq has it. `prefer-standby` keeps the first server that connects while it looks for a
+standby, rather than libpq's second pass, which connects again. A server of the wrong kind is
+`NoTarget(reason)`, a new variant, since `Config` and `Server` say something else. The tests stand a
+server with `default_transaction_read_only` on in for a read-only server, and a scripted server
+reporting `in_hot_standby` in for a standby, since a real standby needs replication set up.
+**Review with the user**: the default is `any`, as libpq's; and the error is the last server's, where
+libpq joins every server's into one message.
+
+## `pgbouncer`: unnamed statements in one round trip, results as text
+
+Settled on the user's delegation 2026-11-16 (branch `resilience`). PgBouncer in transaction mode may
+give each transaction a different server connection, so a statement prepared under a name, or even
+an unnamed one parsed in one round trip and bound in the next, may be gone. With `pgbouncer` (URL
+`pgbouncer=true`, the name Prisma uses for the same switch) a statement is Parse (unnamed), Bind,
+Describe, Execute and Sync in one write, parameters and rows as text, as pgx's `exec` mode does;
+nothing is cached; a batch sends each statement that way; `prepare` is refused with `Config`. The
+statement cache and `statementCacheSize = 0` stay as they were, since `0` still prepares in a round
+trip of its own. Tested against the server itself, no `pgbouncer` binary being installed:
+`pg_prepared_statements` stays empty, and a scripted server proves the one round trip. Alternatives
+weighed: pgx's several query modes as one enum (more surface than the one case needs), and naming
+the flag for what it does (`namedStatements = false`). **Review with the user**: the name, the
+default (off), and refusing `prepare` rather than running a prepared statement unnamed each time.
+
+## Found: a host lookup cannot be cut short
+
+Found 2026-11-16, not worked around, and not reproduced (no slow resolver was at hand). Name
+resolution is a blocking call in avin 0.0.30, and `withTimeout` answers only once everything it
+cancelled has ended, so by its contract a lookup in progress holds the timeout until the resolver
+answers. `connectTimeout` would then bound a slow resolver only after it answers. A numeric host or
+one in the hosts file answers at once. A cancellable or time-limited lookup in `avin.net` would
+close it.

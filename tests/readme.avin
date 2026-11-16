@@ -9,8 +9,9 @@ import avin.time.{millis, seconds}
 import dev.avinlang.pg
 
 import dev.avinlang.pg.{
-  Batch, BatchEnd, BatchQuery, BatchSpan, BatchStart, BatchTracer, Connection, PgColumn, PgConfig, PgError, PgPool,
-  PoolBusy, FromRow, QueryEnd, QuerySpan, QueryStart, QueryTracer, QueryTracers, SlowQueryLog
+  Batch, BatchEnd, BatchQuery, BatchSpan, BatchStart, BatchTracer, Closed, Connection, Host, NotSent, PgColumn,
+  PgConfig, PgError, PgPool, PoolBusy, FromRow, QueryEnd, QuerySpan, QueryStart, QueryTracer, QueryTracers, ReadWrite,
+  SlowQueryLog
 }
 
 data ReadmeItem(id: int, @PgColumn("name") label: string, price: Option[BigDecimal] = None) derives FromRow
@@ -244,3 +245,49 @@ readmeCancel() -> Result[unit, PgError]
   assert(r.isEmpty)
   assertEq(db.queryValue[int]("select 1"), Ok(1))
   db.close()
+
+@test("the README's several servers: a URL's host list and the kind of server wanted")
+readmeSeveralServers() -> Result[unit, PgError]
+  val config = PgConfig.parse("postgres://app@db1:5432,db2:5433/shop?target_session_attrs=read-write")?
+  assertEq(config.servers, [Host("db1", 5432), Host("db2", 5433)])
+  assertEq(config.targetSessionAttrs, ReadWrite)
+  Ok(())
+
+// The README's retry: `f` once more where its first run failed before its statement reached the
+// server.
+retried[T](f: () -> Result[T, PgError]) -> Result[T, PgError] = f() match
+  Err(e) if e.safeToRetry -> f()
+  other -> other
+
+@test("the README's retry: a statement run again only where it never reached the server")
+readmeRetry() -> Result[unit, PgError]
+  val url = testUrl() match
+    Some(u) -> u
+    None -> return Ok(())
+  val pool = PgPool.open(url)?
+  pool.execute("create table if not exists readme_events (n int4)")?
+  val added = retried(() -> pool.execute("insert into readme_events values ($1)", 7))?
+  assertEq(added, long(1))
+  // A failure the statement may have caused is not run again: the second insert never happens.
+  var runs = 0
+  val failed = retried(() ->
+    runs += 1
+    pool.execute("insert into readme_events values ($1::int4)", "not a number"))
+  assert(failed.isErr)
+  assertEq(runs, 1)
+  // One that never left is: the first try finds the pool's server gone.
+  var tries = 0
+  val healed = retried(() ->
+    tries += 1
+    if tries == 1 then Err(NotSent(Closed)) else Ok(42))
+  assertEq((healed, tries), (Ok(42), 2))
+  pool.execute("drop table readme_events")?
+  pool.close()
+  Ok(())
+
+@test("the README's PgBouncer pool opens with the flag set")
+readmePgBouncer() -> Result[unit, PgError]
+  val bounced = PgPool.open("postgres://app:secret@localhost:6432/shop?pgbouncer=true", maxSize = 8)?
+  bounced.close()
+  assert(PgConfig.parse("postgres://app:secret@localhost:6432/shop?pgbouncer=true")?.pgbouncer)
+  Ok(())

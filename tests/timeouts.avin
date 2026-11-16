@@ -1,0 +1,108 @@
+module tests
+
+// `connectTimeout` bounds the whole of making a connection: the TCP connection to an address that
+// never answers, a TLS handshake and an authentication that never finish, and a server that answers
+// slowly enough that no single wait runs out. A connection made in time keeps no limit after.
+
+import avin.io
+import avin.threads.scope
+import avin.time.{Duration, millis, monotonic, seconds}
+import dev.avinlang.pg
+import dev.avinlang.pg.{Connection, Io, PgConfig, PgError, SslMode}
+
+// An address in a block no machine answers for, so a TCP connection to it is never accepted or
+// refused.
+val unanswered = "10.255.255.1"
+
+// What `connect` answers, and how long it took.
+private timed(config: PgConfig) -> (Result[Connection, PgError], Duration)
+  val began = monotonic()
+  val r = pg.connect(config)
+  (r, monotonic() - began)
+
+// Whether `r` is a connection that timed out.
+isTimeout(r: Result[Connection, PgError]) -> bool = r match
+  Err(Io(e)) -> e.kind == io.TimedOut
+  _ -> false
+
+@test("connectTimeout bounds a TCP connection to an address that never answers")
+tcpNeverAnswers() -> Result[unit, PgError]
+  val (r, took) = timed(
+    PgConfig(host = unanswered, port = 5432, sslMode = SslMode.Disable, connectTimeout = Some(millis(300)))
+  )
+  assert(isTimeout(r))
+  assertEq(r.err.map(e -> e.message), Some("the connection to the server failed"))
+  assert(took < seconds(5))
+  Ok(())
+
+@test("connectTimeout bounds authentication: a server that takes the startup message and says nothing")
+authNeverAnswers() -> Result[unit, PgError]
+  val (r, took) = withServer([ReadUntyped], port -> timed(config(port) with {connectTimeout = Some(millis(300))}))
+  assert(isTimeout(r))
+  assert(took < seconds(5))
+  Ok(())
+
+@test("connectTimeout bounds TLS: a server that agrees to TLS and never shakes hands")
+tlsNeverAnswers() -> Result[unit, PgError]
+  val (r, took) = withServer([ReadUntyped, Send(["S".bytes(0)])], port ->
+    timed(config(port, SslMode.Require) with {connectTimeout = Some(millis(300))}))
+  assert(isTimeout(r))
+  assert(took < seconds(5))
+  Ok(())
+
+@test("connectTimeout is the whole connection's: a server answering a little at a time runs past it")
+slowTrickle() -> Result[unit, PgError]
+  // Each part comes well inside the timeout, and all of them together well past it.
+  val parts = Buffer[Step]()
+  parts.addOne(ReadUntyped)
+  for i in 0 ..< 20
+    parts.addOne(Pause(millis(100)))
+    parts.addOne(Send(msg('S', cstr(s"p$i") ++ cstr("x"))))
+  parts.addOne(Send(started))
+  val (r, took) = withServer(parts.toVector, port -> timed(config(port) with {connectTimeout = Some(millis(500))}))
+  assert(isTimeout(r))
+  assert(took < seconds(2))
+  Ok(())
+
+@test("a timeout of zero or less sets no limit, as None does")
+zeroTimeout() -> Result[unit, PgError]
+  for limit in [Some(Duration(0)), Some(millis(-5)), None]
+    val pid = withServer([ReadUntyped, Pause(millis(200)), Send(started)], port ->
+      pg.connect(config(port) with {connectTimeout = limit}).map(c ->
+        _ = c.close()
+        c.backendPid))
+    assertEq(pid, Ok(42))
+  Ok(())
+
+@test("a connection made in time keeps no limit: a statement longer than the timeout runs to its end")
+noLimitAfter() -> Result[unit, PgError]
+  val url = testUrl("sslmode=disable&connect_timeout=1") match
+    Some(u) -> u
+    None -> return Ok(())
+  val c = pg.connect(url)?
+  assertEq(c.queryValue[string]("select pg_sleep(1.5)::text")?, "")
+  assertEq(c.queryValue[int]("select 1")?, 1)
+  c.close()
+
+@test("a host that does not resolve fails at once, an Io error, within the timeout")
+unresolved() -> Result[unit, PgError]
+  val (r, took) = timed(
+    PgConfig(host = "no-such-host.invalid", sslMode = SslMode.Disable, connectTimeout = Some(seconds(10)))
+  )
+  r match
+    Err(Io(e)) -> assert(e.kind != io.TimedOut)
+    _ -> assert(false, "not an Io error")
+  assert(took < seconds(10))
+  Ok(())
+
+@test("many threads connecting to an address that never answers each time out")
+manyTimeouts() -> Result[unit, PgError]
+  val config = PgConfig(host = unanswered, sslMode = SslMode.Disable, connectTimeout = Some(millis(300)))
+  val began = monotonic()
+  val outcomes = scope(s ->
+    val threads = (0 ..< 200).map(_ -> s.spawn(() -> isTimeout(pg.connect(config))))
+    threads.map(t -> t.join()))
+  assertEq(outcomes.count(t -> t), 200)
+  // They waited together, not one after another.
+  assert(monotonic() - began < seconds(10))
+  Ok(())

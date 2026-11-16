@@ -154,6 +154,9 @@ private class MessageReader(private val stream: ByteStream)
   // Bytes buffered and not yet read.
   private available -> int = buffer.length - at
 
+  // Whether bytes have arrived that no message read has taken yet.
+  pending -> bool = available > 0
+
   // Reads until at least `n` bytes are buffered, or answers an error for a connection that ended.
   private fill(n: int) -> Result[unit, PgError]
     while available < n

@@ -1,0 +1,289 @@
+module tests
+
+// Several servers in one configuration: the host list in a URL and in libpq's keyword form, tried in
+// order each within the timeout, and `targetSessionAttrs` choosing among them. The second test
+// server (`PG_TEST_URL2`) stands in for a standby by being read-only by default
+// (`default_transaction_read_only`); a real standby needs replication, so the standby kinds are
+// tried against a scripted server that reports itself in hot standby.
+
+import avin.io
+import avin.threads.{scope, withTimeout}
+import avin.time.{millis, monotonic, seconds}
+import dev.avinlang.pg
+
+import dev.avinlang.pg.{
+  AnySession, Config, Connection, Host, Io, NoTarget, PgConfig, PgError, PreferStandby, Primary, ReadOnly, ReadWrite,
+  Standby, TargetSessionAttrs
+}
+
+private refused(text: string) -> string = PgConfig.parse(text) match
+  Err(Config(reason)) -> reason
+  Err(_) -> "refused, but not as Config"
+  Ok(_) -> "accepted"
+
+@test("a URL's host list: each host with its own port or 5432, IPv6 in brackets, the rest of the URL kept")
+urlHostList() -> Result[unit, PgError]
+  val c = PgConfig.parse(
+    "postgres://alice:pw@a.example:5433,b.example,[::1]:6000/shop?target_session_attrs=read-write"
+  )?
+  assertEq(c.hosts, [Host("a.example", 5433), Host("b.example", 5432), Host("::1", 6000)])
+  assertEq((c.host, c.port), ("a.example", 5433))
+  assertEq((c.user, c.password, c.database, c.targetSessionAttrs), ("alice", Some("pw"), Some("shop"), ReadWrite))
+  // With no user part, and a list ended by the query.
+  val d = PgConfig.parse("postgresql://h1,h2?sslmode=disable")?
+  assertEq(d.servers, [Host("h1"), Host("h2")])
+  // One host is no list: `servers` is that host.
+  val one = PgConfig.parse("postgres://solo:7000/x")?
+  assertEq((one.hosts, one.servers), ([], [Host("solo", 7000)]))
+  assertEq(PgConfig().servers, [Host("localhost", 5432)])
+  Ok(())
+
+@test("every target_session_attrs value, and pgbouncer, read from a URL")
+urlOptions() -> Result[unit, PgError]
+  val kinds: Vector[(string, TargetSessionAttrs)] = [
+    ("any", AnySession),
+    ("read-write", ReadWrite),
+    ("read-only", ReadOnly),
+    ("primary", Primary),
+    ("standby", Standby),
+    ("prefer-standby", PreferStandby)
+  ]
+  for (text, kind) in kinds
+    assertEq(PgConfig.parse(s"postgres://h?target_session_attrs=$text")?.targetSessionAttrs, kind)
+  assertEq(PgConfig().targetSessionAttrs, AnySession)
+  assert(PgConfig.parse("postgres://h?pgbouncer=true")?.pgbouncer)
+  assert(!PgConfig.parse("postgres://h?pgbouncer=false")?.pgbouncer)
+  assert(!PgConfig().pgbouncer)
+  Ok(())
+
+@test("libpq's keyword form: hosts and ports as lists, one port for all, quoted values, and the URL's options")
+keywordForm() -> Result[unit, PgError]
+  val c = PgConfig.parse(
+    "host=a,b port=5433,5434 user=alice password='p w\\'d\\\\' dbname = shop sslmode=disable target_session_attrs=primary"
+  )?
+  assertEq(c.hosts, [Host("a", 5433), Host("b", 5434)])
+  assertEq((c.host, c.port), ("a", 5433))
+  assertEq((c.user, c.password, c.database), ("alice", Some("p w'd\\"), Some("shop")))
+  assertEq((c.sslMode, c.targetSessionAttrs), (pg.SslMode.Disable, Primary))
+  // One port for every host.
+  assertEq(PgConfig.parse("host=a,b,c port=6000")?.servers, [Host("a", 6000), Host("b", 6000), Host("c", 6000)])
+  // One host: no list. A port alone sets the port.
+  val one = PgConfig.parse("host=db port=7000 connect_timeout=3 pgbouncer=true")?
+  assertEq((one.hosts, one.host, one.port, one.connectTimeout, one.pgbouncer), ([], "db", 7000, Some(3.seconds), true))
+  assertEq(PgConfig.parse("port=7001")?.servers, [Host("localhost", 7001)])
+  // Unicode in a quoted value, and an empty one.
+  assertEq(PgConfig.parse("dbname='café ☕' password=''")?.database, Some("café ☕"))
+  assertEq(PgConfig.parse("dbname='café ☕' password=''")?.password, Some(""))
+  Ok(())
+
+@test("a host list or keyword string that cannot be read is a Config error saying why")
+listRefused() -> Result[unit, PgError]
+  assertEq(refused("host=a,b,c port=1,2"), "2 ports for 3 hosts")
+  assertEq(refused("host=a,,b"), "an empty host in the host list")
+  assertEq(refused("postgres://a,,b/d"), "an empty host in the host list")
+  assertEq(refused("postgres://a,b:0/d"), "the port `0` is not one from 1 to 65535")
+  assertEq(refused("postgres://a,b:70000/d"), "the port `70000` is not one from 1 to 65535")
+  assertEq(refused("postgres://a,b:x/d"), "the port `x` is not one from 1 to 65535")
+  assertEq(refused("postgres://a,[::1/d"), "the host `[::1` has no closing bracket")
+  assertEq(refused("postgres://a,[::1]x/d"), "the host `[::1]x` is not `[address]:port`")
+  assertEq(refused("host=a port=http"), "the port `http` is not one from 1 to 65535")
+  assertEq(refused("host=a dbname='shop"), "the value of `dbname` has no closing quote")
+  assertEq(refused("host=a dbname"), "`dbname` has no `=` and value")
+  assertEq(refused("host=a colour=blue"), "the option `colour` is not one this client knows")
+  assertEq(
+    refused("host=a target_session_attrs=master"),
+    "target_session_attrs `master` is not one of any, read-write, read-only, primary, standby and prefer-standby"
+  )
+  assertEq(refused("postgres://h?pgbouncer=yes"), "pgbouncer `yes` is not true or false")
+  Ok(())
+
+// The first test server's settings, plain TCP, with its port and the second server's, or `None`
+// where either is not set up. The second is made read-only by default.
+private bothServers() -> Option[(PgConfig, int, int)]
+  val first = testUrl() match
+    Some(u) -> PgConfig.parse(u).ok.get
+    None -> return None
+  val (url, _) = secondServer()?
+  val second = PgConfig.parse(url + "?sslmode=disable").ok.get
+  val setup = pg.connect(second) match
+    Ok(c) -> c
+    Err(e) ->
+      assert(false, s"the second server: ${e.message}")
+      return None
+  // Its own session writes, whatever the database's default has become.
+  _ = setup.simpleQuery("set default_transaction_read_only = off")
+  assert(setup.simpleQuery("alter database postgres set default_transaction_read_only = on").isOk)
+  _ = setup.close()
+  Some((first with {sslMode = pg.SslMode.Disable}, first.port, second.port))
+
+// The port of the server `config` connects to, or why it did not.
+private portReached(config: PgConfig) -> Result[int, PgError]
+  val c = pg.connect(config)?
+  val port = c.queryValue[int]("select current_setting('port')::int4")
+  _ = c.close()
+  port
+
+@test("hosts are tried in order: one refusing and one never answering are passed over, each within the timeout")
+triedInOrder() -> Result[unit, PgError]
+  val (base, first, _) = bothServers() match
+    Some(b) -> b
+    None -> return Ok(())
+  val config = base with {
+    hosts = [Host("127.0.0.1", 1), Host(unanswered, 5432), Host("127.0.0.1", first)],
+    connectTimeout = Some(millis(300))
+  }
+  val began = monotonic()
+  assertEq(portReached(config), Ok(first))
+  assert(monotonic() - began < seconds(5))
+  // Where none connects, the answer is the last one's failure.
+  val none = pg.connect(
+    base with {hosts = [Host("127.0.0.1", 1), Host(unanswered, 5432)], connectTimeout = Some(millis(300))}
+  )
+  assert(isTimeout(none))
+  val refusedLast = pg.connect(
+    base with {hosts = [Host(unanswered, 5432), Host("127.0.0.1", 1)], connectTimeout = Some(millis(300))}
+  )
+  refusedLast match
+    Err(Io(e)) -> assertEq(e.kind, io.ConnectionRefused)
+    _ -> assert(false, "not Io")
+  Ok(())
+
+@test("target_session_attrs against a read-write server and a read-only one, in either order")
+targets() -> Result[unit, PgError]
+  val (base, rw, ro) = bothServers() match
+    Some(b) -> b
+    None -> return Ok(())
+  val roFirst = base with {hosts = [Host("127.0.0.1", ro), Host("127.0.0.1", rw)]}
+  val rwFirst = base with {hosts = [Host("127.0.0.1", rw), Host("127.0.0.1", ro)]}
+  assertEq(portReached(roFirst with {targetSessionAttrs = AnySession}), Ok(ro))
+  assertEq(portReached(roFirst with {targetSessionAttrs = ReadWrite}), Ok(rw))
+  assertEq(portReached(rwFirst with {targetSessionAttrs = ReadOnly}), Ok(ro))
+  // Read-only by default is not a standby: it is a primary.
+  assertEq(portReached(roFirst with {targetSessionAttrs = Primary}), Ok(ro))
+  // No standby: `standby` finds none, and `prefer-standby` takes the first.
+  assertEq(
+    portReached(rwFirst with {targetSessionAttrs = Standby}),
+    Err(NoTarget(s"127.0.0.1:$ro is read-only"))
+  )
+  assertEq(portReached(rwFirst with {targetSessionAttrs = PreferStandby}), Ok(rw))
+  assertEq(portReached(roFirst with {targetSessionAttrs = PreferStandby}), Ok(ro))
+  // A list with only the wrong kind.
+  val onlyRo = base with {hosts = [Host("127.0.0.1", ro)], targetSessionAttrs = ReadWrite}
+  assertEq(portReached(onlyRo), Err(NoTarget(s"127.0.0.1:$ro is read-only")))
+  assertEq(
+    portReached(onlyRo).err.map(e -> e.message),
+    Some(s"no server of the kind asked for: 127.0.0.1:$ro is read-only")
+  )
+  // The keyword form, end to end.
+  val text = s"host=127.0.0.1,127.0.0.1 port=$ro,$rw user=pgtest password=pgtest dbname=postgres sslmode=disable target_session_attrs=read-write"
+  assertEq(portReached(PgConfig.parse(text)?), Ok(rw))
+  Ok(())
+
+@test("many threads connecting read-write through a list that starts with a read-only server all reach the other")
+manyChoose() -> Result[unit, PgError]
+  val (base, rw, ro) = bothServers() match
+    Some(b) -> b
+    None -> return Ok(())
+  val config = base with {hosts = [Host("127.0.0.1", ro), Host("127.0.0.1", rw)], targetSessionAttrs = ReadWrite}
+  val ports = scope(s ->
+    val threads = (0 ..< 40).map(_ -> s.spawn(() -> portReached(config)))
+    threads.map(t -> t.join()))
+  assertEq(ports.count(p -> p == Ok(rw)), 40)
+  Ok(())
+
+@test("a statement cancelled on the second host of a list is cancelled there, and the connection goes on")
+cancelOnChosen() -> Result[unit, PgError]
+  val (base, rw, ro) = bothServers() match
+    Some(b) -> b
+    None -> return Ok(())
+  val c = pg.connect(
+    base with {hosts = [Host("127.0.0.1", ro), Host("127.0.0.1", rw)], targetSessionAttrs = ReadWrite}
+  )?
+  val began = monotonic()
+  assertEq(withTimeout(millis(300), _ -> c.query("select pg_sleep(30)")), None)
+  assert(monotonic() - began < seconds(10))
+  assertEq(c.queryValue[int]("select current_setting('port')::int4")?, rw)
+  c.close()
+
+// A row description of text columns named `names`, and a row of `values`.
+private textColumns(names: Vector[string]) -> Vector[byte]
+  var body = [byte(0), byte(names.length)]
+  for n in names
+    val field = cstr(n) ++ int32(0) ++ [byte(0), byte(0)] ++ int32(25) ++ [byte(255), byte(255)] ++ int32(-1)
+    body = body ++ field ++ [byte(0), byte(0)]
+  msg('T', body)
+
+private textRow(values: Vector[string]) -> Vector[byte]
+  var body = [byte(0), byte(values.length)]
+  for v in values
+    body = body ++ int32(v.byteLength) ++ v.bytes
+  msg('D', body)
+
+// A startup's answer from a server reporting `standby` and `readOnly` as version 14 and later do.
+private reporting(standby: string, readOnly: string) -> Vector[byte]
+  val hot = msg('S', cstr("in_hot_standby") ++ cstr(standby))
+  val defaultReadOnly = msg('S', cstr("default_transaction_read_only") ++ cstr(readOnly))
+  msg('R', int32(0)) ++ hot ++ defaultReadOnly ++ msg('K', int32(42) ++ int32(7)) ++ ready
+
+@test("a server reporting itself in hot standby is a standby: standby takes it, primary and read-write pass it over")
+reportedStandby() -> Result[unit, PgError]
+  for (target, wanted) in [
+    (Standby, true),
+    (PreferStandby, true),
+    (ReadOnly, true),
+    (Primary, false),
+    (ReadWrite, false)
+  ]
+    val r = withServer([ReadUntyped, Send(reporting("on", "off"))], port ->
+      pg.connect(config(port) with {targetSessionAttrs = target}).map(c ->
+        _ = c.close()
+        c.backendPid))
+    r match
+      Ok(pid) -> assert(wanted && pid == 42)
+      Err(NoTarget(reason)) -> assert(!wanted && reason.endsWith("is a standby"))
+      Err(e) -> assert(false, e.message)
+  Ok(())
+
+@test("prefer-standby keeps the first server only until a standby connects, then closes it")
+preferStandby() -> Result[unit, PgError]
+  val (base, rw, _) = bothServers() match
+    Some(b) -> b
+    None -> return Ok(())
+  val name = "prefer-standby-probe"
+  val pid = withServer([ReadUntyped, Send(reporting("on", "on"))], port ->
+    pg.connect(base with {
+        hosts = [Host("127.0.0.1", rw), Host("127.0.0.1", port)],
+        targetSessionAttrs = PreferStandby,
+        applicationName = Some(name)
+    }).map(c ->
+      _ = c.close()
+      c.backendPid))
+  assertEq(pid, Ok(42))
+  // The connection to the first server was closed.
+  val watcher = pg.connect(base)?
+  var left = 1
+  val until = monotonic() + seconds(5)
+  while left > 0 && monotonic() < until
+    left = watcher.queryValue[int]("select count(*)::int4 from pg_stat_activity where application_name = $1", name)?
+  assertEq(left, 0)
+  watcher.close()
+
+@test("a server that does not report its kind is asked, and its answer decides")
+askedKind() -> Result[unit, PgError]
+  val answer = (standby: string, readOnly: string) ->
+    val head = textColumns(["pg_is_in_recovery", "current_setting"])
+    head ++ textRow([standby, readOnly]) ++ msg('C', cstr("SELECT 1")) ++ ready
+  val ask = (target: TargetSessionAttrs, standby: string, readOnly: string) ->
+    withServer([ReadUntyped, Send(started), ReadTyped, Send(answer(standby, readOnly))], port ->
+      pg.connect(config(port) with {targetSessionAttrs = target}).map(c ->
+        _ = c.close()
+        c.backendPid))
+  assertEq(ask(ReadWrite, "f", "off"), Ok(42))
+  ask(ReadWrite, "f", "on") match
+    Err(NoTarget(reason)) -> assert(reason.endsWith("is read-only"))
+    _ -> assert(false, "not NoTarget")
+  assertEq(ask(Standby, "t", "on"), Ok(42))
+  ask(Primary, "t", "on") match
+    Err(NoTarget(reason)) -> assert(reason.endsWith("is a standby"))
+    _ -> assert(false, "not NoTarget")
+  Ok(())

@@ -256,8 +256,20 @@ private flattened[R](r: Result[Result[R, PgError], PoolError[PgError]]) -> Resul
   Ok(inner) -> inner
   Err(e) -> Err(poolFailure(e))
 
+// What a caller is told of a lease that failed. A connection that could not be made because the
+// server could not be reached, or was starting up or shutting down, is `NotSent`: the caller's
+// statement never left. A refusal that will not pass by itself, a password the server rejects among
+// them, is answered as it is.
 private poolFailure(e: PoolError[PgError]) -> PgError = e match
   AcquireTimedOut -> PoolTimedOut
   QueueFull -> PoolBusy
   PoolError.PoolClosed -> PoolClosed
-  CreateFailed(inner) -> inner
+  CreateFailed(inner) -> if unreachable(inner) then NotSent(inner) else inner
+
+// Whether a failure to connect says the server could not be reached for now: the connection failed
+// or timed out, or the server answered that it is starting up or shutting down (SQLSTATE class 57P)
+// or that it cannot take the connection (class 08).
+private unreachable(e: PgError) -> bool = e match
+  Io(_) -> true
+  Server(d) -> d.code.startsWith("57P") || d.code.startsWith("08")
+  _ -> false

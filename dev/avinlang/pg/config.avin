@@ -15,14 +15,43 @@ data SslMode
   // TLS, its certificate verified, or no connection.
   Require
 
+// One server of a configuration's list: its host name or address, and its port.
+data Host(name: string, port: int = 5432)
+
+// The kind of server a connection is wanted to: the first server of the host list that connects and
+// is of that kind is the one used.
+data TargetSessionAttrs
+  // Any server.
+  AnySession
+  // One that accepts writes: not a standby, and not read-only by default.
+  ReadWrite
+  // One that does not accept writes by default: a standby, or one whose
+  // `default_transaction_read_only` is on.
+  ReadOnly
+  // One that is not a standby.
+  Primary
+  // A standby: one in hot standby, recovering from a primary.
+  Standby
+  // A standby where one connects, any server otherwise.
+  PreferStandby
+
 // How to reach the server and how to talk to it.
 //
+// - `hosts`, where it is not empty, is the list of servers to try, in order; where it is empty, the
+//   one server is `host` at `port`. A connection goes to the first server that answers and is of the
+//   kind `targetSessionAttrs` asks for.
 // - `database` defaults to the user's name, as the server's does.
 // - `rootCertificate` is PEM text of the authorities to trust beside the machine's own.
 // - `statementCacheSize` is how many statements a connection keeps prepared; 0 prepares each
 //   statement unnamed, every time.
 // - `notices` receives each notice and warning the server sends; without it they are dropped.
-// - `connectTimeout` limits each wait while connecting and authenticating.
+// - `connectTimeout` limits the time a connection to each server takes, all of it: resolving the
+//   name, the TCP connection, TLS, authentication and checking the kind of server. A duration of
+//   zero or less, like `None`, sets no limit.
+// - `pgbouncer` keeps the connection fit for PgBouncer's transaction pooling, which may hand each
+//   transaction to another server connection: no statement is prepared under a name, each statement
+//   is parsed, bound and run unnamed in one round trip with its rows sent as text, and nothing is
+//   cached. `prepare` is refused.
 // - `queryTracer`, `prepareTracer`, `connectTracer`, `batchTracer` and `poolTracer` watch what
 //   connections made with these settings do, and what a pool made with them does (`tracing.avin`).
 //   `traceParameters` hands a query tracer the parameters' values too; without it a tracer sees
@@ -44,18 +73,38 @@ data PgConfig(
     connectTracer: Option[ConnectTracer] = None,
     batchTracer: Option[BatchTracer] = None,
     poolTracer: Option[PoolTracer] = None,
-    traceParameters: bool = false
+    traceParameters: bool = false,
+    hosts: Vector[Host] = [],
+    targetSessionAttrs: TargetSessionAttrs = AnySession,
+    pgbouncer: bool = false
 )
+
+impl PgConfig
+  // The servers to try, in order: `hosts`, or `host` at `port` where it is empty.
+  servers -> Vector[Host] = if hosts.isEmpty then [Host(host, port)] else hosts
 
 object PgConfig
   // The settings a connection URL gives: `postgres://user:password@host:port/database?options`, or
-  // `postgresql://`. An IPv6 host is written in brackets, `[::1]`. The user name, password and
-  // database are percent-decoded. The options are
+  // `postgresql://`. An IPv6 host is written in brackets, `[::1]`. Several servers are written as a
+  // list, `postgres://user@a:5432,b:5433/database`, each with its own port or 5432. The user name,
+  // password and database are percent-decoded. The options are
   // `sslmode` (`disable`, `prefer` or `require`; `verify-full` is `require`), `sslrootcert` (a
-  // file of PEM authorities, read now), `application_name`, `connect_timeout` (whole seconds) and
-  // `statement_cache_size`; any other is refused, so a misspelt one is not silently ignored.
-  parse(text: string) -> Result[PgConfig, PgError]
-    val url = Url.parse(text).mapErr(e -> Config(s"not a URL: ${e.message}"))?
+  // file of PEM authorities, read now), `application_name`, `connect_timeout` (whole seconds),
+  // `statement_cache_size`, `target_session_attrs` (`any`, `read-write`, `read-only`, `primary`,
+  // `standby` or `prefer-standby`) and `pgbouncer` (`true` or `false`); any other is refused, so a
+  // misspelt one is not silently ignored.
+  //
+  // Text with no `://` that sets keywords is read in libpq's keyword form instead,
+  // `host=a,b port=5432,5433 user=alice dbname=shop sslmode=require`: each `keyword=value`, spaces
+  // around `=` allowed, a value with spaces in single quotes, `\'` and `\\` in it for a quote and a
+  // backslash. The keywords are `host` (a comma-separated list), `port` (one for every host, or one
+  // for all), `user`, `password`, `dbname`, and the URL's options.
+  parse(text: string) -> Result[PgConfig, PgError] =
+    if !text.contains("://") && text.contains("=") then fromKeywords(text) else fromUrl(text)
+
+  private fromUrl(text: string) -> Result[PgConfig, PgError]
+    val (single, listed) = hostList(text)?
+    val url = Url.parse(single).mapErr(e -> Config(s"not a URL: ${e.message}"))?
     if url.scheme != "postgres" && url.scheme != "postgresql" then return Err(
       Config(s"the scheme is `${url.scheme}`, not `postgres`")
     )
@@ -83,7 +132,115 @@ object PgConfig
     if path != "" then config = config with {database = Some(decoded(path)?)}
     for (name, value) in url.queryParams
       config = option(config, name, value)?
+    if listed.length > 1 then config = config with {hosts = listed}
     Ok(config)
+
+  private fromKeywords(text: string) -> Result[PgConfig, PgError]
+    var config = PgConfig()
+    var names: Vector[string] = []
+    var ports: Vector[string] = []
+    for (key, value) in keywords(text)?
+      key match
+        "host" -> names = value.split(",")
+        "port" -> ports = value.split(",")
+        "user" -> config = config with {user = value}
+        "password" -> config = config with {password = Some(value)}
+        "dbname" -> config = config with {database = Some(value)}
+        _ -> config = option(config, key, value)?
+    if ports.length > 1 && ports.length != names.length then return Err(
+      Config(s"${ports.length} ports for ${names.length} hosts")
+    )
+    val servers = Buffer[Host]()
+    for i in 0 ..< names.length
+      if names(i) == "" then return Err(Config("an empty host in the host list"))
+      val port = if ports.isEmpty then 5432 else portOf(ports(if ports.length == 1 then 0 else i))?
+      servers.addOne(Host(names(i), port))
+    if servers.isEmpty && ports.length == 1 then config = config with {port = portOf(ports(0))?}
+    if servers.nonEmpty then config = config with {host = servers(0).name, port = servers(0).port}
+    if servers.length > 1 then config = config with {hosts = servers.toVector}
+    Ok(config)
+
+// `text` with a URL's list of hosts cut to its first, for `Url.parse`, and the hosts the list names,
+// each with its own port or 5432; the list is empty where the URL names one host or none.
+private hostList(text: string) -> Result[(string, Vector[Host]), PgError]
+  val start = text.indexOf("://")
+  if start < 0 then return Ok((text, []))
+  val from = start + 3
+  var end = text.byteLength
+  for stop in ["/", "?", "#"]
+    val at = text.slice(from, text.byteLength).indexOf(stop)
+    if 0 <= at && from + at < end then end = from + at
+  val authority = text.slice(from, end)
+  val at = authority.lastIndexOf("@")
+  val hostsAt = if at < 0 then from else from + at + 1
+  val part = text.slice(hostsAt, end)
+  if !part.contains(",") then return Ok((text, []))
+  val servers = Buffer[Host]()
+  for entry in part.split(",")
+    servers.addOne(hostOf(entry)?)
+  val first = part.slice(0, part.indexOf(","))
+  Ok((text.slice(0, hostsAt) + first + text.slice(end, text.byteLength), servers.toVector))
+
+// One entry of a URL's host list: `name`, `name:port`, `[v6]` or `[v6]:port`.
+private hostOf(entry: string) -> Result[Host, PgError]
+  if entry == "" then return Err(Config("an empty host in the host list"))
+  val close = entry.indexOf("]")
+  val colon = entry.lastIndexOf(":")
+  if entry.startsWith("[")
+    if close < 0 then return Err(Config(s"the host `$entry` has no closing bracket"))
+    val name = entry.slice(1, close)
+    val rest = entry.slice(close + 1, entry.byteLength)
+    if rest == "" then return Ok(Host(name))
+    if !rest.startsWith(":") then return Err(Config(s"the host `$entry` is not `[address]:port`"))
+    return Ok(Host(name, portOf(rest.slice(1, rest.byteLength))?))
+  if colon < 0 then Ok(Host(entry)) else Ok(
+    Host(entry.slice(0, colon), portOf(entry.slice(colon + 1, entry.byteLength))?)
+  )
+
+private portOf(text: string) -> Result[int, PgError] = text.toIntOption() match
+  Some(n) if 0 < n <= 65535 -> Ok(n)
+  _ -> Err(Config(s"the port `$text` is not one from 1 to 65535"))
+
+// The `keyword=value` pairs of libpq's keyword form, in order.
+private keywords(text: string) -> Result[Vector[(string, string)], PgError]
+  val chars = text.chars
+  val out = Buffer[(string, string)]()
+  var i = 0
+  val n = chars.length
+  while true
+    while i < n && chars(i).isWhitespace
+      i += 1
+    if i >= n then break
+    val key = Buffer[char]()
+    while i < n && chars(i) != '=' && !chars(i).isWhitespace
+      key.append(chars(i))
+      i += 1
+    while i < n && chars(i).isWhitespace
+      i += 1
+    if i >= n || chars(i) != '=' then return Err(Config(s"`${key.mkString("")}` has no `=` and value"))
+    i += 1
+    while i < n && chars(i).isWhitespace
+      i += 1
+    val value = Buffer[char]()
+    if i < n && chars(i) == '\''
+      i += 1
+      var closed = false
+      while i < n && !closed
+        chars(i) match
+          '\'' -> closed = true
+          '\\' if i + 1 < n ->
+            i += 1
+            value.append(chars(i))
+          c -> value.append(c)
+        i += 1
+      if !closed then return Err(Config(s"the value of `${key.mkString("")}` has no closing quote"))
+    else
+      while i < n && !chars(i).isWhitespace
+        if chars(i) == '\\' && i + 1 < n then i += 1
+        value.append(chars(i))
+        i += 1
+    out.addOne((key.mkString(""), value.mkString("")))
+  Ok(out.toVector)
 
 private decoded(text: string) -> Result[string, PgError] = Url.decode(text).mapErr(
   e -> Config(s"bad percent-encoding: ${e.message}")
@@ -108,4 +265,20 @@ private option(config: PgConfig, name: string, value: string) -> Result[PgConfig
       Config("statement_cache_size is negative")
     )
     None -> Err(Config(s"statement_cache_size `$value` is not a whole number"))
+  "target_session_attrs" -> value match
+    "any" -> Ok(config with {targetSessionAttrs = AnySession})
+    "read-write" -> Ok(config with {targetSessionAttrs = ReadWrite})
+    "read-only" -> Ok(config with {targetSessionAttrs = ReadOnly})
+    "primary" -> Ok(config with {targetSessionAttrs = Primary})
+    "standby" -> Ok(config with {targetSessionAttrs = Standby})
+    "prefer-standby" -> Ok(config with {targetSessionAttrs = PreferStandby})
+    _ -> Err(
+      Config(
+        s"target_session_attrs `$value` is not one of any, read-write, read-only, primary, standby and prefer-standby"
+      )
+    )
+  "pgbouncer" -> value match
+    "true" -> Ok(config with {pgbouncer = true})
+    "false" -> Ok(config with {pgbouncer = false})
+    _ -> Err(Config(s"pgbouncer `$value` is not true or false"))
   _ -> Err(Config(s"the option `$name` is not one this client knows"))
