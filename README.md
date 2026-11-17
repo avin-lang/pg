@@ -3,8 +3,8 @@
 A PostgreSQL client for Avin: the frontend/backend protocol (version 3) over TCP and TLS,
 SCRAM-SHA-256, MD5, cleartext and trust authentication, simple queries and the extended protocol with
 a statement cache, typed parameters and results, rows read by column or into derived types, the
-server's errors with every field, transactions with savepoints, a connection pool, and statements
-cancelled when their thread is.
+server's errors with every field, transactions with savepoints, a connection pool, statements
+cancelled when their thread is, and LISTEN/NOTIFY delivered to a channel or an actor.
 
 The package's module is **`dev.avinlang.pg`**, written in Avin. A program depends on it in its
 `avin.hocon`:
@@ -327,6 +327,75 @@ import avin.time.seconds
 val r = withTimeout(seconds(2), _ -> db.query("select pg_sleep(60)"))   // None: cancelled
 ```
 
+## LISTEN and NOTIFY
+
+A `Listener` keeps a connection of its own LISTENing on channels, owned by a thread of its own, and
+delivers each notification as `Notified(Notification(channel, payload, pid))` on its `events`
+channel. `listen`, `unlisten` and `unlistenAll` change the channels at run time from any thread; a
+name is quoted, so it is used exactly as written. A notification sent in a transaction arrives once
+the transaction commits, and never where it rolls back.
+
+```avin
+import dev.avinlang.pg.{Listener, Notified}
+
+val listener = Listener.open(config, ["orders"])?
+listener.listen("refunds")?
+db.execute("select pg_notify('orders', $1)", "order 42")?
+listener.events.receive() match
+  Some(Notified(n)) -> println(s"${n.channel}: ${n.payload}")   // orders: order 42
+  _ -> ()
+listener.close()
+```
+
+**A slow consumer** never makes the listener's memory grow: events wait in a queue of `capacity`
+(1024 unless asked), and while it is full further notifications are dropped and counted, in
+`listener.dropped` and in a `Dropped(count)` event delivered as soon as there is room, in its place
+among the others.
+
+**A lost connection** is reported as `Disconnected(error)`; the listener connects again, with a
+backoff doubling from `minBackoff` to `maxBackoff`, LISTENs to its channels again, and reports
+`Reconnected(attempts)`. The server keeps nothing for a listener that is not connected, so the
+notifications sent between the two events are lost: a consumer that keeps state from them reloads it
+on `Reconnected`.
+
+**An actor** receives the events instead with `Listener.toActor(config, channels, actor, make)`: each
+event arrives as the message `make(event, ack)`, and the actor tells `ack` once it has handled it. At
+most `window` events (16) wait for their acknowledgement, so the actor's mailbox stays bounded and the
+listener's queue drops as above. The listener closes itself once the actor ends.
+
+```avin
+import avin.actors.{ActorRef, spawn}
+import dev.avinlang.pg.{ListenEvent, Listener, Notified}
+
+data OrderMsg
+  Pg(event: ListenEvent, ack: ActorRef[unit])
+
+actor Orders() receives OrderMsg
+  var seen = 0
+  receive
+    Pg(Notified(n), ack) ->
+      seen += 1
+      ack.tell(())
+    Pg(_, ack) -> ack.tell(())
+
+val orders = spawn(Orders())
+val feed = Listener.toActor(config, ["orders"], orders, (e, ack) -> Pg(e, ack))?
+```
+
+**On an ordinary connection**, a notification read while a statement runs goes to the
+configuration's `notifications` hook, on the thread running the statement, and is dropped without
+one; it never disturbs the statement. `Connection.waitForNotification(timeout)` waits while the
+connection is idle and answers the next notification, or `None` once the time is up, and
+`connection.readable()` is a `select` arm that waits for one beside channels.
+
+```avin
+val c = pg.connect(config with {notifications = Some(n -> println(s"during a query: ${n.payload}"))})?
+c.simpleQuery("listen jobs")?
+c.waitForNotification(seconds(30))? match
+  Some(n) -> println(s"job ${n.payload}")
+  None -> println("no job within 30 seconds")
+```
+
 ## Tracing
 
 Hooks on the configuration watch what its connections do, for a server's logs, metrics and traces:
@@ -412,8 +481,7 @@ val both = config with {queryTracer = Some(QueryTracers([SlowQueryLog(millis(250
 
 ## Not yet
 
-`LISTEN`/`NOTIFY` and `COPY` come next. A notification the server sends is dropped, and `COPY` is
-refused.
+`COPY` comes next, and is refused.
 
 ## Tests
 

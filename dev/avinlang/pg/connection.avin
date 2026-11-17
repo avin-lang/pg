@@ -8,7 +8,7 @@ import avin.io
 import avin.io.IoError
 import avin.net.{ByteStream, TcpStream}
 import avin.net.tls.{TlsClient, TlsStream}
-import avin.threads.withTimeout
+import avin.threads.{Readiness, withTimeout}
 import avin.time.{Duration, monotonic, seconds}
 
 // A statement prepared on a connection: its name there, its text, the types of its parameters as
@@ -75,7 +75,7 @@ class Connection(
   private val config: PgConfig,
   // Whether the connection is encrypted.
   val isTls: bool
-)
+): Readiness
   private var reader = MessageReader(stream)
   private var pid = 0
   private var secret = 0
@@ -83,6 +83,8 @@ class Connection(
   // failed one.
   private var status = 'I'
   private var broken = false
+  // What the server ended the session with, found while the connection was idle and not yet answered.
+  private var ended: Option[PgError] = None
   private var closed = false
   // Set while a request's answer is being read, so a cancellation in the middle knows to drain it.
   private var awaiting = false
@@ -140,6 +142,46 @@ class Connection(
     val answered = simple("")
     if stream.setTimeout(Duration(0)).isErr then broken = true
     answered
+
+  // ---- Notifications ----
+
+  // Waits at most `timeout` while the connection is idle for a notification on a channel it has
+  // LISTENed to, and answers it, or `None` where none came in time. A timeout of zero or less reads
+  // only what has already arrived. A notification that arrives while a statement runs goes to the
+  // configuration's `notifications` hook instead, and is dropped without one, so a connection that
+  // both runs statements and waits sets the hook, or a `Listener` is used. Notices and parameter
+  // changes that arrive meanwhile are dealt with as they are during a statement. The server ending
+  // the connection breaks it and answers the error it sent, `Server` with SQLSTATE `57P01` where an
+  // administrator terminated it.
+  waitForNotification(timeout: Duration) -> Result[Option[Notification], PgError]
+    if closed || broken then return Err(Closed)
+    val deadline = monotonic() + timeout
+    while true
+      if !readable()
+        val left = deadline - monotonic()
+        if left.micros <= 0 then return Ok(None)
+        val arrived = select
+          stream.readable() -> true
+          after left -> false
+        if !arrived then return Ok(None)
+      val m = reader.next() match
+        Ok(m) -> m
+        Err(e) ->
+          broken = true
+          return Err(e)
+      heard = monotonic()
+      m.kind match
+        'A' -> return Ok(Some(notificationOf(m)))
+        'E' -> return broke(Server(diagnosticOf(m)))
+        _ -> if !asynchronous(m) then return broke(Protocol(s"unexpected message `${m.kind}` while idle"))
+    Ok(None)
+
+  // Whether a read would answer without waiting: a message is buffered or bytes have arrived, or the
+  // connection has ended. A `select` waits for a notification with a `connection.readable()` arm,
+  // then reads it with `waitForNotification`; only the thread that owns the connection may.
+  override readable() -> bool = reader.hasBuffered || stream.readable()
+
+  override readinessDescriptor() -> int = stream.readinessDescriptor()
 
   // ---- Running statements ----
 
@@ -273,8 +315,31 @@ class Connection(
     simple("ROLLBACK")
 
   // Whether the connection can be used at once: it is open, not broken, in no transaction, and the
-  // server has sent nothing unasked, as it does when it ends the session.
-  isHealthy -> bool = !closed && !broken && status == 'I' && !reader.pending && !stream.readable()
+  // server has not ended the session. What the server sent unasked is read, never waited for: a
+  // notice, a parameter's new value or a notification is dealt with as during a statement (a
+  // notification goes to the `notifications` hook), so one that arrived while the connection was
+  // idle does not make it unfit; an error or the end of the connection does, and breaks it, the
+  // failure being what the next request answers (`NotSent`), as if that request had found it.
+  isHealthy -> bool
+    if closed || broken || status != 'I' then return false
+    drained().isEmpty
+
+  // Reads what the server has sent unasked, without waiting, dealing with what may come at any time.
+  // Answers the failure where the server ended the session, which breaks the connection and is kept
+  // for the next request to answer.
+  private drained() -> Option[PgError]
+    while reader.pending || stream.readable()
+      val failure = reader.next() match
+        Ok(m) ->
+          if asynchronous(m) then continue
+          if m.kind == 'E' then Server(diagnosticOf(m)) else Protocol(
+            s"unexpected message `${m.kind}` between requests"
+          )
+        Err(e) -> e
+      broken = true
+      ended = Some(failure)
+      return Some(failure)
+    None
 
   // Says goodbye to the server and closes the connection. Closing a closed connection does nothing.
   close() -> Result[unit, PgError]
@@ -698,41 +763,23 @@ class Connection(
   // ---- Talking to the server ----
 
   // Fails where the connection cannot be used. Between requests it first reads what the server has
-  // sent unasked: a notice or a parameter's new value is dealt with as `receive` deals with it, while
-  // an error, which the server sends as it ends the session, or the connection's end, breaks the
-  // connection. Outside a transaction that failure is `NotSent`, since nothing of the request has
-  // been sent.
+  // sent unasked: a notice, a parameter's new value or a notification is dealt with as `receive` deals
+  // with it (a notification goes to the `notifications` hook, not to be mistaken for an unexpected
+  // message), while an error, which the server sends as it ends the session, or the connection's
+  // end, breaks the connection (a failure `isHealthy` found first is answered here, once). Outside a
+  // transaction that failure is `NotSent`, since nothing of the request has been sent.
   private usable() -> Result[unit, PgError]
-    if closed || broken then return Err(Closed)
+    if closed then return Err(Closed)
+    if broken
+      val found = ended
+      ended = None
+      return Err(if found is Some(f) then NotSent(f) else Closed)
     if awaiting then return Ok(())
-    while reader.pending || stream.readable()
-      val failure = reader.next() match
-        Ok(m) ->
-          if aside(m) then continue
-          if m.kind == 'E' then Server(diagnosticOf(m)) else Protocol(
-            s"unexpected message `${m.kind}` between requests"
-          )
-        Err(e) -> e
-      broken = true
-      return Err(if status == 'I' && depth == 0 then NotSent(failure) else failure)
-    Ok(())
-
-  // Deals with `m` where it is a message the server may send at any time, answering whether it was:
-  // a notice goes to the configuration's sink, a parameter's new value is kept, a notification is
-  // dropped.
-  private aside(m: Message) -> bool = m.kind match
-    'N' ->
-      config.notices match
-        Some(sink) -> sink(diagnosticOf(m))
-        None -> ()
-      true
-    'S' ->
-      val r = In(m.body)
-      val name = r.cstring()
-      parameters = parameters.updated(name, r.cstring())
-      true
-    'A' -> true
-    _ -> false
+    drained() match
+      Some(failure) ->
+        ended = None
+        Err(if status == 'I' && depth == 0 then NotSent(failure) else failure)
+      None -> Ok(())
 
   // Sends `out`; a failure breaks the connection.
   private send(out: Out) -> Result[unit, PgError]
@@ -750,9 +797,8 @@ class Connection(
     broken = true
     Err(e)
 
-  // The next message, with the ones that can come at any time dealt with on the way: a notice goes
-  // to the configuration's sink, a parameter's new value is kept, a notification is dropped. A
-  // failure to read breaks the connection.
+  // The next message, with the ones that can come at any time dealt with on the way. A failure to
+  // read breaks the connection.
   private receive() -> Result[Message, PgError]
     while true
       val m = reader.next() match
@@ -761,8 +807,25 @@ class Connection(
           broken = true
           return Err(e)
       heard = monotonic()
-      if !aside(m) then return Ok(m)
+      if !asynchronous(m) then return Ok(m)
     Err(Protocol("unreachable"))
+
+  // Deals with `m` where it is a message that can come at any time, and answers whether it was: a
+  // notice goes to the configuration's sink, a parameter's new value is kept, a notification goes to
+  // the configuration's hook, each dropped where there is none.
+  private asynchronous(m: Message) -> bool = m.kind match
+    'N' ->
+      if config.notices is Some(sink) then sink(diagnosticOf(m))
+      true
+    'S' ->
+      val r = In(m.body)
+      val name = r.cstring()
+      parameters = parameters.updated(name, r.cstring())
+      true
+    'A' ->
+      if config.notifications is Some(hook) then hook(notificationOf(m))
+      true
+    _ -> false
 
   // Sends `out` and reads the answer up to ReadyForQuery, giving each message other than an error to
   // `handle` with whether an error has already come. The first error is the answer; a protocol

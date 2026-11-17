@@ -52,6 +52,10 @@ data TargetSessionAttrs
 //   transaction to another server connection: no statement is prepared under a name, each statement
 //   is parsed, bound and run unnamed in one round trip with its rows sent as text, and nothing is
 //   cached. `prepare` is refused.
+// - `notifications` receives each notification a connection reads while it runs a statement or
+//   checks, between requests, that the server has not ended the session, on the thread doing so;
+//   without it they are dropped. `Connection.waitForNotification` answers those that arrive while
+//   the connection is idle, and a `Listener` delivers every one.
 // - `queryTracer`, `prepareTracer`, `connectTracer`, `batchTracer` and `poolTracer` watch what
 //   connections made with these settings do, and what a pool made with them does (`tracing.avin`).
 //   `traceParameters` hands a query tracer the parameters' values too; without it a tracer sees
@@ -68,6 +72,7 @@ data PgConfig(
     connectTimeout: Option[Duration] = None,
     statementCacheSize: int = 100,
     notices: Option[@sendable (Diagnostic) -> unit] = None,
+    notifications: Option[@sendable (Notification) -> unit] = None,
     queryTracer: Option[QueryTracer] = None,
     prepareTracer: Option[PrepareTracer] = None,
     connectTracer: Option[ConnectTracer] = None,

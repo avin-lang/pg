@@ -1,0 +1,80 @@
+module tests
+
+// The README's LISTEN and NOTIFY examples, against the test server: a listener's events, delivery to
+// an actor, and an ordinary connection's hook and wait.
+
+import avin.actors.{ActorRef, spawn}
+import avin.threads.{Mutex, Promise}
+import avin.time.seconds
+import dev.avinlang.pg
+import dev.avinlang.pg.{ListenEvent, Listener, Notified, PgConfig, PgError}
+
+@test("the README's listener: a notification on a channel listened to, and one added at run time")
+readmeListener() -> Result[unit, PgError]
+  val url = testUrl() match
+    Some(u) -> u
+    None -> return Ok(())
+  val config = PgConfig.parse(url)?
+  val db = pg.connect(config)?
+  val listener = Listener.open(config, ["orders"])?
+  listener.listen("refunds")?
+  db.execute("select pg_notify('orders', $1)", "order 42")?
+  val line = listener.events.receive() match
+    Some(Notified(n)) -> s"${n.channel}: ${n.payload}"
+    _ -> ""
+  assertEq(line, "orders: order 42")
+  db.execute("select pg_notify('refunds', $1)", "refund 7")?
+  assert(listener.events.receive(seconds(10)) is Some(Notified(_)))
+  listener.close()
+  db.close()
+
+data ReadmeOrderMsg
+  Pg(event: ListenEvent, ack: ActorRef[unit])
+
+actor ReadmeOrders(done: Promise[int]) receives ReadmeOrderMsg
+  var seen = 0
+  receive
+    Pg(Notified(n), ack) ->
+      seen += 1
+      ack.tell(())
+      if seen == 3 then _ = done.complete(seen)
+    Pg(_, ack) -> ack.tell(())
+
+@test("the README's actor: each notification handled and acknowledged")
+readmeListenerActor() -> Result[unit, PgError]
+  val url = testUrl() match
+    Some(u) -> u
+    None -> return Ok(())
+  val config = PgConfig.parse(url)?
+  val done = Promise[int]()
+  val orders = spawn(ReadmeOrders(done))
+  val feed = Listener.toActor(config, ["orders"], orders, (e, ack) -> Pg(e, ack))?
+  val db = pg.connect(config)?
+  for i in 0 ..< 3
+    db.execute("select pg_notify('orders', $1)", s"order $i")?
+  assertEq(done.future.await(seconds(10)), Some(3))
+  feed.close()
+  db.close()
+
+@test("the README's connection: the hook during a statement, and a wait while idle")
+readmeWaitForNotification() -> Result[unit, PgError]
+  val url = testUrl() match
+    Some(u) -> u
+    None -> return Ok(())
+  val config = PgConfig.parse(url)?
+  val lines = Mutex(Buffer[string]())
+  val c = pg.connect(
+    config with {notifications = Some(n -> lines.with(b -> b.addOne(s"during a query: ${n.payload}")))}
+  )?
+  c.simpleQuery("listen jobs")?
+  val sender = pg.connect(config)?
+  sender.execute("select pg_notify('jobs', '1')")?
+  c.waitForNotification(seconds(30))? match
+    Some(n) -> lines.with(b -> b.addOne(s"job ${n.payload}"))
+    None -> lines.with(b -> b.addOne("no job within 30 seconds"))
+  // One sent while `c` is busy reaches the hook.
+  sender.execute("select pg_notify('jobs', '2')")?
+  c.query("select pg_sleep(0.2)")?
+  assertEq(lines.with(b -> b.toVector), ["job 1", "during a query: 2"])
+  sender.close()?
+  c.close()
