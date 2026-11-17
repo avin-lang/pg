@@ -162,12 +162,12 @@ db.execute("insert into users values ($1)", "ada@example.com") match
 
 The others: `Io` (the connection could not be made, broke or timed out), `Tls`, `TlsRefused`, `Auth`,
 `Protocol`, `BadColumn`, `Config`, `RolledBack`, `Closed`, `PoolTimedOut`, `PoolBusy`, `PoolClosed`,
-`NotSent` and `NoTarget`. A connection that broke is `isBroken`, and answers `Closed` from then on.
+`NotSent`, `NoTarget` and `DeadlinePassed` (see [Deadlines](#deadlines-and-the-request-id)). A connection that broke is `isBroken`, and answers `Closed` from then on.
 
 **What is safe to run again.** `e.safeToRetry` is true where the statement certainly never reached the
 server: `NotSent(failure)`, which a connection answers where the server had already ended its session
 (restarting, say) or the connection had broken before the statement was sent, and a pool answers
-where it could not make a connection; and `Closed`. Any other failure may have come after the server
+where it could not make a connection; `DeadlinePassed`; and `Closed`. Any other failure may have come after the server
 had the statement, so a statement that changes data may have run. Nothing in the driver runs a
 statement again by itself; a caller that wants to does it where `safeToRetry` allows:
 
@@ -396,6 +396,46 @@ import avin.threads.withTimeout
 import avin.time.seconds
 
 val r = withTimeout(seconds(2), _ -> db.query("select pg_sleep(60)"))   // None: cancelled
+```
+
+## Deadlines and the request id
+
+Every request keeps the deadline of the thread that runs it, set by `withDeadline` or `withTimeout`
+around the work (`avin.threads`), as a server bounds the time a request may take. Nothing is passed
+in: the driver reads the thread's request context. Where the deadline passes while the server is
+working, the thread is cancelled and the statement with it, as above, and `withDeadline` answers
+`DeadlineExceeded`. That holds for every call: statements, prepared statements, batches, COPY in and
+out, a transaction (rolled back), a pool's wait for a connection, and making a connection. The
+connection is left usable and goes back to its pool.
+
+```avin
+import avin.threads.withDeadline
+import avin.time.{now, seconds}
+
+val r = withDeadline(now() + seconds(2), _ -> db.query("select pg_sleep(60)"))
+// Err(DeadlineExceeded): the server stopped the statement, and the pool lends its connection again
+```
+
+A request started once the deadline has already passed (in a `defer` that runs after the work was
+cancelled, say) is not sent at all, no connection is asked of a pool or made, and it fails at once
+with `DeadlinePassed(deadline)`, for which `safeToRetry` is true. A body can meet it in the moment
+between its deadline passing and its cancellation landing, and return it, so `withDeadline` may answer
+`Ok(Err(DeadlinePassed(_)))` as well as `Err(DeadlineExceeded)`. The driver's own tidying after a
+cancellation, the rollback and the reset a pool does, runs whatever the deadline says.
+
+The threads a `withDeadline` body starts with its scope (`s.spawn`) keep its deadline, so they are
+cancelled with it. A plain `spawn`, a future and an actor do not: work they start runs to its end.
+
+A request id set under `pg.requestId` around the work reaches every tracer: each start and end
+event carries it as `requestId`, `None` where none is set, and the slow-query log writes it in its
+line, so a trace can be tied to its request. A plain `spawn` and a future take it too; an actor's
+turn does not.
+
+```avin
+import avin.threads.withValue
+
+withValue(pg.requestId, "r-17", () -> db.query("select pg_sleep(1)"))
+// slow query for request r-17: 1.002s on backend 4242, 1 rows: select pg_sleep(1)
 ```
 
 ## LISTEN and NOTIFY

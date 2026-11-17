@@ -1,0 +1,572 @@
+module tests
+
+// Deadlines from the request context: a request started once its thread's deadline has passed is
+// not sent; one under way when the deadline passes is cancelled on the server and the connection goes
+// on, for statements, prepared statements, batches, COPY in and out, transactions, a pool's wait and
+// a connection being made; nested deadlines, the threads that take a deadline and those that do not;
+// and the request id the tracers report.
+
+import avin.threads.{Context, Key, Mutex, scope, sleep, spawn, withDeadline, withValue}
+import avin.threads.Channel
+import avin.time.{Duration, Instant, millis, monotonic, now, seconds}
+import dev.avinlang.pg
+
+import dev.avinlang.pg.{
+  Batch, BatchEnd, BatchQuery, BatchSpan, BatchStart, BatchTracer, Connection, DeadlinePassed, Independent, PgConfig,
+  PgError, PgPool, SlowQueryLog, SslMode, ToPg
+}
+
+// ---- Helpers ----
+
+// What `request` answers when it is started just after the calling thread's deadline has passed: in a
+// `defer` of a `withDeadline` body the deadline cancelled, where no wait is stopped, so the request
+// meets the passed deadline itself. Also answers the deadline.
+private lateRequest[T: Sendable](request: () -> T) -> (T, Instant)
+  val got = Mutex(None: Option[T])
+  val deadline = now() + millis(30)
+  val r = withDeadline(deadline, _ ->
+    defer
+      sleep(millis(5))
+      got.set(Some(request()))
+    sleep(seconds(30)))
+  assert(r.isErr)
+  (got.get().get, deadline)
+
+// Whether `r` failed because the deadline had passed before it was sent, at `deadline`.
+private passed[T](r: Result[T, PgError], deadline: Instant) -> bool = r match
+  Err(DeadlinePassed(d)) -> d == deadline
+  _ -> false
+
+// Whether `r` is `withDeadline`'s answer for a deadline that passed.
+private exceeded[T, E: Error](r: Result[T, E]) -> bool = r match
+  Err(e) -> e.message == "deadline exceeded"
+  Ok(_) -> false
+
+// A table `name` with one int column `n`, freshly made, on a new connection.
+private deadlineTable(name: string) -> Option[Result[Connection, PgError]] = testConnection().map(r ->
+  val c = r?
+  c.simpleQuery(s"drop table if exists $name; create table $name (n int)")?
+  Ok(c))
+
+// ---- A request started after its deadline ----
+
+@test("every kind of request started after the deadline is not sent: DeadlinePassed, safe to retry")
+passedBeforeSend() -> Result[unit, PgError]
+  val c = deadlineTable("dl_late") match
+    Some(r) -> r?
+    None -> return Ok(())
+  val stmt = c.prepare("insert into dl_late values ($1)")?
+  val (q, d1) = lateRequest(() -> c.query("insert into dl_late values (1) returning n").map(rs -> rs.length))
+  assert(passed(q, d1))
+  val (e, d2) = lateRequest(() -> c.execute("insert into dl_late values (2)"))
+  assert(passed(e, d2))
+  val (p, d3) = lateRequest(() -> c.execute(stmt, 3))
+  assert(passed(p, d3))
+  val (s, d4) = lateRequest(() -> c.simpleQuery("insert into dl_late values (4)").map(rs -> rs.length))
+  assert(passed(s, d4))
+  val (b, d5) = lateRequest(() ->
+    c.sendBatch(Batch().queue("insert into dl_late values (5)").queue("select 1")).map(rs -> rs.results.length))
+  assert(passed(b, d5))
+  val rows: Vector[Vector[ToPg]] = [[6]]
+  val (cf, d6) = lateRequest(() -> c.copyFrom("dl_late", [], rows))
+  assert(passed(cf, d6))
+  val (pr, d7) = lateRequest(() -> c.prepare("select 7").map(st -> st.sql))
+  assert(passed(pr, d7))
+  val (qv, d8) = lateRequest(() -> c.queryValue[int]("select 8"))
+  assert(passed(qv, d8))
+  // The error says what happened, and that running the request again cannot run it twice.
+  val failure = q.err.get
+  assert(failure.safeToRetry)
+  assertEq(failure.message, "the deadline had passed before the request was sent")
+  assertEq(failure.code, None)
+  // Nothing reached the server, and the connection goes on as it was.
+  assert(!c.isBroken && !c.inTransaction)
+  assertEq(c.queryValue[long]("select count(*) from dl_late")?, long(0))
+  assertEq(c.execute(stmt, 9)?, long(1))
+  assertEq(c.queryValue[long]("select count(*) from dl_late")?, long(1))
+  c.simpleQuery("drop table dl_late")?
+  c.close()
+
+@test("a transaction started after the deadline runs nothing: its BEGIN is refused and its body never runs")
+passedTransaction() -> Result[unit, PgError]
+  val c = deadlineTable("dl_late_tx") match
+    Some(r) -> r?
+    None -> return Ok(())
+  val ran = Mutex(false)
+  val (r, d) = lateRequest(() -> c.transaction(tx ->
+    ran.set(true)
+    tx.execute("insert into dl_late_tx values (1)")))
+  assert(passed(r, d))
+  assert(!ran.get())
+  assert(!c.inTransaction && !c.isBroken)
+  assertEq(c.queryValue[long]("select count(*) from dl_late_tx")?, long(0))
+  c.simpleQuery("drop table dl_late_tx")?
+  c.close()
+
+@test("a deadline that passes before COMMIT is sent rolls the transaction back and answers DeadlinePassed")
+passedBeforeCommit() -> Result[unit, PgError]
+  val c = deadlineTable("dl_commit") match
+    Some(r) -> r?
+    None -> return Ok(())
+  val got = Mutex(None: Option[Result[long, PgError]])
+  val deadline = now() + millis(200)
+  // The body ends at once, before the deadline; its `defer` then runs the transaction, whose own waits
+  // no cancellation stops, so the deadline passes inside it, after BEGIN and the insert.
+  _ = withDeadline(deadline, _ ->
+    defer
+      got.set(Some(c.transaction(tx ->
+        val n = tx.execute("insert into dl_commit values (1)")?
+        sleep(millis(400))
+        Ok(n))))
+    ())
+  assert(passed(got.get().get, deadline))
+  assert(!c.inTransaction && !c.isBroken)
+  assertEq(c.queryValue[long]("select count(*) from dl_commit")?, long(0))
+  // A savepoint's RELEASE the same way: the inner work is rolled back, the outer transaction kept.
+  c.transaction(tx ->
+    tx.execute("insert into dl_commit values (10)")?
+    val late = Mutex(None: Option[Result[long, PgError]])
+    val inner = now() + millis(200)
+    _ = withDeadline(inner, _ ->
+      defer
+        late.set(Some(tx.transaction(sp ->
+          val n = sp.execute("insert into dl_commit values (11)")?
+          sleep(millis(400))
+          Ok(n))))
+      ())
+    assert(passed(late.get().get, inner))
+    Ok(()))?
+  assertEq(c.query("select n from dl_commit order by n")?.map(r -> r.get[int](0).ok), [Some(10)])
+  c.simpleQuery("drop table dl_commit")?
+  c.close()
+
+@test("with no deadline nothing changes: no remaining time, and a statement runs as long as it takes")
+noDeadline() -> Result[unit, PgError]
+  val c = testConnection() match
+    Some(r) -> r?
+    None -> return Ok(())
+  assertEq(Context.current().remaining(), None)
+  assertEq(Context.current().deadline, None)
+  assertEq(c.queryValue[string]("select pg_sleep(0.3)::text")?, "")
+  // A deadline far enough off changes nothing either.
+  assertEq(withDeadline(now() + seconds(30), _ -> c.queryValue[int]("select 1")).ok, Some(Ok(1)))
+  c.close()
+
+// ---- A deadline passing while the server works ----
+
+@test("a deadline passing mid-statement cancels it on the server, for each kind of call, and the connection goes on")
+midStatement() -> Result[unit, PgError]
+  val c = testConnection() match
+    Some(r) -> r?
+    None -> return Ok(())
+  val pid = c.backendPid
+  val stmt = c.prepare("select pg_sleep($1)")?
+  val calls: Vector[(Connection) -> bool] = [
+    x -> x.query("select pg_sleep(30)").isOk,
+    x -> x.queryValue[string]("select pg_sleep(30)::text").isOk,
+    x -> x.execute("select pg_sleep(30)").isOk,
+    x -> x.query(stmt, 30.0).isOk,
+    x -> x.simpleQuery("select 1; select pg_sleep(30)").isOk
+  ]
+  for call in calls
+    val began = monotonic()
+    assert(exceeded(withDeadline(now() + millis(300), _ -> call(c))))
+    // Cancelled on the server: the connection answers at once, not after the statement's 30 s.
+    assert(monotonic() - began < seconds(10))
+    assert(!c.isBroken && !c.inTransaction)
+    assertEq(c.queryValue[int]("select 1")?, 1)
+  // The same server session throughout: nothing was reconnected.
+  assertEq(c.backendPid, pid)
+  assertEq(
+    c.queryValue[long](
+      "select count(*) from pg_stat_activity where query like '%pg_sleep(30)%' and pid <> pg_backend_pid() and state = 'active'"
+    )?,
+    long(0)
+  )
+  c.close()
+
+@test("a deadline passing inside a transaction aborts it: nothing it did is kept, and the connection goes on")
+midTransaction() -> Result[unit, PgError]
+  val c = deadlineTable("dl_tx") match
+    Some(r) -> r?
+    None -> return Ok(())
+  assert(exceeded(withDeadline(now() + millis(300), _ -> c.transaction(tx ->
+    tx.execute("insert into dl_tx values (1)")?
+    tx.execute("select pg_sleep(30)")))))
+  assert(!c.inTransaction && !c.isBroken)
+  assertEq(c.queryValue[long]("select count(*) from dl_tx")?, long(0))
+  // Nested: the savepoint and the transaction around it both go.
+  assert(exceeded(withDeadline(now() + millis(300), _ -> c.transaction(tx ->
+    tx.execute("insert into dl_tx values (2)")?
+    tx.transaction(sp ->
+      sp.execute("insert into dl_tx values (3)")?
+      sp.execute("select pg_sleep(30)"))))))
+  assert(!c.inTransaction && !c.isBroken)
+  assertEq(c.queryValue[long]("select count(*) from dl_tx")?, long(0))
+  // A deadline set inside the transaction, around one statement: the transaction is rolled back.
+  _ = c.transaction(tx ->
+    tx.execute("insert into dl_tx values (4)")?
+    assert(exceeded(withDeadline(now() + millis(300), _ -> tx.execute("select pg_sleep(30)"))))
+    Ok(()))
+  assert(!c.inTransaction && !c.isBroken)
+  assertEq(c.execute("insert into dl_tx values (5)")?, long(1))
+  assertEq(c.queryValue[long]("select count(*) from dl_tx")?, long(1))
+  c.simpleQuery("drop table dl_tx")?
+  c.close()
+
+@test("a deadline passing mid-batch cancels the batch in either mode, and the connection goes on")
+midBatch() -> Result[unit, PgError]
+  val c = deadlineTable("dl_batch") match
+    Some(r) -> r?
+    None -> return Ok(())
+  // Atomic: what ran before the sleep is rolled back with it.
+  val b = Batch().queue(
+    "insert into dl_batch values (1)"
+  ).queue("select pg_sleep(30)").queue("insert into dl_batch values (2)")
+  assert(exceeded(withDeadline(now() + millis(300), _ -> c.sendBatch(b))))
+  assert(!c.isBroken && !c.inTransaction)
+  assertEq(c.queryValue[long]("select count(*) from dl_batch")?, long(0))
+  // Independent: the statement before the sleep was its own transaction and is kept. The one after
+  // it is a transaction of its own too, already sent with its own Sync: the CancelRequest stops the
+  // statement the server is running, so the server goes on to run it, as it does under pgx.
+  assert(exceeded(withDeadline(now() + millis(300), _ -> c.sendBatch(b, Independent))))
+  assert(!c.isBroken && !c.inTransaction)
+  assertEq(c.query("select n from dl_batch order by n")?.map(r -> r.get[int](0).ok), [Some(1), Some(2)])
+  c.execute("truncate dl_batch")?
+  // A batch large enough to be written by a thread of its own.
+  var big = Batch().queue("select pg_sleep(30)")
+  for i in 0 ..< 20000
+    big = big.queue("insert into dl_batch values ($1)", i)
+  assert(exceeded(withDeadline(now() + millis(300), _ -> c.sendBatch(big))))
+  // Atomic, so nothing after the cancelled statement ran; a cancellation in the middle of the
+  // writing thread's write may break the connection instead, which is not used then.
+  val d = if c.isBroken then testConnection().get? else c
+  assertEq(d.queryValue[long]("select count(*) from dl_batch")?, long(0))
+  d.simpleQuery("drop table dl_batch")?
+  _ = c.close()
+  d.close()
+
+@test("a deadline passing mid-COPY, in from a stalled source or out to a slow sink, leaves the connection usable")
+midCopy() -> Result[unit, PgError]
+  val c = deadlineTable("dl_copy") match
+    Some(r) -> r?
+    None -> return Ok(())
+  // In, from a channel that stalls after some rows.
+  val rows = Channel[Vector[ToPg]](16)
+  scope(s ->
+    s.spawn(() ->
+      for i in 0 ..< 70000
+        rows.send([i])
+      ())
+    assert(exceeded(withDeadline(now() + millis(500), _ -> c.copyFrom("dl_copy", [], rows))))
+    rows.close())
+  assert(!c.isBroken)
+  assertEq(c.queryValue[long]("select count(*) from dl_copy")?, long(0))
+  // In, from a reader that blocks.
+  assert(exceeded(withDeadline(now() + millis(300), _ -> c.copyIn("copy dl_copy from stdin", SlowReader()))))
+  assert(!c.isBroken)
+  assertEq(c.queryValue[long]("select count(*) from dl_copy")?, long(0))
+  // Out, to a row function that is slow.
+  c.execute("insert into dl_copy select generate_series(1, 100000)")?
+  var seen = 0
+  assert(exceeded(withDeadline(now() + millis(300), _ -> c.copyTo("select n from dl_copy", _ ->
+    seen += 1
+    if seen % 1000 == 0 then sleep(millis(20))
+    Ok(())))))
+  assert(0 < seen < 100000)
+  assert(!c.isBroken && !c.inTransaction)
+  // Out, raw, to a sink that is slow.
+  var chunks = 0
+  assert(exceeded(withDeadline(now() + millis(300), _ -> c.copyOut("copy dl_copy to stdout", _ ->
+    chunks += 1
+    sleep(millis(50))
+    Ok(())))))
+  assert(!c.isBroken && !c.inTransaction)
+  assertEq(c.queryValue[long]("select count(*) from dl_copy")?, long(100000))
+  c.simpleQuery("drop table dl_copy")?
+  c.close()
+
+@test("nested deadlines: the sooner wins, whether it is the outer or the inner one")
+nestedDeadlines() -> Result[unit, PgError]
+  val c = testConnection() match
+    Some(r) -> r?
+    None -> return Ok(())
+  // The outer is sooner: the inner, later one cannot buy the statement more time.
+  val outer = now() + millis(300)
+  val seen = Mutex(None: Option[Instant])
+  val began = monotonic()
+  val r = withDeadline(outer, _ ->
+    withDeadline(now() + seconds(30), _ ->
+      seen.set(Context.current().deadline)
+      c.query("select pg_sleep(30)").isOk))
+  assert(exceeded(r))
+  assert(monotonic() - began < seconds(10))
+  assertEq(seen.get(), Some(outer))
+  assertEq(c.queryValue[int]("select 1")?, 1)
+  // The inner is sooner: it ends the statement, and the outer goes on.
+  val inner = withDeadline(now() + seconds(30), _ ->
+    val first = withDeadline(now() + millis(300), _ -> c.query("select pg_sleep(30)").isOk)
+    (exceeded(first), c.queryValue[int]("select 2").ok))
+  assertEq(inner.ok, Some((true, Some(2))))
+  c.close()
+
+// ---- Pools ----
+
+@test("a pooled statement whose deadline passes is cancelled and its connection goes back to the pool to be lent again")
+pooledStatement() -> Result[unit, PgError]
+  val url = testUrl() match
+    Some(u) -> u
+    None -> return Ok(())
+  val db = PgPool.open(url, maxSize = 1)?
+  val pid = db.use(c -> Ok(c.backendPid))?
+  assert(exceeded(withDeadline(now() + millis(300), _ -> db.query("select pg_sleep(30)"))))
+  assert(exceeded(withDeadline(now() + millis(300), _ -> db.transaction(tx -> tx.execute("select pg_sleep(30)")))))
+  assertEq(db.use(c -> Ok((c.backendPid, c.inTransaction)))?, (pid, false))
+  val stats = db.stats()
+  assertEq((stats.created, stats.destroyed), (long(1), long(0)))
+  db.close()
+  Ok(())
+
+@test("a wait for a pooled connection ends at the deadline, and one asked for after it fails at once")
+poolAcquire() -> Result[unit, PgError]
+  val url = testUrl() match
+    Some(u) -> u
+    None -> return Ok(())
+  val db = PgPool.open(url, maxSize = 1)?
+  val held = Channel[unit](1)
+  val release = Channel[unit](1)
+  scope(s ->
+    s.spawn(() -> db.use(c ->
+      held.send(())
+      _ = release.receive()
+      Ok(())))
+    _ = held.receive()
+    val began = monotonic()
+    assert(exceeded(withDeadline(now() + millis(300), _ -> db.query("select 1"))))
+    assert(monotonic() - began < seconds(10))
+    assertEq(db.stats().waiting, 0)
+    release.send(()))
+  // After the deadline nothing is asked of the pool.
+  val before = db.stats().acquires
+  val (r, d) = lateRequest(() -> db.query("select 1").map(rs -> rs.length))
+  assert(passed(r, d))
+  assertEq(db.stats().acquires, before)
+  assertEq(db.query("select 1")?.length, 1)
+  db.close()
+  Ok(())
+
+@test("many threads under deadlines share a pool: the late ones cancelled, the rest answered, every connection kept")
+manyUnderDeadlines() -> Result[unit, PgError]
+  val url = testUrl() match
+    Some(u) -> u
+    None -> return Ok(())
+  val db = PgPool.open(url, maxSize = 8)?
+  val outcomes = scope(s ->
+    val threads = (0 ..< 200).map(i -> s.spawn(() ->
+      if i % 2 == 0
+        val r = withDeadline(now() + millis(long(50 + i)), _ -> db.query("select pg_sleep(2)").map(_ -> 0))
+        // With many threads runnable a deadline can pass a moment before its cancellation lands: a
+        // request started in that moment is refused, and the body returns its refusal in time.
+        val refused = r match
+          Ok(Err(DeadlinePassed(_))) -> true
+          _ -> false
+        if exceeded(r) || refused then "" else s"$i: $r"
+      else
+        val r = withDeadline(now() + seconds(60), _ -> db.use(c -> c.queryValue[int]("select $1::int4", i)))
+        if r.ok == Some(Ok(i)) then "" else s"$i: $r"))
+    threads.map(t -> t.join()))
+  assertEq(outcomes.filter(o -> o != ""), [])
+  val stats = db.stats()
+  assertEq(stats.destroyed, long(0))
+  assert(stats.created <= long(8))
+  // Every connection is usable: eight statements at once, each on its own connection.
+  val answers = scope(s ->
+    val threads = (0 ..< 8).map(_ -> s.spawn(() -> db.query("select 1 from pg_sleep(0.2)").isOk))
+    threads.map(t -> t.join()))
+  assertEq(answers.count(a -> a), 8)
+  db.close()
+  Ok(())
+
+// ---- Connecting ----
+
+@test("connect under a deadline: an address that never answers and a server that never authenticates end at it")
+connectUnderDeadline() -> Result[unit, PgError]
+  val began = monotonic()
+  assert(exceeded(withDeadline(now() + millis(300), _ ->
+    pg.connect(PgConfig(host = unanswered, sslMode = SslMode.Disable)).isOk)))
+  assert(monotonic() - began < seconds(5))
+  assert(
+    exceeded(withServer([ReadUntyped], port -> withDeadline(now() + millis(300), _ -> pg.connect(config(port)).isOk)))
+  )
+  // A deadline sooner than the connectTimeout wins; a connectTimeout sooner than the deadline answers
+  // its own TimedOut.
+  val config = PgConfig(host = unanswered, sslMode = SslMode.Disable, connectTimeout = Some(seconds(20)))
+  assert(exceeded(withDeadline(now() + millis(300), _ -> pg.connect(config).isOk)))
+  val short = config with {connectTimeout = Some(millis(200))}
+  val timedOut = withDeadline(now() + seconds(20), _ -> isTimeout(pg.connect(short)))
+  assertEq(timedOut.ok, Some(true))
+  // After the deadline nothing is tried.
+  val (late, d) = lateRequest(() -> pg.connect(config).map(c -> c.backendPid))
+  assert(passed(late, d))
+  // A server that would answer is not tried either; with time left the connection is made.
+  val url = testUrl() match
+    Some(u) -> u
+    None -> return Ok(())
+  val (lateConnect, d2) = lateRequest(() -> pg.connect(url).map(c ->
+    _ = c.close()
+    c.backendPid))
+  assert(passed(lateConnect, d2))
+  val c = withDeadline(now() + seconds(30), _ -> pg.connect(url)).ok.get?
+  assertEq(c.queryValue[int]("select 1")?, 1)
+  c.close()
+
+// ---- Which threads take the deadline ----
+
+@test("a scope's threads take the deadline: every statement they run is cancelled with the body")
+scopeThreadsInherit() -> Result[unit, PgError]
+  val url = testUrl() match
+    Some(u) -> u
+    None -> return Ok(())
+  val db = PgPool.open(url, maxSize = 4)?
+  val deadlines = Mutex(Buffer[bool]())
+  val began = monotonic()
+  assert(exceeded(withDeadline(now() + millis(300), s ->
+    for _ in 0 ..< 4
+      s.spawn(() ->
+        val has = Context.current().remaining().isDefined
+        deadlines.with(b ->
+          b.addOne(has)
+          ())
+        db.query("select pg_sleep(30)"))
+    sleep(seconds(30)))))
+  assert(monotonic() - began < seconds(10))
+  assertEq(deadlines.with(b -> b.toVector), [true, true, true, true])
+  // The four connections were cancelled on the server and kept.
+  val answers = scope(s ->
+    val threads = (0 ..< 4).map(_ -> s.spawn(() -> db.query("select 1 from pg_sleep(0.1)").isOk))
+    threads.map(t -> t.join()))
+  assertEq(answers, [true, true, true, true])
+  assertEq(db.stats().destroyed, long(0))
+  db.close()
+  Ok(())
+
+@test("a plain spawn takes no deadline: its statement runs to completion after the body is cancelled")
+spawnDoesNotInherit() -> Result[unit, PgError]
+  val url = testUrl() match
+    Some(u) -> u
+    None -> return Ok(())
+  val db = PgPool.open(url, maxSize = 2)?
+  val out = Channel[(bool, Option[string])](1)
+  assert(exceeded(withDeadline(now() + millis(200), _ ->
+    _ = spawn(() ->
+      val free = Context.current().remaining().isEmpty
+      out.send((free, db.use(c -> c.queryValue[string]("select pg_sleep(0.6)::text")).ok)))
+    sleep(seconds(30)))))
+  assertEq(out.receive(), Some((true, Some(""))))
+  db.close()
+  Ok(())
+
+// ---- pgbouncer ----
+
+@test("under pgbouncer a deadline is kept the same way: refused after it, cancelled mid-statement")
+bouncerDeadlines() -> Result[unit, PgError]
+  val c = testUrl("sslmode=disable&pgbouncer=true") match
+    Some(u) -> pg.connect(u)?
+    None -> return Ok(())
+  val (r, d) = lateRequest(() -> c.queryValue[int]("select $1::int4", 1))
+  assert(passed(r, d))
+  assert(exceeded(withDeadline(now() + millis(300), _ -> c.query("select pg_sleep(30)"))))
+  assert(exceeded(withDeadline(now() + millis(300), _ -> c.transaction(tx -> tx.execute("select pg_sleep(30)")))))
+  assert(!c.isBroken && !c.inTransaction)
+  assertEq(c.queryValue[int]("select $1::int4", 7)?, 7)
+  assertEq(c.queryValue[int]("select count(*)::int4 from pg_prepared_statements")?, 0)
+  c.close()
+
+// ---- The request id ----
+
+@test("the request id reaches every tracer, on each start and end; none set reports none")
+requestIdTraced() -> Result[unit, PgError]
+  val r = Recorder()
+  val config = tracedConfig(r) match
+    Some(cr) -> cr?
+    None -> return Ok(())
+  val c = withValue(pg.requestId, "r-17", () -> pg.connect(config))?
+  withValue(pg.requestId, "r-18", () -> c.query("select $1::int4", 1))?
+  c.query("select 2")?
+  withValue(pg.requestId, "r-19", () -> c.transaction(tx -> tx.execute("select 3")))?
+  val starts = items(r.queryStarts).map(p -> (p.1.sql, p.1.requestId))
+  assertEq(
+    starts,
+    [
+      ("select $1::int4", Some("r-18")),
+      ("select 2", None),
+      ("BEGIN", Some("r-19")),
+      ("select 3", Some("r-19")),
+      ("COMMIT", Some("r-19"))
+    ]
+  )
+  assertEq(pairedEnds(r).map(e -> e.requestId), [Some("r-18"), None, Some("r-19"), Some("r-19"), Some("r-19")])
+  assertEq(items(r.prepareStarts).map(p -> p.1.requestId), [Some("r-18"), None, Some("r-19")])
+  assertEq(items(r.prepareEnds).map(p -> p.1.requestId), [Some("r-18"), None, Some("r-19")])
+  assertEq(items(r.connectStarts).map(p -> p.1.requestId), [Some("r-17")])
+  assertEq(items(r.connectEnds).map(p -> p.1.requestId), [Some("r-17")])
+  c.close()
+
+@test("the request id: an inner withValue shadows, another key of the same name is not it, a spawn takes it")
+requestIdScoping() -> Result[unit, PgError]
+  val r = Recorder()
+  val config = tracedConfig(r) match
+    Some(cr) -> cr?
+    None -> return Ok(())
+  val c = pg.connect(config)?
+  val lookalike = Key[string]("pg request id")
+  withValue(pg.requestId, "outer", () ->
+    withValue(pg.requestId, "inner", () -> c.query("select 1")))?
+  withValue(lookalike, "not pg's", () -> c.query("select 2"))?
+  // A plain spawn takes the values, though not the deadline.
+  val db = PgPool.of(config, maxSize = 1)
+  val done = Channel[bool](1)
+  withValue(pg.requestId, "spawned", () ->
+    _ = spawn(() -> done.send(db.query("select 3").isOk)))
+  assertEq(done.receive(), Some(true))
+  val ids = items(r.queryStarts).map(p -> (p.1.sql, p.1.requestId))
+  assertEq(ids, [("select 1", Some("inner")), ("select 2", None), ("select 3", Some("spawned"))])
+  assertEq(items(r.acquireEnds).map(p -> p.1.requestId), [Some("spawned")])
+  assertEq(items(r.releases).map(p -> p.1.requestId), [Some("spawned")])
+  db.close()
+  c.close()
+
+// A batch tracer that records the request id of each start and end.
+class BatchIds: Sendable
+  val seen = Mutex(Buffer[string]())
+
+impl BatchTracer for BatchIds
+  batchStart(e: BatchStart) -> BatchSpan
+    push(seen, s"start ${e.requestId.getOrElse("-")}")
+    self
+
+impl BatchSpan for BatchIds
+  batchQuery(e: BatchQuery) = ()
+  batchEnd(e: BatchEnd) = push(seen, s"end ${e.requestId.getOrElse("-")} ${e.cancelled}")
+
+@test("the request id reaches a batch tracer, a cancelled batch's end included, and the slow-query log's line")
+requestIdBatchAndSlowLog() -> Result[unit, PgError]
+  val url = testUrl() match
+    Some(u) -> u
+    None -> return Ok(())
+  val ids = BatchIds()
+  val lines = Mutex(Buffer[string]())
+  val log = SlowQueryLog(millis(100), line -> push(lines, line))
+  val c = pg.connect(PgConfig.parse(url)? with {batchTracer = Some(ids), queryTracer = Some(log)})?
+  withValue(pg.requestId, "b-1", () -> c.sendBatch(Batch().queue("select 1")))?
+  c.sendBatch(Batch().queue("select 2"))?
+  _ = withValue(pg.requestId, "b-2", () ->
+    withDeadline(now() + millis(300), _ -> c.sendBatch(Batch().queue("select pg_sleep(30)"))))
+  assertEq(items(ids.seen), ["start b-1", "end b-1 false", "start -", "end - false", "start b-2", "end b-2 true"])
+  withValue(pg.requestId, "s-9", () -> c.query("select pg_sleep(0.2)"))?
+  c.query("select pg_sleep(0.2)")?
+  val logged = items(lines)
+  assertEq(logged.length, 2)
+  assert(logged(0).startsWith("slow query for request s-9: "))
+  assert(logged(1).startsWith("slow query: "))
+  c.close()

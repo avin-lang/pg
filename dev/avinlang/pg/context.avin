@@ -1,0 +1,31 @@
+module dev.avinlang.pg
+
+// What the driver reads from the calling thread's request context (`avin.threads.Context`): the
+// deadline every request keeps, and the request id the tracers report.
+//
+// A deadline is kept by cancellation. Where it passes while a request waits for the server, for a
+// pooled connection or for a connection to be made, the thread is cancelled where it waits: a
+// statement is cancelled on the server (a CancelRequest), what the server still sends is read until
+// the connection is ready again, a transaction is rolled back, and the connection goes back to its
+// pool, while `withDeadline` answers `DeadlineExceeded`. A request started once the deadline has
+// already passed is not sent at all, and answers `DeadlinePassed`. The driver's own tidying after a
+// cancellation (draining, rolling back, readying a connection for its pool) runs whatever the
+// deadline says.
+
+import avin.threads.{Context, Key}
+
+// The key of the request id a program sets around the work of one request, which every tracer is told
+// with each operation the request makes, so a trace line can be tied to its request.
+//
+//     withValue(pg.requestId, "r-17", () -> db.query("select 1"))
+val requestId = Key[string]("pg request id")
+
+// The request id set around the calling thread's work, where one is.
+private currentRequestId() -> Option[string] = Context.current().value(requestId)
+
+// Fails with `DeadlinePassed` where the calling thread's deadline has already passed.
+private beforeDeadline() -> Result[unit, PgError]
+  val context = Context.current()
+  context.remaining() match
+    Some(left) if left.micros <= 0 -> Err(DeadlinePassed(context.deadline.get))
+    _ -> Ok(())

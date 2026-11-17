@@ -47,7 +47,7 @@ class PgPool(
     private val tracer: Option[PoolTracer] = None
 ): Sendable
   // Runs `f` with a connection lent to it, waiting for one for at most the pool's `acquireTimeout`,
-  // and answers what `f` answers.
+  // or until the calling thread's deadline, and answers what `f` answers.
   use[R: Sendable](@isolating f: (Connection) -> Result[R, PgError]) -> Result[R, PgError] = leased(None, f)
 
   // `use(f)`, waiting for a connection for at most `timeout`.
@@ -65,13 +65,17 @@ class PgPool(
   execute(sql: string, params: ToPg*) -> Result[long, PgError] = leased(None, c -> c.execute(sql, params*))
 
   // Lends a connection to `f`, waiting for at most `timeout`, or the pool's `acquireTimeout` where it
-  // is `None`.
+  // is `None`. Where the calling thread's deadline has already passed, nothing is asked of the pool, no
+  // tracer is told, and the answer is `DeadlinePassed`; one that passes while the caller waits cancels
+  // the wait.
   private leased[R: Sendable](
       timeout: Option[Duration],
       @isolating f: (Connection) -> Result[R, PgError]
-  ) -> Result[R, PgError] = tracer match
-    None -> flattened(leaseFor(timeout, l -> lent(l, f)))
-    Some(t) -> tracedLease(t, timeout, f)
+  ) -> Result[R, PgError]
+    beforeDeadline()?
+    tracer match
+      None -> flattened(leaseFor(timeout, l -> lent(l, f)))
+      Some(t) -> tracedLease(t, timeout, f)
 
   private leaseFor[R: Sendable](
       timeout: Option[Duration],
@@ -87,25 +91,26 @@ class PgPool(
       timeout: Option[Duration],
       @isolating f: (Connection) -> Result[R, PgError]
   ) -> Result[R, PgError]
+    val id = currentRequestId()
     val span = t.acquireStart()
     val asked = monotonic()
     // Set by the lease's body, which may capture only sendable values.
     val ended = AtomicCell(false)
     defer
-      if !ended.load() then span.acquireEnd(AcquireEnd(monotonic() - asked, 0, None, true))
+      if !ended.load() then span.acquireEnd(AcquireEnd(monotonic() - asked, 0, None, true, id))
     val result = leaseFor(timeout, l ->
       ended.store(true)
       val pid = l.resource.backendPid
-      span.acquireEnd(AcquireEnd(monotonic() - asked, pid, None, false))
+      span.acquireEnd(AcquireEnd(monotonic() - asked, pid, None, false, id))
       val since = monotonic()
-      defer span.released(Released(monotonic() - since, pid, l.isBroken))
+      defer span.released(Released(monotonic() - since, pid, l.isBroken, id))
       lent(l, f))
     result match
       Ok(inner) -> inner
       Err(e) ->
         ended.store(true)
         val failure = poolFailure(e)
-        span.acquireEnd(AcquireEnd(monotonic() - asked, 0, Some(failure), false))
+        span.acquireEnd(AcquireEnd(monotonic() - asked, 0, Some(failure), false, id))
         Err(failure)
 
   // Runs the statements of `batch` together on a pooled connection (`Connection.sendBatch`).

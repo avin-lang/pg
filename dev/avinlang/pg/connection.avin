@@ -114,6 +114,9 @@ class Connection(
   // When the server was last heard from, on the monotonic clock.
   private var heard = monotonic()
   private var auth: AuthMethod = Trust
+  // Set while the connection tidies itself up (a rollback, a reset, a ping), which runs whatever the
+  // calling thread's deadline says.
+  private var tidying = false
 
   // How the server had this connection authenticate.
   authMethod -> AuthMethod = auth
@@ -143,12 +146,12 @@ class Connection(
   // Makes a round trip to the server, an empty statement, waiting at most `timeout` for the answer;
   // a connection that fails it, or takes longer, is broken. A pool pings a connection that has been
   // idle a while before lending it.
-  ping(timeout: Duration) -> Result[unit, PgError]
+  ping(timeout: Duration) -> Result[unit, PgError] = tidily(() ->
     usable()?
     setTimeouts(timeout).mapErr(e -> Io(e))?
     val answered = simple("")
     if setTimeouts(Duration(0)).isErr then broken = true
-    answered
+    answered)
 
   // ---- Notifications ----
 
@@ -297,16 +300,28 @@ class Connection(
         if status == 'E'
           rollback(level)?
           return Err(RolledBack)
-        simple(if level == 0 then "COMMIT" else s"RELEASE SAVEPOINT $savepoint")?
-        Ok(v)
+        simple(if level == 0 then "COMMIT" else s"RELEASE SAVEPOINT $savepoint") match
+          Ok(_) -> Ok(v)
+          // A deadline passed before the commit was sent: the work is given up and rolled back.
+          Err(DeadlinePassed(d)) ->
+            _ = rollback(level)
+            Err(DeadlinePassed(d))
+          Err(e) -> Err(e)
       Err(e) ->
         _ = rollback(level)
         Err(e)
 
   // Rolls back the transaction or savepoint opened at `level`.
-  private rollback(level: int) -> Result[unit, PgError] =
+  private rollback(level: int) -> Result[unit, PgError] = tidily(() ->
     if level == 0 then simple("ROLLBACK")
-    else simple(s"ROLLBACK TO SAVEPOINT pg_savepoint_$level; RELEASE SAVEPOINT pg_savepoint_$level")
+    else simple(s"ROLLBACK TO SAVEPOINT pg_savepoint_$level; RELEASE SAVEPOINT pg_savepoint_$level"))
+
+  // Runs `body`, the connection tidying itself up, whatever the calling thread's deadline says.
+  private tidily[T](body: () -> T) -> T
+    val was = tidying
+    tidying = true
+    defer tidying = was
+    body()
 
   // After a cancellation inside a transaction: rolls back to before it, or gives the connection up.
   private abandon(level: int)
@@ -319,7 +334,7 @@ class Connection(
   reset() -> Result[unit, PgError]
     depth = 0
     if status == 'I' then return Ok(())
-    simple("ROLLBACK")
+    tidily(() -> simple("ROLLBACK"))
 
   // Whether the connection can be used at once: it is open, not broken, in no transaction, and the
   // server has not ended the session. What the server sent unasked is read, never waited for: a
@@ -810,6 +825,7 @@ class Connection(
       ended = None
       return Err(if found is Some(f) then NotSent(f) else Closed)
     if awaiting then return Ok(())
+    if !tidying then beforeDeadline()?
     drained() match
       Some(failure) ->
         ended = None
@@ -1192,10 +1208,13 @@ connect(url: string) -> Result[Connection, PgError] = Connection.connect(PgConfi
 connect(config: PgConfig) -> Result[Connection, PgError] = Connection.connect(config)
 
 object Connection
-  // A connection made with `config`, as the module's `connect` makes it.
-  connect(config: PgConfig) -> Result[Connection, PgError] = config.connectTracer match
-    None -> chosen(config)
-    Some(t) -> tracedConnect(t, config, () -> chosen(config))
+  // A connection made with `config`, as the module's `connect` makes it. Where the calling thread's
+  // deadline has already passed, nothing is tried and the answer is `DeadlinePassed`.
+  connect(config: PgConfig) -> Result[Connection, PgError]
+    beforeDeadline()?
+    config.connectTracer match
+      None -> chosen(config)
+      Some(t) -> tracedConnect(t, config, () -> chosen(config))
 
   // A connection to the first of the configuration's servers that connects, each within the
   // `connectTimeout`, and is of the kind its `targetSessionAttrs` asks for. Under `PreferStandby` the

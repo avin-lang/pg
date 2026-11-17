@@ -1,0 +1,49 @@
+module tests
+
+// The README's deadline and request-id examples, against the test server: a pooled statement past its
+// deadline cancelled and its connection lent again, a request started after the deadline not sent,
+// and a request id in the slow-query log's line.
+
+import avin.threads.{Mutex, sleep, withDeadline, withValue}
+import avin.time.{millis, now, seconds}
+import dev.avinlang.pg
+import dev.avinlang.pg.{DeadlinePassed, PgConfig, PgError, PgPool, SlowQueryLog}
+
+@test("the README's deadline: the statement cancelled, DeadlineExceeded, and the pool lends the connection again")
+readmeDeadline() -> Result[unit, PgError]
+  val url = testUrl() match
+    Some(u) -> u
+    None -> return Ok(())
+  val db = PgPool.open(url, maxSize = 1)?
+  val r = withDeadline(now() + seconds(2), _ -> db.query("select pg_sleep(60)"))
+  assertEq(r.err.map(e -> e.message), Some("deadline exceeded"))
+  assertEq(db.query("select 1")?.length, 1)
+  assertEq(db.stats().destroyed, long(0))
+  // Started after the deadline: not sent, safe to retry.
+  val late = Mutex(None: Option[Result[long, PgError]])
+  _ = withDeadline(now() + millis(50), _ ->
+    defer late.set(Some(db.execute("select 1")))
+    sleep(seconds(30)))
+  late.get().get match
+    Err(e) ->
+      assert(e is DeadlinePassed(_))
+      assert(e.safeToRetry)
+    Ok(_) -> assert(false, "sent after the deadline")
+  db.close()
+  Ok(())
+
+@test("the README's request id: the slow-query log names the request")
+readmeRequestId() -> Result[unit, PgError]
+  val url = testUrl() match
+    Some(u) -> u
+    None -> return Ok(())
+  val lines = Mutex(Buffer[string]())
+  val log = SlowQueryLog(millis(500), line -> push(lines, line))
+  val db = PgPool.of(PgConfig.parse(url)? with {queryTracer = Some(log)}, maxSize = 1)
+  withValue(pg.requestId, "r-17", () -> db.query("select pg_sleep(1)"))?
+  val logged = items(lines)
+  assertEq(logged.length, 1)
+  assert(logged(0).startsWith("slow query for request r-17: "))
+  assert(logged(0).endsWith(", 1 rows: select pg_sleep(1)"))
+  db.close()
+  Ok(())

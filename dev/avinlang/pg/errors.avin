@@ -2,6 +2,7 @@ module dev.avinlang.pg
 
 import avin.io.IoError
 import avin.net.tls.TlsError
+import avin.time.Instant
 
 // What the server says about an error or a notice: the fields of an `ErrorResponse` or a
 // `NoticeResponse`. `code` is the SQLSTATE (`23505` for a unique violation, `42601` for a syntax
@@ -74,6 +75,11 @@ data PgError
   // Connections were made, but none to a server of the kind the configuration's
   // `targetSessionAttrs` asks for.
   NoTarget(reason: string)
+  // The calling thread's deadline, set by `withDeadline` or `withTimeout` around it, had passed before
+  // the request was sent, so none of it reached the server and no connection was asked of a pool or
+  // made. A deadline that passes while a request is under way cancels the thread instead: the server
+  // is told to cancel the statement, and `withDeadline` answers `DeadlineExceeded`.
+  DeadlinePassed(deadline: Instant)
 
 impl PgError
   // The server's SQLSTATE where the server refused the statement, or `None` for any other failure.
@@ -83,11 +89,12 @@ impl PgError
     _ -> None
 
   // Whether the statement certainly did not reach the server, so that running it again, on another
-  // connection, cannot run it twice: `NotSent`, and `Closed`, which a connection answers once it is
-  // closed or broken. Any other failure may have come after the server had the statement, and a
-  // statement that changes data may then have run. Nothing here runs a statement again by itself.
+  // connection, cannot run it twice: `NotSent`, `DeadlinePassed`, and `Closed`, which a connection
+  // answers once it is closed or broken. Any other failure may have come after the server had the
+  // statement, and a statement that changes data may then have run. Nothing here runs a statement
+  // again by itself; after `DeadlinePassed` a retry needs a deadline of its own.
   safeToRetry -> bool = self match
-    NotSent(_) | Closed -> true
+    NotSent(_) | Closed | DeadlinePassed(_) -> true
     _ -> false
 
 impl Error for PgError
@@ -110,6 +117,7 @@ impl Error for PgError
     NoMoreResults -> "the batch has no more results"
     NotSent(e) -> s"the statement was not sent: ${e.message}"
     NoTarget(reason) -> s"no server of the kind asked for: $reason"
+    DeadlinePassed(_) -> "the deadline had passed before the request was sent"
 
   cause -> Option[Error] = self match
     Io(e) -> Some(e)

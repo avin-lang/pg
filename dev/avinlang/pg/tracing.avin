@@ -14,6 +14,9 @@ module dev.avinlang.pg
 // pool, and is told nothing it could use to run a statement on the connection being traced. A hook
 // set to `None`, the default, costs one test of the option. Hooks answer nothing, so nothing a hook
 // does can fail the operation it watches.
+//
+// Every event, start and end, carries `requestId`: the value set under `pg.requestId` around the
+// operation (`withValue(pg.requestId, id, …)`), read once as it starts, or `None` where none is set.
 
 import avin.time.{Duration, monotonic}
 
@@ -23,7 +26,13 @@ import avin.time.{Duration, monotonic}
 // will run it. `params` holds the parameters' values only where the configuration's
 // `traceParameters` is set; otherwise it is empty, so a tracer never sees a password or a token bound
 // as a parameter unless the program asks for them.
-data QueryStart(sql: string, paramCount: int, pid: int, params: Vector[PgValue] = [])
+data QueryStart(
+    sql: string,
+    paramCount: int,
+    pid: int,
+    params: Vector[PgValue] = [],
+    requestId: Option[string] = None
+)
 
 // A statement has finished: how long it took, the rows it returned or touched (the larger of the
 // rows read and the command tag's count), its command tag, and the error it failed with. Where the
@@ -36,7 +45,8 @@ data QueryEnd(
     rows: long,
     tag: string,
     error: Option[PgError],
-    cancelled: bool
+    cancelled: bool,
+    requestId: Option[string] = None
 )
 
 impl QueryEnd
@@ -57,7 +67,7 @@ trait QuerySpan: Sendable
 
 // A statement is about to be prepared under `name`, "" for an unnamed one: by `prepare`, or by the
 // statement cache on its first use.
-data PrepareStart(sql: string, name: string, pid: int)
+data PrepareStart(sql: string, name: string, pid: int, requestId: Option[string] = None)
 
 // A statement has been prepared, with `paramCount` parameters and `columnCount` columns, or failed
 // to be.
@@ -69,7 +79,8 @@ data PrepareEnd(
     paramCount: int,
     columnCount: int,
     error: Option[PgError],
-    cancelled: bool
+    cancelled: bool,
+    requestId: Option[string] = None
 )
 
 impl PrepareEnd
@@ -97,7 +108,7 @@ data AuthMethod
   ScramSha256
 
 // A connection is about to be made.
-data ConnectStart(host: string, port: int, user: string, database: string)
+data ConnectStart(host: string, port: int, user: string, database: string, requestId: Option[string] = None)
 
 // A connection has been made, or failed to be: how long it took, the server process serving it,
 // whether it is encrypted, and how it authenticated. A failed one has `pid` 0, `tls` false and no
@@ -112,7 +123,8 @@ data ConnectEnd(
     tls: bool,
     auth: Option[AuthMethod],
     error: Option[PgError],
-    cancelled: bool
+    cancelled: bool,
+    requestId: Option[string] = None
 )
 
 // Watches every connection made with the configuration, a pool's among them. Under `sslmode=prefer`
@@ -126,13 +138,20 @@ trait ConnectSpan: Sendable
 // ---- Batches ----
 
 // A batch of `size` statements is about to be sent in one round trip.
-data BatchStart(size: int, pid: int)
+data BatchStart(size: int, pid: int, requestId: Option[string] = None)
 
 // One statement of a batch has finished, as a `QueryEnd` says.
 data BatchQuery(sql: string, paramCount: int, rows: long, tag: string, error: Option[PgError])
 
 // The whole batch has finished.
-data BatchEnd(size: int, pid: int, duration: Duration, error: Option[PgError], cancelled: bool)
+data BatchEnd(
+    size: int,
+    pid: int,
+    duration: Duration,
+    error: Option[PgError],
+    cancelled: bool,
+    requestId: Option[string] = None
+)
 
 // Watches every batch a connection sends: told the batch starts, then each statement's outcome in
 // order, then the end.
@@ -148,11 +167,17 @@ trait BatchSpan: Sendable
 // A pool has lent a connection, after waiting `wait` for it, or failed to: `error` is `PoolTimedOut`,
 // `PoolClosed`, or why a new connection could not be made. Where the thread asking was cancelled
 // while it waited, `cancelled` is true.
-data AcquireEnd(wait: Duration, pid: int, error: Option[PgError], cancelled: bool)
+data AcquireEnd(
+    wait: Duration,
+    pid: int,
+    error: Option[PgError],
+    cancelled: bool,
+    requestId: Option[string] = None
+)
 
 // A lent connection has come back after `held`; `broken` says the pool let it go rather than keep
 // it.
-data Released(held: Duration, pid: int, broken: bool)
+data Released(held: Duration, pid: int, broken: bool, requestId: Option[string] = None)
 
 // Watches every connection a pool lends: `acquireStart` as a use asks for one, then `acquireEnd`
 // once it has one or has given up, then, where it had one, `released` once it is given back.
@@ -166,8 +191,9 @@ trait AcquireSpan: Sendable
 // ---- The slow-query log ----
 
 // A query tracer that writes a line to `sink` for each statement that takes `threshold` or longer,
-// failed or cancelled ones among them: its time, the server process, the rows, the SQLSTATE where it
-// failed, and its text. Parameter values are never written.
+// failed or cancelled ones among them: the request it ran for where `pg.requestId` is set, its time,
+// the server process, the rows, the SQLSTATE where it failed, and its text. Parameter values are
+// never written.
 //
 //     val config = PgConfig(queryTracer = Some(SlowQueryLog(250.millis, line -> log.warn(line))))
 data SlowQueryLog(threshold: Duration, sink: @sendable (string) -> unit = line -> eprintln(line))
@@ -185,7 +211,10 @@ private slowLine(e: QueryEnd) -> string
     None -> e.error match
       Some(err) -> s"failed: ${err.message}"
       None -> s"${e.rows} rows"
-  s"slow query: ${e.duration} on backend ${e.pid}, $outcome: ${e.sql}"
+  val request = e.requestId match
+    Some(id) -> s" for request $id"
+    None -> ""
+  s"slow query$request: ${e.duration} on backend ${e.pid}, $outcome: ${e.sql}"
 
 // ---- Several tracers as one ----
 
@@ -279,17 +308,18 @@ private tracedQuery[R](
     counted: (R) -> (long, string)
 ) -> Result[R, PgError]
   val n = params.length
-  val span = tracer.queryStart(QueryStart(sql, n, pid, if withValues then params.map(p -> p.value) else []))
+  val id = currentRequestId()
+  val span = tracer.queryStart(QueryStart(sql, n, pid, if withValues then params.map(p -> p.value) else [], id))
   val began = monotonic()
   var ended = false
   defer
-    if !ended then span.queryEnd(QueryEnd(sql, n, pid, monotonic() - began, 0, "", None, true))
+    if !ended then span.queryEnd(QueryEnd(sql, n, pid, monotonic() - began, 0, "", None, true, id))
   val result = body()
   ended = true
   val (rows, tag) = result match
     Ok(r) -> counted(r)
     Err(_) -> (long(0), "")
-  span.queryEnd(QueryEnd(sql, n, pid, monotonic() - began, rows, tag, result.err, false))
+  span.queryEnd(QueryEnd(sql, n, pid, monotonic() - began, rows, tag, result.err, false, id))
   result
 
 // A statement result's rows for a tracer: those read, or the command tag's count where that is more.
@@ -306,11 +336,12 @@ private tracedBatch(
     body: () -> Result[BatchResults, PgError]
 ) -> Result[BatchResults, PgError]
   val size = batch.items.length
-  val span = tracer.batchStart(BatchStart(size, pid))
+  val id = currentRequestId()
+  val span = tracer.batchStart(BatchStart(size, pid, id))
   val began = monotonic()
   var ended = false
   defer
-    if !ended then span.batchEnd(BatchEnd(size, pid, monotonic() - began, None, true))
+    if !ended then span.batchEnd(BatchEnd(size, pid, monotonic() - began, None, true, id))
   val result = body()
   ended = true
   val error = result match
@@ -323,7 +354,7 @@ private tracedBatch(
           Ok(r) -> BatchQuery(item.sql, n, rowsOf(r), r.tag, None)
           Err(e) -> BatchQuery(item.sql, n, 0, "", Some(e)))
       firstFailure(rs.results)
-  span.batchEnd(BatchEnd(size, pid, monotonic() - began, error, false))
+  span.batchEnd(BatchEnd(size, pid, monotonic() - began, error, false, id))
   result
 
 // The first statement's failure in `results`, passing over the `Skipped` ones: a statement that
@@ -344,17 +375,18 @@ private tracedPrepare(
     pid: int,
     body: () -> Result[Statement, PgError]
 ) -> Result[Statement, PgError]
-  val span = tracer.prepareStart(PrepareStart(sql, name, pid))
+  val id = currentRequestId()
+  val span = tracer.prepareStart(PrepareStart(sql, name, pid, id))
   val began = monotonic()
   var ended = false
   defer
-    if !ended then span.prepareEnd(PrepareEnd(sql, name, pid, monotonic() - began, 0, 0, None, true))
+    if !ended then span.prepareEnd(PrepareEnd(sql, name, pid, monotonic() - began, 0, 0, None, true, id))
   val result = body()
   ended = true
   val (params, columns) = result match
     Ok(s) -> (s.paramOids.length, s.columns.length)
     Err(_) -> (0, 0)
-  span.prepareEnd(PrepareEnd(sql, name, pid, monotonic() - began, params, columns, result.err, false))
+  span.prepareEnd(PrepareEnd(sql, name, pid, monotonic() - began, params, columns, result.err, false, id))
   result
 
 // Runs `body`, making a connection with `config`, between `tracer`'s start and end.
@@ -364,12 +396,13 @@ private tracedConnect(
     body: () -> Result[Connection, PgError]
 ) -> Result[Connection, PgError]
   val database = config.database.getOrElse(config.user)
-  val span = tracer.connectStart(ConnectStart(config.host, config.port, config.user, database))
+  val id = currentRequestId()
+  val span = tracer.connectStart(ConnectStart(config.host, config.port, config.user, database, id))
   val began = monotonic()
   var ended = false
   defer
     if !ended then span.connectEnd(
-      ConnectEnd(config.host, config.port, config.user, database, monotonic() - began, 0, false, None, None, true)
+      ConnectEnd(config.host, config.port, config.user, database, monotonic() - began, 0, false, None, None, true, id)
     )
   val result = body()
   ended = true
@@ -385,7 +418,8 @@ private tracedConnect(
       c.isTls,
       Some(c.authMethod),
       None,
-      false
+      false,
+      id
     )
-    Err(e) -> ConnectEnd(config.host, config.port, config.user, database, took, 0, false, None, Some(e), false))
+    Err(e) -> ConnectEnd(config.host, config.port, config.user, database, took, 0, false, None, Some(e), false, id))
   result

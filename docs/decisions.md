@@ -612,3 +612,70 @@ answers `Config`. **Review with the user**: `copyOut`'s sink answers `IoError` (
 because avin has no `Writer` trait to match `Reader`, so the sink is a function, `chunk ->
 file.write(chunk)`; a `Writer` trait in the standard library would let it take a file or a
 connection directly.
+
+## Deadlines come from the thread's request context and are kept by cancellation
+
+Settled on the user's delegation 2026-11-17. The driver takes no deadline or context parameter: every
+request keeps the deadline in the calling thread's request context (`avin.threads.Context`), set by
+`withDeadline` or `withTimeout` around the work. A deadline that passes while a request waits, for
+the server, for a pooled connection, or for a connection being made, cancels the thread where it
+waits (avin's rule), and the driver's existing cancellation path does the rest: a CancelRequest from
+a `defer`, the answer drained to every ReadyForQuery owed, a transaction rolled back, a COPY stopped
+with CopyFail or a CancelRequest, the connection handed back to its pool. The caller's answer is
+`withDeadline`'s `Err(DeadlineExceeded)`, not a `PgError`, because the body that would have
+returned the `PgError` was stopped. This is pgx's behaviour (a query under a context deadline is
+cancelled on the server and the caller gets the context's error) with avin's ambient context in
+place of pgx's `ctx` argument, so no signature changed. Alternatives weighed: a `deadline` argument
+on every call (pgx's shape; the tax the avin decision rejected); turning a cancellation into a
+`PgError` (the body is gone, so there is no one to return it to). **Review with the user**: in an
+`Independent` batch the CancelRequest stops the statement the server is running; statements queued
+after it, each its own transaction with its own Sync, were already sent and still run, as they do
+under pgx. Cancelling each of them too would take a CancelRequest per ReadyForQuery, which races the
+server moving on to the next statement.
+
+## A request started after its deadline is not sent: `DeadlinePassed`
+
+Settled on the user's delegation 2026-11-17. Before a request is sent (every statement, prepare,
+batch, COPY, a transaction's BEGIN and COMMIT), before a pool is asked for a connection, and before a
+connection is made, a deadline already passed fails the call at once with the new variant
+`DeadlinePassed(deadline: Instant)`, whose `safeToRetry` is true (nothing reached the server) and whose
+`code` is `None`. It is reached where a request starts after the cancellation, in a `defer` above
+all, and in the moment between the deadline and the cancellation landing. A COMMIT refused this way
+rolls the transaction (or savepoint) back, so the connection is not left inside a transaction the
+caller has given up. The driver's own tidying (rollback, `reset`, the pool's `ping`) runs regardless
+of the deadline, so a cancelled request's cleanup in a `defer` is never refused. A refused pool call
+tells no pool tracer, since nothing was asked of the pool. Alternatives weighed: `NotSent(...)` around
+an inner reason (`NotSent` means the connection had ended, which it had not); `Io(TimedOut)` (it
+reads as a network failure); no check, leaving it to the cancellation (a `defer` would then send
+statements whose deadline is long past).
+
+## `statement_timeout` is not sent from the deadline
+
+Settled on the user's delegation 2026-11-17. The CancelRequest is the deadline's enforcement on the
+server; no `SET statement_timeout` is sent from `remaining()`. Measured on the test server over
+loopback, 5000 statements a round, three rounds: `select 1` through the statement cache took 465-643
+ms, and the same preceded by its own `SET statement_timeout` 864-965 ms, a second round trip per
+statement (+80-90%); sent in the same simple-protocol message, `SET ...; select 1` took 451-473 ms
+against 419-482 ms for `select 1` alone, but the setting outlives the statement in the session, so
+it must be set again or reset for every statement (a statement that reads no deadline would inherit
+the last one), and under `pgbouncer` session state goes to whichever server connection the pooler
+hands the next transaction. The setting would add something only where the CancelRequest cannot
+reach the server, and there the connection is broken by the drain limit anyway. Alternatives
+weighed: an opt-in setting that pipelines `SET` with each statement (deferred until a program needs
+it); `SET LOCAL` inside transactions only (covers a fraction of statements).
+
+## The request id is pg's own key, and every trace event carries it
+
+Settled on the user's delegation 2026-11-17. `pg.requestId` is a module-level `Key[string]`; the
+value set under it around an operation (`withValue(pg.requestId, id, …)`) is read once as the
+operation starts and carried on every start and end event (`QueryStart`, `QueryEnd`, `PrepareStart`,
+`PrepareEnd`, `ConnectStart`, `ConnectEnd`, `BatchStart`, `BatchEnd`, `AcquireEnd`, `Released`) as
+`requestId: Option[string] = None`, a trailing field with a default so existing constructions still
+compile. The slow-query log writes `slow query for request <id>: …` where one is set. The pool's
+`acquireStart()` takes no event, so it is not told; its `AcquireEnd` is. Keys are told apart by
+identity, so a server framework's own request-id key is not pg's: the program sets pg's alongside its
+own. Alternatives weighed: tracers reading `Context.current()` themselves (they run on the operation's
+thread and can, but a span reported from a `defer` or by a shared tracer would each have to know
+to); a key the program hands to `PgConfig` (lets a framework's key be used directly; one more
+setting, and a key of another type would need converting). **Review with the user**: whether a
+`PgConfig.requestKey` should let a framework's own `Key[string]` be read instead.
