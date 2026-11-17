@@ -528,3 +528,59 @@ delivers it after the statement. `isHealthy`, which a pool asks before lending, 
 unasked the same way, so a notification that reached an idle pooled connection no longer makes it
 unfit and be discarded; where it finds the server's error it breaks the connection and keeps the
 failure, which the next request answers as `NotSent`, as if that request had found it.
+
+## COPY: four calls, typed rows in binary and raw bytes as they are
+
+Settled on the user's delegation 2026-11-16. `copyFrom(table, columns, rows)` and `copyTo(query,
+each)` (with `copyToAs[T]`) carry typed rows; `copyIn(sql, source)` and `copyOut(sql, sink)` carry a
+COPY statement's own bytes, so text, CSV and binary all go through them. pgx's `CopyFrom` and
+`CopyTo` are the model: its `CopyFrom` takes a table and columns and writes binary, its `CopyTo` takes
+the whole statement and a writer; `copyTo` with typed rows has no pgx counterpart and takes a query,
+since a COPY's output carries no column types and the client must describe the query first.
+`copyFrom`'s rows are an `Iterable[Vector[ToPg]]`, which a vector, an iterator and a `Channel` all
+are, so one signature serves eager rows, lazy ones and a producer thread. The table is asked for its
+column types with a Parse and Describe of `SELECT <columns> FROM <table>` on the unnamed statement,
+one round trip that leaves nothing prepared, which also suits `pgbouncer`; pgx does the same. Each
+value is encoded for its column's type, not its own, and one of another type is converted through
+its text as the server converts a parameter. **Review with the user**: the table and column names are
+quoted, each part of a dotted table name separately (a part already quoted is kept), so names are
+matched exactly, as pgx's `Identifier` does; a table whose name contains a dot must be written quoted.
+
+## COPY: binary where every column's type is known, text otherwise
+
+Settled on the user's delegation 2026-11-16. COPY's binary format has no per-column fallback, so
+`copyFrom` and `copyTo` use it only where the client writes and reads every column's type in binary,
+and COPY's text format otherwise (an `inet`, an enum, an `interval` column), values written with the
+same text a parameter's would be and read with the same decoding a text result's is. For that,
+`numeric` (base-10000 digits, weight, sign and display scale; NaN and the infinities read as
+`PgOther`, as in text), `time` (microseconds; `24:00:00` read as `PgOther`), `oid` and `"char"` gained
+binary encodings, and `numeric` and `time` binary decodings. Queries still ask for `numeric` and
+`time` in text, so their behaviour is unchanged.
+
+## COPY data goes in 64 KiB CopyData chunks; the source is read only as it is sent
+
+Settled on the user's delegation 2026-11-16. Rows are gathered into one CopyData message until it
+holds 64 KiB, then sent, so memory holds one chunk and one row whatever the row count (a million rows
+of three columns grew the process by 8 MB, taking 1.1 to 1.6 s against 6.1 s for the same rows as
+INSERTs in batches of 10,000, three rounds under `marshal run --exclusive`). The source, rows or a `Reader`, is read only after the chunk
+before has been written, and out of COPY the next message is read only once the sink or row
+function has answered, so back-pressure is the socket's in both directions. Between chunks the client
+reads, without waiting, anything the server has sent: in copy-in mode that can only be the error that
+ended it (the server then drops the rest and sends ReadyForQuery), so a constraint broken early stops
+the sending early rather than after the whole source.
+
+## COPY's failures leave the connection usable
+
+Settled on the user's delegation 2026-11-16. A client-side failure going in (a row of the wrong width,
+a value no conversion fits, a `Reader` error) sends CopyFail, whose message is the error's, and
+answers the client's error (`Config`, `Io`), not the server's acknowledgement of the CopyFail. A
+cancelled thread going in also sends CopyFail rather than a CancelRequest, because the server waiting
+for COPY data does not act on a cancel until data arrives; where COPY had not begun yet the answering
+CopyInResponse is answered with CopyFail. A sink or row function failing coming out sends a
+CancelRequest and drains what the server still sends, as a cancelled statement does, rather than
+closing the connection as pgx does. A statement given to `copyIn` or `copyOut` that is not that kind
+of COPY is run (a COPY FROM given to `copyOut` is answered with CopyFail so it cannot hang) and
+answers `Config`. **Review with the user**: `copyOut`'s sink answers `IoError` (wrapped as `Io`)
+because avin has no `Writer` trait to match `Reader`, so the sink is a function, `chunk ->
+file.write(chunk)`; a `Writer` trait in the standard library would let it take a file or a
+connection directly.

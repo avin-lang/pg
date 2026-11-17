@@ -1,0 +1,460 @@
+module dev.avinlang.pg
+
+// COPY: rows streamed into a table, and a query's rows streamed out, through the COPY sub-protocol.
+// `copyFrom` writes typed rows in COPY's binary format, `copyTo` reads them back the same way, and
+// `copyIn` and `copyOut` carry a COPY statement's bytes as they are, text or CSV, to and from the
+// program. Data goes a chunk at a time, so memory stays bounded whatever the number of rows.
+
+import avin.io.{IoError, Reader}
+import avin.time.Duration
+
+// How many bytes of COPY data go in one CopyData message: rows are gathered until a chunk holds at
+// least this many, then it is sent, so at most one chunk and one row are held at a time.
+private val CopyChunk = 65536
+
+// The binary format's signature, which begins its header.
+private val CopySignature: Vector[int] = [
+  int('P'),
+  int('G'),
+  int('C'),
+  int('O'),
+  int('P'),
+  int('Y'),
+  10,
+  255,
+  13,
+  10,
+  0
+]
+
+impl Connection
+  // ---- COPY ----
+
+  // Streams `rows` into `table`'s `columns` (every column, in order, where `columns` is empty) with
+  // `COPY … FROM STDIN`, and answers how many rows were copied. `rows` may be a vector, an iterator,
+  // or a `Channel` another thread sends rows to and closes at the end; it is read a row at a time as
+  // the data is sent, so only one chunk of data is held at once, however many rows there are.
+  //
+  // The table's column types are asked of the server first, and each value is written as its
+  // column's type: in COPY's binary format where the client writes every column's type in binary,
+  // and in its text format otherwise. A value of another type is converted as a parameter is (the
+  // string `"42"` for an `integer` column, an `int` for a `numeric` one). `table` may be qualified by
+  // its schema (`audit.events`); it and the column names are quoted, so they are matched exactly.
+  //
+  // A row with the wrong number of values, or a value that cannot be written as its column's type,
+  // stops the COPY: the client sends CopyFail, the server copies nothing, and the answer is a `Config`
+  // error naming the row (counting from 1) and the column. A value the server refuses, a constraint
+  // a row breaks, stops it too, and the answer is the server's error. Either way the connection can
+  // be used on; inside a transaction the transaction has failed, as after any failed statement.
+  // Where the thread is cancelled the COPY is stopped the same way.
+  //
+  // The configuration's `queryTracer` sees one statement, `COPY <table> (<columns>) FROM STDIN`, and
+  // the rows copied.
+  copyFrom(table: string, columns: Vector[string], rows: Iterable[Vector[ToPg]]) -> Result[long, PgError]
+    val quoted = quotedTable(table)
+    traceCopy(s"COPY $quoted${columnList(columns)} FROM STDIN", () -> copyRows(quoted, columns, rows))
+
+  private copyRows(quoted: string, columns: Vector[string], rows: Iterable[Vector[ToPg]]) -> Result[long, PgError]
+    usable()?
+    val names = if columns.isEmpty then "*" else columns.map(quotedName).mkString(", ")
+    val types = described(s"SELECT $names FROM $quoted")?
+    val binary = types.forall(c -> copiesBinary(c.typeOid))
+    val sql = s"COPY $quoted${columnList(columns)} FROM STDIN" + (if binary then " (FORMAT binary)" else "")
+    val source = rows.iterator()
+    var started = false
+    var n = 0
+    copyingIn(sql, out ->
+      if binary && !started
+        for b in CopySignature
+          out.byte1(b)
+        out.int32(0).int32(0)
+      started = true
+      while out.length < CopyChunk && source.hasNext()
+        val row = source.next()
+        n += 1
+        if row.length != types.length then return Err(
+          Config(s"row $n has ${row.length} values for ${types.length} columns")
+        )
+        if binary then binaryRowTo(out, types, row, n)? else textRowTo(out, types, row, n)?
+      if source.hasNext() then return Ok(true)
+      if binary then out.int16(-1)
+      Ok(false))
+
+  // Runs `sql`, a `COPY … FROM STDIN` statement, sending what `source` gives, a chunk at a time until
+  // it ends, as the statement's data, and answers how many rows the server copied. The data is
+  // sent as it is, so it is in the format the statement names: text, CSV (`WITH (FORMAT csv)`), or
+  // binary. A file, a connection or any other `Reader` is a source; the next chunk is read only once
+  // the last has been sent, so a slow server slows the reading.
+  //
+  // A read that fails stops the COPY with CopyFail and answers `Io`; the server refusing the data
+  // answers its error; either way the connection can be used on. A statement that is not a
+  // `COPY … FROM STDIN` is run and answers a `Config` error. The configuration's `queryTracer` sees
+  // `sql` and the rows copied.
+  copyIn(sql: string, source: Reader) -> Result[long, PgError] = traceCopy(sql, () ->
+    usable()?
+    copyingIn(sql, out ->
+      val chunk = source.read(CopyChunk).mapErr(e -> Io(e))?
+      out.rawArray(chunk)
+      Ok(chunk.length > 0)))
+
+  // Runs `sql`, a `COPY … TO STDOUT` statement, giving `sink` its data a chunk at a time, in order, as
+  // it arrives, and answers how many rows the server copied. The data is as the statement writes it:
+  // text, CSV or binary. The next chunk is read only once `sink` has answered, so a slow sink slows
+  // the server. Where `sink` answers an `Err`, the server is asked to cancel the COPY, what it still
+  // sends is read and dropped, and the answer is `Io` with the sink's error; the connection can be
+  // used on. The configuration's `queryTracer` sees `sql` and the rows copied.
+  copyOut(sql: string, sink: (Array[byte]) -> Result[unit, IoError]) -> Result[long, PgError] = traceCopy(sql, () ->
+    usable()?
+    copyingOut(sql, chunk -> sink(chunk).mapErr(e -> Io(e))))
+
+  // Runs `query` (a `SELECT`, `VALUES`, or `TABLE <name>`, with no parameters) with `COPY (…) TO
+  // STDOUT` and gives `each` its rows, each read as `query` would read it, in order, as they arrive;
+  // answers how many rows there were. Only one row is held at a time, so a query of any size can be
+  // read; the next row is read once `each` has answered. Rows come in COPY's binary format where the
+  // client reads every column's type in binary, and in its text format otherwise.
+  //
+  // Where `each` answers an `Err`, the server is asked to cancel the COPY, what it still sends is read
+  // and dropped, and the answer is that error; the connection can be used on. The configuration's
+  // `queryTracer` sees `COPY (<query>) TO STDOUT` and the rows copied.
+  copyTo(query: string, each: (Row) -> Result[unit, PgError]) -> Result[long, PgError] =
+    traceCopy(s"COPY ($query) TO STDOUT", () -> copyRowsOut(query, each))
+
+  // `copyTo`, each row read as a `T`, its fields from the columns of their names; a row that cannot be
+  // read as one stops the COPY as an `Err` from `each` does.
+  copyToAs[T: FromRow](query: string, each: (T) -> Result[unit, PgError]) -> Result[long, PgError] =
+    copyTo(query, row -> each(T.fromRow(row)?))
+
+  private copyRowsOut(query: string, each: (Row) -> Result[unit, PgError]) -> Result[long, PgError]
+    usable()?
+    val columns = described(query)?
+    val binary = columns.forall(c -> copiesBinary(c.typeOid))
+    val decoder = CopyDecoder(columns, binary)
+    val sql = s"COPY ($query) TO STDOUT" + (if binary then " (FORMAT binary)" else "")
+    copyingOut(sql, chunk ->
+      for row in decoder.rows(chunk)?
+        each(row)?
+      Ok(()))
+
+  // `body`, traced as one statement, `sql`, where the configuration has a `queryTracer`.
+  private traceCopy(sql: string, body: () -> Result[long, PgError]) -> Result[long, PgError] =
+    config.queryTracer match
+      None -> body()
+      Some(t) -> tracedQuery(t, sql, [], false, pid, body, n -> (n, s"COPY $n"))
+
+  // The columns `query`'s rows have, asked of the server with a Parse and a Describe of the unnamed
+  // statement, in one round trip, so nothing outlives it.
+  private described(query: string) -> Result[Vector[Column], PgError]
+    val out = Out()
+    out.begin('P').cstring("").cstring(query).int16(0).close()
+    out.begin('D').byte1(int('S')).cstring("").close()
+    out.begin('S').close()
+    var columns: Vector[Column] = []
+    exchange(out, (m, _) ->
+      m.kind match
+        '1' | 't' | 'n' -> ()
+        'T' -> columns = describe(m)?.map(c -> c.0)
+        _ -> return Err(Protocol(s"unexpected message `${m.kind}` answering Describe"))
+      Ok(()))?
+    Ok(columns)
+
+  // Runs `sql`, a `COPY … FROM STDIN`, `fill` putting each chunk of its data into an open CopyData
+  // message and answering whether more is to come, and answers the rows copied. An `Err` from `fill`
+  // stops the COPY with CopyFail and is the answer. Between chunks the client reads what the server
+  // has sent: an error there means it has stopped the COPY, so nothing more is sent. Where the thread
+  // is cancelled, CopyFail stops the COPY and the answer is read to its end, so the connection can be
+  // used on; a write cut in the middle breaks it.
+  private copyingIn(sql: string, fill: (Out) -> Result[bool, PgError]) -> Result[long, PgError]
+    awaiting = true
+    owed = 1
+    unsynced = false
+    // Whether the server is in COPY's copy-in mode, waiting for data from this end.
+    var copying = false
+    defer
+      if awaiting && !broken then abandonCopy(copying)
+    send(Out().begin('Q').cstring(sql).close())?
+    var failure: Option[PgError] = None
+    var other = false
+    var answered = false
+    while !copying && !answered
+      val m = receive()?
+      m.kind match
+        'G' -> copying = true
+        'E' -> if failure.isEmpty then failure = Some(Server(diagnosticOf(m)))
+        'Z' ->
+          status = char(In(m.body).byte1())
+          answered = true
+        // Copy-out data, or a query's: the statement is not a COPY FROM STDIN.
+        'T' | 'D' | 'C' | 'I' | 'H' | 'd' | 'c' -> other = true
+        _ -> return broke(Protocol(s"unexpected message `${m.kind}` answering COPY"))
+    var aborted: Option[PgError] = None
+    var tag = ""
+    if copying
+      var more = true
+      while more && failure.isEmpty && aborted.isEmpty
+        val out = Out().begin('d')
+        fill(out) match
+          Ok(m) -> more = m
+          Err(e) -> aborted = Some(e)
+        if out.length > 5 then send(out.close())?
+        while failure.isEmpty && (reader.pending || stream.readable())
+          val m = receive()?
+          if m.kind != 'E' then return broke(Protocol(s"unexpected message `${m.kind}` during COPY"))
+          failure = Some(Server(diagnosticOf(m)))
+      // After an error the server has left copy-in mode and sends ReadyForQuery unasked.
+      if failure.isEmpty
+        aborted match
+          Some(e) -> send(Out().begin('f').cstring(e.message).close())?
+          None -> send(Out().begin('c').close())?
+      copying = false
+    while !answered
+      val m = receive()?
+      m.kind match
+        'C' -> tag = In(m.body).cstring()
+        'E' -> if failure.isEmpty then failure = Some(Server(diagnosticOf(m)))
+        'Z' ->
+          status = char(In(m.body).byte1())
+          answered = true
+        _ -> return broke(Protocol(s"unexpected message `${m.kind}` ending COPY"))
+    owed = 0
+    awaiting = false
+    if aborted is Some(e) then return Err(e)
+    if failure is Some(e) then return Err(e)
+    if other then return Err(Config("the statement is not a COPY … FROM STDIN"))
+    Ok(affectedBy(tag))
+
+  // A COPY FROM STDIN left by a cancelled thread: ends copy-in mode with CopyFail, or answers it with
+  // CopyFail where it has not begun yet, then reads the answer to its ReadyForQuery, waiting at most
+  // `DrainLimit` for each read. A write cut in the middle, or a read that fails, breaks the connection.
+  private abandonCopy(copying: bool)
+    awaiting = false
+    if writing
+      writing = false
+      broken = true
+      return
+    _ = stream.setTimeout(DrainLimit)
+    val fail = Out().begin('f').cstring("the COPY was cancelled").close()
+    if copying && send(fail).isErr then return
+    var answered = false
+    while !broken && !answered
+      reader.next() match
+        Ok(m) ->
+          m.kind match
+            'G' -> if send(Out().begin('f').cstring("the COPY was cancelled").close()).isErr then return
+            'Z' ->
+              status = char(In(m.body).byte1())
+              answered = true
+            _ -> ()
+        Err(_) -> broken = true
+    owed = 0
+    if stream.setTimeout(Duration(0)).isErr then broken = true
+
+  // Runs `sql`, a `COPY … TO STDOUT`, giving `take` each chunk of its data, and answers the rows
+  // copied. The first `Err` from `take` asks the server to cancel the COPY; what it still sends is
+  // read and dropped, and that error is the answer. A statement that is not a COPY TO STDOUT is run
+  // (a COPY FROM STDIN is answered with CopyFail) and answers a `Config` error.
+  private copyingOut(sql: string, take: (Array[byte]) -> Result[unit, PgError]) -> Result[long, PgError]
+    val out = Out()
+    out.begin('Q').cstring(sql).close()
+    var tag = ""
+    var other = false
+    var stopped: Option[PgError] = None
+    val answer = exchange(out, (m, failed) ->
+      m.kind match
+        'H' | 'c' -> ()
+        'd' -> if !failed && stopped.isEmpty
+          take(m.body) match
+            Ok(_) -> ()
+            Err(e) ->
+              stopped = Some(e)
+              cancelRequest()
+        'C' -> tag = In(m.body).cstring()
+        'G' ->
+          other = true
+          send(Out().begin('f').cstring("the statement is not a COPY … TO STDOUT").close())?
+        'T' | 'D' | 'I' -> other = true
+        _ -> return Err(Protocol(s"unexpected message `${m.kind}` answering COPY"))
+      Ok(()))
+    if stopped is Some(e) then return Err(e)
+    answer?
+    if other then return Err(Config("the statement is not a COPY … TO STDOUT"))
+    Ok(affectedBy(tag))
+
+// Whether COPY carries values of type `oid` in binary: every type the client knows, `numeric` and
+// `time` included, since COPY has no text column to fall back to in the binary format.
+private copiesBinary(oid: int) -> bool = isKnown(oid) || isKnown(elementOf(oid))
+
+// A table's name, each part of a schema-qualified one quoted; a part already quoted is kept as it is.
+private quotedTable(table: string) -> string =
+  table.split(".").map(part -> if part.startsWith("\"") then part else quotedName(part)).mkString(".")
+
+// The parenthesised list of `columns`, or nothing for every column.
+private columnList(columns: Vector[string]) -> string =
+  if columns.isEmpty then "" else " (" + columns.map(quotedName).mkString(", ") + ")"
+
+// Writes `row`, the `n`th, to `out` as a tuple of COPY's binary format: the field count, then each
+// value's length and bytes, -1 for NULL.
+private binaryRowTo(out: Out, columns: Vector[Column], row: Vector[ToPg], n: int) -> Result[unit, PgError]
+  out.int16(columns.length)
+  var i = 0
+  while i < columns.length
+    val c = columns(i)
+    val v = row(i).toPg
+    if v == PgNull
+      out.int32(-1)
+    else
+      val bytes = copyBinary(c.typeOid, v).okOr(
+        Config(
+          s"row $n, column `${c.name}`: ${kindOf(v)} cannot be written as ${typeName(c.typeOid)}"
+        )
+      )?
+      out.int32(bytes.length).raw(bytes)
+    i += 1
+  Ok(())
+
+// `v` in binary as type `oid`; a value of another type is converted through its text, as the server
+// converts a parameter sent as text.
+private copyBinary(oid: int, v: PgValue) -> Option[Vector[byte]] = encodeBinary(oid, v) match
+  Some(bytes) -> Some(bytes)
+  None -> textOf(v).ok.flatMap(text -> textValue(oid, text)).flatMap(converted -> encodeBinary(oid, converted))
+
+// Writes `row`, the `n`th, to `out` as a line of COPY's text format: the values separated by tabs,
+// NULL written `\N`, and backslashes and line breaks escaped.
+private textRowTo(out: Out, columns: Vector[Column], row: Vector[ToPg], n: int) -> Result[unit, PgError]
+  var i = 0
+  while i < columns.length
+    if i > 0 then out.byte1(int('\t'))
+    val v = row(i).toPg
+    if v == PgNull
+      out.byte1(int('\\')).byte1(int('N'))
+    else
+      val text = textOf(v).mapErr(e -> Config(s"row $n, column `${columns(i).name}`: $e"))?
+      for b in text.bytes
+        escapedTo(out, int(b))
+    i += 1
+  out.byte1(int('\n'))
+  Ok(())
+
+// Writes the byte `b` of a value to `out`, a backslash, line feed, carriage return or tab escaped.
+private escapedTo(out: Out, b: int) -> Out
+escapedTo(out, 92) = out.byte1(92).byte1(92)
+escapedTo(out, 10) = out.byte1(92).byte1(int('n'))
+escapedTo(out, 13) = out.byte1(92).byte1(int('r'))
+escapedTo(out, 9) = out.byte1(92).byte1(int('t'))
+escapedTo(out, b) = out.byte1(b)
+
+// Reads the rows of a COPY TO STDOUT's data, in COPY's binary or text format, from chunks that may
+// end anywhere: what is left of a row at the end of a chunk is kept for the next.
+private class CopyDecoder(val columns: Vector[Column], val binary: bool)
+  private var pending: Array[byte] = Array.empty[byte]()
+  private var headed = !binary
+  private var ended = false
+
+  // The rows `chunk` completes.
+  rows(chunk: Array[byte]) -> Result[Vector[Row], PgError]
+    val data = if pending.length == 0 then chunk else joined(pending, chunk)
+    val out = Buffer[Row]()
+    var at = 0
+    var going = true
+    while going && at < data.length && !ended
+      val next = if binary then binaryTuple(data, at, out)? else textLine(data, at, out)?
+      if next < 0 then going = false else at = next
+    pending = if at >= data.length then Array.empty[byte]() else data.slice(at, data.length)
+    Ok(out.toVector)
+
+  // Reads the header, or one tuple, at `at`, adding a tuple's row to `out`; answers where the next
+  // begins, or -1 where `data` ends first.
+  private binaryTuple(data: Array[byte], at: int, out: Buffer[Row]) -> Result[int, PgError]
+    val r = In(data)
+    r.at = at
+    if !headed
+      if data.length - at < CopySignature.length + 8 then return Ok(-1)
+      var i = 0
+      while i < CopySignature.length
+        if r.byte1() != CopySignature(i) then return Err(Protocol("COPY's binary data has no signature"))
+        i += 1
+      r.int32()
+      val extension = r.int32()
+      if extension < 0 then return Err(Protocol("COPY's binary header is broken"))
+      r.bytes(extension)
+      if r.failed then return Ok(-1)
+      headed = true
+      return Ok(r.at)
+    val count = r.int16()
+    if r.failed then return Ok(-1)
+    if count == -1
+      ended = true
+      return Ok(r.at)
+    if count != columns.length then return Err(Protocol(s"a COPY row of $count values for ${columns.length} columns"))
+    val values = Buffer[PgValue]()
+    var i = 0
+    while i < count
+      val length = r.int32()
+      if length == -1
+        values.addOne(PgNull)
+      else
+        val bytes = r.bytes(length)
+        if r.failed then return Ok(-1)
+        val c = columns(i)
+        values.addOne(decodeBinary(c.typeOid, bytes).mapErr(e -> Protocol(s"column `${c.name}`: $e"))?)
+      if r.failed then return Ok(-1)
+      i += 1
+    out.addOne(Row(columns, values.toVector))
+    Ok(r.at)
+
+  // Reads one line of the text format at `at` into a row added to `out`; answers where the next
+  // begins, or -1 where `data` has no whole line left.
+  private textLine(data: Array[byte], at: int, out: Buffer[Row]) -> Result[int, PgError]
+    var end = at
+    while end < data.length && int(data(end)) != 10 do end += 1
+    if end >= data.length then return Ok(-1)
+    val values = Buffer[PgValue]()
+    var field = Buffer[byte]()
+    var isNull = false
+    var i = at
+    while i <= end
+      val b = if i < end then int(data(i)) else 9
+      if b == 9
+        if values.length >= columns.length then return Err(Protocol("a COPY line of too many values"))
+        val c = columns(values.length)
+        values.addOne(if isNull then PgNull else decodeText(c.typeOid, string.fromUtf8Lossy(field.toArray())))
+        field = Buffer[byte]()
+        isNull = false
+        i += 1
+      elif b == 92 && i + 1 < end
+        val e = int(data(i + 1))
+        if e == int('N') && field.isEmpty
+          isNull = true
+        else
+          field.addOne(byte(unescaped(e)))
+        i += 2
+      else
+        field.addOne(byte(b))
+        i += 1
+    if values.length != columns.length then return Err(
+      Protocol(s"a COPY line of ${values.length} values for ${columns.length} columns")
+    )
+    out.addOne(Row(columns, values.toVector))
+    Ok(end + 1)
+
+// The byte an escape `\c` stands for in COPY's text format.
+private unescaped(c: int) -> int
+unescaped(98) = 8
+unescaped(102) = 12
+unescaped(110) = 10
+unescaped(114) = 13
+unescaped(116) = 9
+unescaped(118) = 11
+unescaped(c) = c
+
+// `a` followed by `b`.
+private joined(a: Array[byte], b: Array[byte]) -> Array[byte]
+  val out = Array.fill(a.length + b.length, byte(0))
+  var i = 0
+  while i < a.length
+    out(i) = a(i)
+    i += 1
+  var j = 0
+  while j < b.length
+    out(a.length + j) = b(j)
+    j += 1
+  out

@@ -1,0 +1,62 @@
+module tests
+
+// The README's COPY examples, against the test server: rows in from a vector and from a producer
+// thread, rows out as a derived type, and CSV in from a file and out to one.
+
+import avin.fs
+import avin.threads.{Channel, scope}
+import avin.time.Instant
+import dev.avinlang.pg
+import dev.avinlang.pg.{FromRow, PgError, PgNull, ToPg}
+
+data Reading(sensor: int, value: real) derives FromRow
+
+@test("the README's COPY: rows from a vector and from a producer thread, read back with copyToAs")
+readmeCopyRows() -> Result[unit, PgError]
+  val db = testConnection() match
+    Some(r) -> r?
+    None -> return Ok(())
+  db.execute("create temporary table readings (sensor int, at timestamptz, value float8)")?
+  val rows: Vector[Vector[ToPg]] = [[1, Instant(1700000000000000), 20.5], [2, Instant(1700000000000000), PgNull]]
+  val n = db.copyFrom("readings", ["sensor", "at", "value"], rows)?
+  assertEq(n, long(2))
+  val feed = Channel[Vector[ToPg]](256)
+  val copied = scope(s ->
+    s.spawn(() ->
+      for i in 0 ..< 100000
+        feed.send([i % 10, Instant(1700000000000000 + long(i)), real(i)])
+      feed.close())
+    db.copyFrom("readings", [], feed))?
+  assertEq(copied, long(100000))
+  var total = 0.0
+  val m = db.copyToAs[Reading]("select sensor, value from readings where value is not null", r ->
+    total += r.value
+    Ok(()))?
+  assertEq(m, long(100001))
+  assertEq(total, 20.5 + 99999.0 * 100000.0 / 2.0)
+  db.close()
+
+@test("the README's COPY: CSV in from a file with copyIn, and out to a file with copyOut")
+readmeCopyFiles() -> Result[unit, PgError]
+  val db = testConnection() match
+    Some(r) -> r?
+    None -> return Ok(())
+  val dir = fs.tempDir("pg-copy").mapErr(e -> pg.Io(e))?
+  fs.writeText(
+    s"${dir.path}/readings.csv",
+    "sensor,at,value\n1,2024-01-01 00:00:00+00,1.5\n2,2024-01-02 00:00:00+00,\n"
+  )
+    .mapErr(e -> pg.Io(e))?
+  db.execute("create temporary table readings (sensor int, at timestamptz, value float8)")?
+  val file = fs.open(s"${dir.path}/readings.csv").mapErr(e -> pg.Io(e))?
+  val n = db.copyIn("copy readings from stdin (format csv, header true)", file)?
+  assertEq(n, long(2))
+  val out = fs.create(s"${dir.path}/backup.csv").mapErr(e -> pg.Io(e))?
+  db.copyOut("copy readings to stdout (format csv)", chunk -> out.write(chunk))?
+  _ = out.close()
+  assertEq(
+    fs.readText(s"${dir.path}/backup.csv").ok,
+    Some("1,2024-01-01 00:00:00+00,1.5\n2,2024-01-02 00:00:00+00,\n")
+  )
+  _ = dir.close()
+  db.close()

@@ -207,6 +207,12 @@ private decodeBinary(oid: int, bytes: Array[byte]) -> Result[PgValue, string]
     17 -> return Ok(PgBytes(bytes.toVector))
     2950 -> return Uuid.fromBytes(bytes.toVector).map(u -> PgUuid(u)).okOr("a uuid is not 16 bytes")
     1082 -> PgDate(dateOfDays(r.int32()))
+    1083 ->
+      val us = r.int64()
+      if us == MicrosPerDay then PgOther(oid, "24:00:00")
+      elif 0 <= us < MicrosPerDay then PgTime(Time(us))
+      else return Err(s"a time of $us microseconds")
+    1700 -> return numericOfBinary(bytes)
     1114 -> PgTimestamp(readingOfMicros(r.int64()))
     1184 -> PgTimestamptz(instantOfMicros(r.int64()))
     114 -> return jsonOf(string.fromUtf8Lossy(bytes))
@@ -217,6 +223,83 @@ private decodeBinary(oid: int, bytes: Array[byte]) -> Result[PgValue, string]
       if elementOf(oid) != 0 then return decodeBinaryArray(bytes)
       return Ok(PgOther(oid, string.fromUtf8Lossy(bytes)))
   if r.failed || r.remaining != 0 then Err(s"a ${typeName(oid)} of ${bytes.length} bytes") else Ok(value)
+
+// The sign words of a binary numeric.
+private val NumericNegative = 0x4000
+private val NumericNaN = 0xc000
+private val NumericInfinity = 0xd000
+private val NumericNegativeInfinity = 0xf000
+
+// A `numeric` sent in binary: how many base-10000 digits follow, the weight of the first (the power
+// of 10000 it counts), the sign word and the display scale, then the digits. `NaN` and the
+// infinities arrive as `PgOther`, as they do in text.
+private numericOfBinary(bytes: Array[byte]) -> Result[PgValue, string]
+  val r = In(bytes)
+  val n = r.int16()
+  val weight = r.int16()
+  val sign = r.int16() & 0xffff
+  val scale = r.int16()
+  val groups = Buffer[int]()
+  var i = 0
+  while i < n
+    groups.addOne(r.int16())
+    i += 1
+  if r.failed || r.remaining != 0 || n < 0 || scale < 0 then return Err(s"a numeric of ${bytes.length} bytes")
+  if sign == NumericNaN then return Ok(PgOther(OidNumeric, "NaN"))
+  if sign == NumericInfinity then return Ok(PgOther(OidNumeric, "Infinity"))
+  if sign == NumericNegativeInfinity then return Ok(PgOther(OidNumeric, "-Infinity"))
+  if sign != 0 && sign != NumericNegative then return Err(s"a numeric whose sign word is $sign")
+  val group = (k: int) -> if 0 <= k < n then groups(k) else 0
+  var integer = ""
+  var k = 0
+  while k <= weight
+    integer += group(k).toString().padStart(4, '0')
+    k += 1
+  while integer.byteLength > 1 && integer.startsWith("0")
+    integer = integer.slice(1, integer.byteLength)
+  if integer == "" then integer = "0"
+  var fraction = ""
+  var j = weight + 1
+  while fraction.byteLength < scale
+    fraction += group(j).toString().padStart(4, '0')
+    j += 1
+  val text = (if sign == NumericNegative then "-" else "") + integer + (
+    if scale > 0 then "." + fraction.slice(0, scale) else ""
+  )
+  BigDecimal.parse(text).map(d -> PgNumeric(d)).okOr(s"a numeric the client cannot read: $text")
+
+// `n` in binary: its digits in groups of four from the decimal point, the leading and trailing zero
+// groups left out, each group a base-10000 digit.
+private numericToBinary(out: Out, n: BigDecimal)
+  var digits = n.unscaled.abs.toString()
+  var scale = n.scale
+  if scale < 0
+    digits = digits + "0".repeat(-scale)
+    scale = 0
+  val point = digits.byteLength - scale
+  val integer = if point > 0 then digits.slice(0, point) else ""
+  val fraction = if point >= 0 then digits.slice(point, digits.byteLength) else "0".repeat(-point) + digits
+  val whole = "0".repeat((4 - integer.byteLength % 4) % 4) + integer
+  val all = whole + fraction + "0".repeat((4 - fraction.byteLength % 4) % 4)
+  val groups = Buffer[int]()
+  var at = 0
+  while at < all.byteLength
+    groups.addOne(all.slice(at, at + 4).toInt())
+    at += 4
+  var weight = whole.byteLength / 4 - 1
+  var first = 0
+  while first < groups.length && groups(first) == 0
+    first += 1
+    weight -= 1
+  var last = groups.length
+  while last > first && groups(last - 1) == 0
+    last -= 1
+  if first == last then weight = 0
+  out.int16(last - first).int16(weight).int16(if n.sign < 0 then NumericNegative else 0).int16(scale)
+  var g = first
+  while g < last
+    out.int16(groups(g))
+    g += 1
 
 private jsonOf(text: string) -> Result[PgValue, string] = json.parse(text) match
   Ok(j) -> Ok(PgJson(j))
@@ -365,12 +448,16 @@ private encodeBinary(oid: int, v: PgValue) -> Option[Vector[byte]]
     (21, PgInt(n)) -> if -32768 <= n <= 32767 then out.int16(int(n)) else return None
     (23, PgInt(n)) -> if long(int.MinValue) <= n <= long(int.MaxValue) then out.int32(int(n)) else return None
     (20, PgInt(n)) -> out.int64(n)
+    (26, PgInt(n)) -> if 0 <= n <= 4294967295 then out.int32(int.wrap(n)) else return None
     (700, PgReal(x)) -> out.int32(x.toBits32)
     (701, PgReal(x)) -> out.int64(x.toBits)
     (25 | 1042 | 1043 | 19, PgText(s)) -> out.raw(s.bytes)
+    (18, PgText(s)) -> if s.byteLength <= 1 then out.raw(s.bytes) else return None
     (17, PgBytes(b)) -> out.raw(b)
     (2950, PgUuid(u)) -> out.raw(u.bytes())
     (1082, PgDate(d)) -> out.int32(daysOfDate(d)?)
+    (1083, PgTime(t)) -> out.int64(t.microsOfDay)
+    (1700, PgNumeric(n)) -> numericToBinary(out, n)
     (1114, PgTimestamp(t)) -> out.int64(microsOfReading(t)?)
     (1184, PgTimestamptz(t)) -> out.int64(microsOfInstant(t)?)
     (114, PgJson(j)) -> out.raw(j.render.bytes)

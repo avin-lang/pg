@@ -1,0 +1,755 @@
+module tests
+
+// COPY: typed rows in and out in the binary format, every type the client knows and NULLs; tables
+// of types it does not know, in the text format; raw text and CSV in from a reader and out to a sink;
+// empty copies; the errors (a bad row, a value the server refuses, a constraint broken part-way, a
+// failing reader or sink, a statement that is not a COPY), each leaving the connection usable; COPY
+// in transactions; cancelled and timed-out copies; a million rows in bounded memory; many copies at
+// once on a pool; pgbouncer mode; and tracing.
+
+import avin.io
+import avin.io.{IoError, Reader}
+import avin.process
+import avin.threads.{Atomic, Channel, scope, sleep, withTimeout}
+import avin.time.{Date, Instant, date, dateTime, millis, seconds, time}
+import avin.uuid.Uuid
+import dev.avinlang.json
+import dev.avinlang.pg
+
+import dev.avinlang.pg.{
+  Config, Connection, FromRow, Io, PgArray, PgBool, PgConfig, PgError, PgInt, PgNull, PgNumeric, PgOther, PgPool,
+  PgReal, PgText, PgValue, RolledBack, Row, Server, ToPg, Typed
+}
+
+// A connection and a fresh table of its own, `name`, which other connections see.
+private copyTable(name: string, columns: string) -> Option[Result[Connection, PgError]] =
+  testConnection().map(r ->
+    val c = r?
+    c.simpleQuery(s"drop table if exists $name; create table $name ($columns)")?
+    Ok(c))
+
+// The rows `query` reads through `copyTo`.
+private copied(c: Connection, query: string) -> Result[Vector[Row], PgError]
+  val rows = Buffer[Row]()
+  val n = c.copyTo(query, row ->
+    rows.addOne(row)
+    Ok(()))?
+  assertEq(n, long(rows.length))
+  Ok(rows.toVector)
+
+// A source that gives `data` a few bytes at a time, counting its reads and the most it was asked for.
+class PieceReader(val data: Array[byte], val piece: int): Reader
+  var at = 0
+  var reads = 0
+  var largest = 0
+
+  override read(max: int) -> Result[Array[byte], IoError]
+    reads += 1
+    if max > largest then largest = max
+    val n = if data.length - at < piece then data.length - at else piece
+    val chunk = data.slice(at, at + (if n < max then n else max))
+    at += chunk.length
+    Ok(chunk)
+
+// A source that fails once it has given `good` bytes of `data`.
+class FailingReader(val data: Array[byte], val good: int): Reader
+  var at = 0
+
+  override read(max: int) -> Result[Array[byte], IoError]
+    if at >= good then return Err(IoError(io.Other("the disk went away"), "read", "rows.csv"))
+    val end = if good - at < max then good else at + max
+    val chunk = data.slice(at, end)
+    at = end
+    Ok(chunk)
+
+// ---- Typed rows in and out, binary ----
+
+private val everyType = (
+  "b bool, i2 int2, i4 int4, i8 int8, o oid, f4 float4, f8 float8, n numeric, t text, vc varchar(20), " + "bc char(3), nm name, ch \"char\", by bytea, u uuid, d date, tm time, ts timestamp, tz timestamptz, "
+    + "j json, jb jsonb, ai int4[], at text[], an numeric[], atm time[]"
+)
+
+@test("copyFrom writes every type the client knows, NULLs included, and query and copyTo read them back alike")
+everyTypeRoundTrip() -> Result[unit, PgError]
+  val c = copyTable("copy_types", everyType) match
+    Some(r) -> r?
+    None -> return Ok(())
+  val u = Uuid.random()
+  val doc = json.parse("{\"a\": [1, 2, {\"b\": null}], \"é\": \"☕\"}").ok.get
+  val full: Vector[ToPg] = [
+    true,
+    PgInt(-32768),
+    int.MaxValue,
+    long.MinValue,
+    PgInt(4294967295),
+    PgReal(1.5),
+    2.25,
+    BigDecimal("-12345.6789"),
+    "héllo ☕",
+    "varying",
+    "abc",
+    "a_name",
+    PgText("x"),
+    [byte(0), byte(255), byte(10)],
+    u,
+    date(2024, 2, 29),
+    time(23, 59, 59, 999999),
+    dateTime(date(1999, 12, 31), time(1, 2, 3, 4)),
+    Instant(1700000000123456),
+    doc,
+    doc,
+    [1, 2, 3],
+    ["a", "b,c", "\"q\""],
+    [BigDecimal("1.10"), BigDecimal("-2")],
+    [time(12, 0)]
+  ]
+  val extremes: Vector[ToPg] = [
+    false,
+    PgInt(32767),
+    int.MinValue,
+    long.MaxValue,
+    PgInt(0),
+    PgReal(real.NegativeInfinity),
+    real.NaN,
+    BigDecimal("0.000000000000000000001"),
+    "",
+    "",
+    "",
+    "",
+    PgText("\u0001"),
+    Vector.empty[byte](),
+    Uuid.Nil,
+    Date.Max,
+    time(0, 0),
+    dateTime(date(2000, 1, 1), time(0, 0)),
+    Instant.Min,
+    json.parse("[]").ok.get,
+    json.parse("{}").ok.get,
+    Vector.empty[int](),
+    Vector.empty[string](),
+    Vector.empty[BigDecimal](),
+    Vector.empty[avin.time.Time]()
+  ]
+  val nulls: Vector[ToPg] = (0 ..< 25).map(_ -> PgNull).toVector
+  assertEq(c.copyFrom("copy_types", [], [full, extremes, nulls])?, long(3))
+  val queried = c.query("select * from copy_types order by i4 nulls last")?
+  val out = copied(c, "select * from copy_types order by i4 nulls last")?
+  assertEq(out.length, 3)
+  // NaN is equal to nothing, itself included, so the float8 column is compared on its own.
+  assertEq(out.map(r -> r.values.updated(6, PgNull)), queried.map(r -> r.values.updated(6, PgNull)))
+  assert(out(0).values(6) is PgReal(x) && x.isNaN)
+  assert(queried(0).values(6) is PgReal(y) && y.isNaN)
+  assertEq(out.map(r -> r.names), queried.map(r -> r.names))
+  // The values are those written.
+  val first = out(1)
+  assertEq(first.get[bool]("b"), Ok(true))
+  assertEq(first.get[int]("i2"), Ok(-32768))
+  assertEq(first.get[long]("i8"), Ok(long.MinValue))
+  assertEq(first.get[long]("o"), Ok(long(4294967295)))
+  assertEq(first.get[BigDecimal]("n").map(n -> n.toString()), Ok("-12345.6789"))
+  assertEq(first.get[string]("t"), Ok("héllo ☕"))
+  assertEq(first.get[Uuid]("u"), Ok(u))
+  assertEq(first.get[Vector[BigDecimal]]("an").map(v -> v.map(n -> n.toString())), Ok(["1.10", "-2"]))
+  assertEq(first.get[Vector[string]]("at"), Ok(["a", "b,c", "\"q\""]))
+  assertEq(out(0).get[Date]("d"), Ok(Date.Max))
+  assertEq(out(0).get[Instant]("tz"), Ok(Instant.Min))
+  assertEq(out(0).get[BigDecimal]("n").map(n -> n.toString()), Ok("0.000000000000000000001"))
+  assert(out(2).values.forall(v -> v == PgNull))
+  Ok(())
+
+@test("numeric and time cross COPY's binary format exactly: scales, signs, zeros, huge values, NaN, infinities, 24:00")
+numericAndTime() -> Result[unit, PgError]
+  val c = copyTable("copy_numeric", "k int, n numeric, tm time") match
+    Some(r) -> r?
+    None -> return Ok(())
+  val texts = [
+    "0",
+    "0.0",
+    "0.00000",
+    "1",
+    "-1",
+    "10000",
+    "9999",
+    "10000.0001",
+    "-0.001",
+    "0.0001",
+    "0.00001",
+    "123.4500",
+    "100000000",
+    "1e-20",
+    "-98765432109876543210.0123456789",
+    "3.14159265358979323846264338327950288",
+    "1000000000000000000000000000000000000000",
+    "0.10",
+    "12345678.9"
+  ]
+  // Each written by copyFrom and by an INSERT, and the server's text for both compared.
+  val rows: Vector[Vector[ToPg]] = texts.indices.map(
+    i -> ([i, BigDecimal(texts(i)), time(1, 2, 3)]: Vector[ToPg])
+  ).toVector
+  assertEq(c.copyFrom("copy_numeric", [], rows)?, long(texts.length))
+  for i in texts.indices
+    assertEq(
+      c.queryValue[string]("select n::text from copy_numeric where k = $1", i)?,
+      c.queryValue[string](s"select '${BigDecimal(texts(i))}'::numeric::text")?
+    )
+  c.simpleQuery(
+    "insert into copy_numeric values (100, 'NaN', '24:00:00'), (101, 'Infinity', '00:00:00'), (102, '-Infinity', '12:00')"
+  )?
+  val back = copied(c, "select k, n, tm from copy_numeric order by k")?
+  val queried = c.query("select k, n, tm from copy_numeric order by k")?
+  assertEq(back.map(r -> r.values), queried.map(r -> r.values))
+  for i in texts.indices
+    assertEq(back(i).get[BigDecimal]("n").map(n -> n.toString()), Ok(BigDecimal(texts(i)).toString()))
+  val n = back.length
+  assertEq(back(n - 3).values(1), PgOther(1700, "NaN"))
+  assertEq(back(n - 3).values(2), PgOther(1083, "24:00:00"))
+  assertEq(back(n - 2).values(1), PgOther(1700, "Infinity"))
+  assertEq(back(n - 1).values(1), PgOther(1700, "-Infinity"))
+  Ok(())
+
+@test("a value of another type is converted as a parameter is; one that cannot be stops the COPY with CopyFail")
+conversions() -> Result[unit, PgError]
+  val c = copyTable("copy_convert", "i int4, n numeric, f float8, d date, b bool") match
+    Some(r) -> r?
+    None -> return Ok(())
+  val rows: Vector[Vector[ToPg]] = [
+    ["42", 7, 1, "2024-01-02", "t"],
+    [PgInt(5), 2.5, BigDecimal("0.5"), "infinity", "f"]
+  ]
+  assertEq(c.copyFrom("copy_convert", [], rows)?, long(2))
+  val back = copied(c, "select * from copy_convert order by i")?
+  assertEq(back(0).values, [PgInt(5), PgNumeric(BigDecimal("2.5")), PgReal(0.5), pg.PgDate(Date.Max), PgBool(false)])
+  assertEq(back(1).get[int]("i"), Ok(42))
+  assertEq(back(1).get[BigDecimal]("n"), Ok(BigDecimal(7)))
+  assertEq(back(1).get[real]("f"), Ok(1.0))
+  // A value no conversion fits: the COPY stops, names the row and column, and copies nothing.
+  val bad: Vector[Vector[ToPg]] = [[1, 1, 1, "2024-01-01", true], ["abc", 1, 1, "2024-01-01", true]]
+  assertEq(
+    c.copyFrom("copy_convert", [], bad).err,
+    Some(Config("row 2, column `i`: text cannot be written as integer"))
+  )
+  assertEq(countOf(c, "copy_convert")?, long(2))
+  // An integer out of a smallint's range.
+  c.simpleQuery("alter table copy_convert add column s int2")?
+  val big: Vector[Vector[ToPg]] = [[1, 1, 1, "2024-01-01", true, 40000]]
+  assertEq(
+    c.copyFrom("copy_convert", [], big).err,
+    Some(Config("row 1, column `s`: an integer cannot be written as smallint"))
+  )
+  assertEq(c.queryValue[int]("select 1")?, 1)
+  Ok(())
+
+@test("a row with the wrong number of values stops the COPY: nothing is copied and the connection is usable")
+wrongWidth() -> Result[unit, PgError]
+  val c = copyTable("copy_width", "a int, b text") match
+    Some(r) -> r?
+    None -> return Ok(())
+  val rows: Vector[Vector[ToPg]] = [[1, "x"], [2, "y"], [3]]
+  assertEq(c.copyFrom("copy_width", [], rows).err, Some(Config("row 3 has 1 values for 2 columns")))
+  assertEq(countOf(c, "copy_width")?, long(0))
+  val wide: Vector[Vector[ToPg]] = [[1, "x", true]]
+  assertEq(c.copyFrom("copy_width", ["a", "b"], wide).err, Some(Config("row 1 has 3 values for 2 columns")))
+  assertEq(c.copyFrom("copy_width", ["a"], [[1], [2]])?, long(2))
+  assertEq(countOf(c, "copy_width")?, long(2))
+  Ok(())
+
+@test("COPY's columns may be a subset in any order; names are quoted exactly; a table may be qualified by its schema")
+columnsAndNames() -> Result[unit, PgError]
+  val c = testConnection() match
+    Some(r) -> r?
+    None -> return Ok(())
+  c.simpleQuery(
+    "drop schema if exists copy_schema cascade; create schema copy_schema; " + "create table copy_schema.\"Mixed Case\" (id int, \"Name\" text, \"we\"\"ird\" text, d int default 9)"
+  )?
+  val rows: Vector[Vector[ToPg]] = [["b", 1, "x"], ["a", 2, "y"]]
+  assertEq(c.copyFrom("copy_schema.Mixed Case", ["we\"ird", "id", "Name"], rows)?, long(2))
+  val back = copied(c, "select id, \"Name\", \"we\"\"ird\", d from copy_schema.\"Mixed Case\" order by id")?
+  assertEq(
+    back.map(r -> r.values),
+    [
+      [PgInt(1), PgText("x"), PgText("b"), PgInt(9)],
+      [PgInt(2), PgText("y"), PgText("a"), PgInt(9)]
+    ]
+  )
+  // A table already quoted is taken as written.
+  assertEq(c.copyFrom("copy_schema.\"Mixed Case\"", ["id"], [[3]])?, long(1))
+  // No such table or column: the server's error.
+  assertEq(c.copyFrom("copy_missing", [], [[1]]).err.flatMap(e -> e.code), Some("42P01"))
+  assertEq(c.copyFrom("copy_schema.Mixed Case", ["nope"], [[1]]).err.flatMap(e -> e.code), Some("42703"))
+  // Case matters: `mixed case` is another table.
+  assertEq(c.copyFrom("copy_schema.mixed case", [], [[1]]).err.flatMap(e -> e.code), Some("42P01"))
+  assertEq(countOf(c, "copy_schema.\"Mixed Case\"")?, long(3))
+  c.simpleQuery("drop schema copy_schema cascade")?
+  Ok(())
+
+@test("copyToAs reads each row as a derived type; an Err from the row function stops the COPY")
+typedOut() -> Result[unit, PgError]
+  val c = copyTable("copy_people", "id int, name text, email text") match
+    Some(r) -> r?
+    None -> return Ok(())
+  val people: Vector[Vector[ToPg]] = (1 ..< 1001).map(i ->
+    ([i, s"person $i", if i % 2 == 0 then Some(s"p$i@x") else None]: Vector[ToPg])).toVector
+  assertEq(c.copyFrom("copy_people", [], people)?, long(1000))
+  val seen = Buffer[CopyPerson]()
+  assertEq(c.copyToAs[CopyPerson]("select * from copy_people order by id", p ->
+    seen.addOne(p)
+    Ok(()))?, long(1000))
+  assertEq(seen(0), CopyPerson(1, "person 1", None))
+  assertEq(seen(999), CopyPerson(1000, "person 1000", Some("p1000@x")))
+  // The row function fails part-way: the COPY stops there and the connection goes on.
+  var calls = 0
+  val stopped = c.copyTo("select * from copy_people order by id", row ->
+    calls += 1
+    if calls == 10 then Err(Config("enough")) else Ok(()))
+  assertEq(stopped.err, Some(Config("enough")))
+  assertEq(calls, 10)
+  assertEq(countOf(c, "copy_people")?, long(1000))
+  // A row that does not fit the type stops it as well.
+  assertEq(
+    c.copyToAs[CopyPerson]("select id, name from copy_people", _ -> Ok(())).err.map(e -> e.message),
+    Some("cannot read column `email`: the result has no such column")
+  )
+  assertEq(c.queryValue[int]("select 2")?, 2)
+  Ok(())
+
+data CopyPerson(id: int, name: string, email: Option[string]) derives FromRow
+
+@test("a table of types the client does not know is copied in COPY's text format, escapes and all")
+textFormat() -> Result[unit, PgError]
+  val c = testConnection() match
+    Some(r) -> r?
+    None -> return Ok(())
+  c.simpleQuery(
+    "drop table if exists copy_text; drop type if exists copy_mood; create type copy_mood as enum ('sad', 'ok'); " + "create table copy_text (k int, ip inet, mood copy_mood, span interval, s text, arr int4[])"
+  )?
+  val tricky = "tab\there\nnew line\\back\\slash \\N ☕\r"
+  val rows: Vector[Vector[ToPg]] = [
+    [1, PgText("192.168.0.1/32"), "ok", "1 day 02:03:04", tricky, [1, 2]],
+    [2, PgNull, PgNull, PgNull, "", Vector.empty[int]()],
+    [3, "::1", "sad", "-1 mons", "\\N", PgNull]
+  ]
+  assertEq(c.copyFrom("copy_text", [], rows)?, long(3))
+  assertEq(c.queryValue[string]("select s from copy_text where k = 1")?, tricky)
+  assertEq(c.queryValue[string]("select s from copy_text where k = 2")?, "")
+  assertEq(c.queryValue[string]("select s from copy_text where k = 3")?, "\\N")
+  assertEq(c.queryValue[Option[string]]("select ip::text from copy_text where k = 2")?, None)
+  val back = copied(c, "select * from copy_text order by k")?
+  val queried = c.query("select * from copy_text order by k")?
+  assertEq(back.map(r -> r.values), queried.map(r -> r.values))
+  assertEq(back(0).values(1), PgOther(869, "192.168.0.1"))
+  assertEq(back(0).get[string]("s"), Ok(tricky))
+  // A value the server refuses in the text format: its error, and nothing copied.
+  val bad: Vector[Vector[ToPg]] = [[4, "not an address", "ok", "1 day", "", PgNull]]
+  assertEq(c.copyFrom("copy_text", [], bad).err.flatMap(e -> e.code), Some("22P02"))
+  assertEq(countOf(c, "copy_text")?, long(3))
+  Ok(())
+
+// ---- Empty ----
+
+@test("an empty COPY copies nothing, in and out, typed and raw")
+emptyCopy() -> Result[unit, PgError]
+  val c = copyTable("copy_empty", "a int, b text") match
+    Some(r) -> r?
+    None -> return Ok(())
+  val none: Vector[Vector[ToPg]] = []
+  assertEq(c.copyFrom("copy_empty", [], none)?, long(0))
+  assertEq(c.copyIn("copy copy_empty from stdin", PieceReader(Array.empty[byte](), 10))?, long(0))
+  assertEq(c.copyIn("copy copy_empty from stdin (format csv)", PieceReader(Array.empty[byte](), 10))?, long(0))
+  var chunks = 0
+  assertEq(c.copyOut("copy copy_empty to stdout", _ ->
+    chunks += 1
+    Ok(()))?, long(0))
+  assertEq(chunks, 0)
+  assertEq(copied(c, "select * from copy_empty")?.length, 0)
+  assertEq(copied(c, "select 1 where false")?.length, 0)
+  // A binary COPY of no rows is still its header and trailer.
+  val bytes = Buffer[byte]()
+  assertEq(c.copyOut("copy copy_empty to stdout (format binary)", b ->
+    bytes.addAll(b)
+    Ok(()))?, long(0))
+  assertEq(bytes.length, 21)
+  assertEq(countOf(c, "copy_empty")?, long(0))
+  Ok(())
+
+// ---- Raw text and CSV ----
+
+@test("copyIn sends a reader's text and CSV as they are, a chunk at a time, and answers the rows copied")
+rawIn() -> Result[unit, PgError]
+  val c = copyTable("copy_raw", "id int, name text, note text") match
+    Some(r) -> r?
+    None -> return Ok(())
+  val text = "1\tada\t\\N\n2\tgrace\ttab\\there\n"
+  assertEq(c.copyIn("copy copy_raw from stdin", PieceReader(text.bytes.toArray(), 3))?, long(2))
+  val csv = "id,name,note\n" + (3 ..< 20003).map(i -> s"$i,\"name, $i\",\"said \"\"hi\"\"\"\n").mkString("")
+  val reader = PieceReader(csv.bytes.toArray(), 100000)
+  assertEq(c.copyIn("copy copy_raw from stdin (format csv, header true)", reader)?, long(20000))
+  // The reader was asked for at most one chunk at a time, and read to its end.
+  assertEq(reader.largest, 65536)
+  assert(reader.reads >= csv.byteLength / 65536)
+  assertEq(c.queryValue[string]("select note from copy_raw where id = 2")?, "tab\there")
+  assertEq(c.queryValue[Option[string]]("select note from copy_raw where id = 1")?, None)
+  assertEq(
+    c.queryValue[string]("select name || '|' || note from copy_raw where id = 20002")?,
+    "name, 20002|said \"hi\""
+  )
+  assertEq(countOf(c, "copy_raw")?, long(20002))
+  Ok(())
+
+@test("copyOut gives a sink the statement's text, CSV and binary data in order, a chunk at a time")
+rawOut() -> Result[unit, PgError]
+  val c = copyTable("copy_rawout", "id int, name text") match
+    Some(r) -> r?
+    None -> return Ok(())
+  c.execute("insert into copy_rawout select g, 'n' || g from generate_series(1, 3) g")?
+  val text = Buffer[byte]()
+  assertEq(c.copyOut("copy copy_rawout to stdout", b ->
+    text.addAll(b)
+    Ok(()))?, long(3))
+  assertEq(string.fromUtf8Lossy(text.toArray()), "1\tn1\n2\tn2\n3\tn3\n")
+  val csv = Buffer[byte]()
+  assertEq(c.copyOut("copy (select * from copy_rawout order by id desc) to stdout (format csv, header true)", b ->
+    csv.addAll(b)
+    Ok(()))?, long(3))
+  assertEq(string.fromUtf8Lossy(csv.toArray()), "id,name\n3,n3\n2,n2\n1,n1\n")
+  // What copyOut writes, copyIn reads back.
+  c.simpleQuery("create temp table copy_rawout2 (like copy_rawout)")?
+  assertEq(c.copyIn("copy copy_rawout2 from stdin (format csv, header true)", PieceReader(csv.toArray(), 5))?, long(3))
+  assertEq(countOf(c, "copy_rawout2")?, long(3))
+  Ok(())
+
+@test("a reader that fails stops the COPY with CopyFail and answers Io; nothing is copied")
+readerFails() -> Result[unit, PgError]
+  val c = copyTable("copy_readfail", "n int") match
+    Some(r) -> r?
+    None -> return Ok(())
+  val data = (0 ..< 100000).map(i -> s"$i\n").mkString("")
+  val r = c.copyIn("copy copy_readfail from stdin", FailingReader(data.bytes.toArray(), 200000))
+  assert(r.err is Some(Io(e)) && e.kind == io.Other("the disk went away"))
+  assertEq(countOf(c, "copy_readfail")?, long(0))
+  assert(!c.isBroken)
+  Ok(())
+
+@test("a sink that fails cancels the COPY: no more chunks, the sink's error answered, the connection usable")
+sinkFails() -> Result[unit, PgError]
+  val c = copyTable("copy_sinkfail", "n int, pad text") match
+    Some(r) -> r?
+    None -> return Ok(())
+  c.execute("insert into copy_sinkfail select g, repeat('x', 100) from generate_series(1, 200000) g")?
+  var calls = 0
+  val r = c.copyOut("copy copy_sinkfail to stdout", _ ->
+    calls += 1
+    if calls == 3 then Err(IoError(io.ConnectionReset, "write", "out.tsv")) else Ok(()))
+  assert(r.err is Some(Io(e)) && e.kind == io.ConnectionReset)
+  assertEq(calls, 3)
+  assertEq(c.queryValue[int]("select 3")?, 3)
+  assert(!c.isBroken && !c.inTransaction)
+  Ok(())
+
+@test("a statement that is not the COPY asked for is run and answers Config; a COPY FROM given to copyOut is refused")
+notACopy() -> Result[unit, PgError]
+  val c = copyTable("copy_wrong", "n int") match
+    Some(r) -> r?
+    None -> return Ok(())
+  assertEq(
+    c.copyIn("select 1", PieceReader(Array.empty[byte](), 1)).err,
+    Some(Config("the statement is not a COPY … FROM STDIN"))
+  )
+  assertEq(
+    c.copyIn("copy copy_wrong to stdout", PieceReader(Array.empty[byte](), 1)).err,
+    Some(Config("the statement is not a COPY … FROM STDIN"))
+  )
+  assertEq(c.copyOut("select 1", _ -> Ok(())).err, Some(Config("the statement is not a COPY … TO STDOUT")))
+  // The server's own refusal of the CopyFail sent for a COPY FROM.
+  assertEq(c.copyOut("copy copy_wrong from stdin", _ -> Ok(())).err.flatMap(e -> e.code), Some("57014"))
+  // simpleQuery answers a COPY FROM the same way, saying what does run one.
+  val refused = c.simpleQuery("copy copy_wrong from stdin").err
+  assertEq(refused.flatMap(e -> e.code), Some("57014"))
+  assert(refused.map(e -> e.message).getOrElse("").contains("copyIn and copyFrom do"))
+  assertEq(c.copyOut("copy nonesuch to stdout", _ -> Ok(())).err.flatMap(e -> e.code), Some("42P01"))
+  assertEq(
+    c.copyIn("copy nonesuch from stdin", PieceReader(Array.empty[byte](), 1)).err.flatMap(e -> e.code),
+    Some("42P01")
+  )
+  assertEq(c.copyTo("select from", _ -> Ok(())).err.flatMap(e -> e.code), Some("42601"))
+  assertEq(countOf(c, "copy_wrong")?, long(0))
+  Ok(())
+
+// ---- Server errors part-way ----
+
+@test("a constraint broken part-way stops the COPY: the server's error, nothing copied, and nothing more sent")
+constraintPartWay() -> Result[unit, PgError]
+  val c = copyTable("copy_unique", "n int primary key") match
+    Some(r) -> r?
+    None -> return Ok(())
+  val total = 1000000
+  val produced = Atomic(0)
+  // Row 50000 repeats row 0; the server finds it long before the source is used up.
+  val rows = (0 ..< total).iterator().map(i ->
+    produced.add(1)
+    val row: Vector[ToPg] = [if i == 50000 then 0 else i]
+    row)
+  val r = c.copyFrom("copy_unique", [], rows)
+  assertEq(r.err.flatMap(e -> e.code), Some("23505"))
+  assert(produced.load() < total)
+  assertEq(countOf(c, "copy_unique")?, long(0))
+  assert(!c.isBroken && !c.inTransaction)
+  // A bad value in CSV the server reads.
+  val csv = "1\n2\nthree\n4\n"
+  assertEq(
+    c.copyIn("copy copy_unique from stdin (format csv)", PieceReader(csv.bytes.toArray(), 100)).err.flatMap(e -> e.code),
+    Some("22P02")
+  )
+  assertEq(c.copyFrom("copy_unique", [], [[1], [2]])?, long(2))
+  Ok(())
+
+@test("a server statement_timeout stops a long COPY TO with its error, and the connection goes on")
+serverTimeout() -> Result[unit, PgError]
+  val c = testConnection() match
+    Some(r) -> r?
+    None -> return Ok(())
+  c.simpleQuery("set statement_timeout = 200")?
+  val r = c.copyTo("select g, pg_sleep(0.05) from generate_series(1, 100) g", _ -> Ok(()))
+  assertEq(r.err.flatMap(e -> e.code), Some("57014"))
+  c.simpleQuery("set statement_timeout = 0")?
+  assertEq(c.queryValue[int]("select 4")?, 4)
+  Ok(())
+
+// ---- Transactions ----
+
+@test("in a transaction a COPY commits and rolls back with it, and a failed one fails the transaction")
+copyInTransaction() -> Result[unit, PgError]
+  val c = copyTable("copy_tx", "n int primary key") match
+    Some(r) -> r?
+    None -> return Ok(())
+  assertEq(c.transaction(tx -> tx.copyFrom("copy_tx", [], [[1], [2]]))?, long(2))
+  assertEq(countOf(c, "copy_tx")?, long(2))
+  assertEq(c.transaction(tx ->
+    tx.copyFrom("copy_tx", [], [[3]])?
+    Err(Config("changed my mind"))).err, Some(Config("changed my mind")))
+  assertEq(countOf(c, "copy_tx")?, long(2))
+  // A failed COPY whose error the body ignores: the transaction is rolled back.
+  assertEq(c.transaction(tx ->
+    tx.execute("insert into copy_tx values (10)")?
+    assert(tx.copyFrom("copy_tx", [], [[1]]).isErr)
+    assert(tx.copyFrom("copy_tx", [], [[11]]).err.flatMap(e -> e.code) == Some("25P02"))
+    Ok(())).err, Some(RolledBack))
+  assertEq(countOf(c, "copy_tx")?, long(2))
+  // A savepoint: the COPY's failure rolls back only the inner transaction.
+  c.transaction(tx ->
+    tx.copyFrom("copy_tx", [], [[20]])?
+    assert(tx.transaction(inner -> inner.copyFrom("copy_tx", [], [[20]])).isErr)
+    Ok(()))?
+  assertEq(countOf(c, "copy_tx")?, long(3))
+  Ok(())
+
+// ---- Cancellation ----
+
+@test("a cancelled copyFrom, its rows coming from a channel that stalls, stops with CopyFail and copies nothing")
+cancelledFrom() -> Result[unit, PgError]
+  val c = copyTable("copy_cancel", "n int") match
+    Some(r) -> r?
+    None -> return Ok(())
+  val rows = Channel[Vector[ToPg]](16)
+  scope(s ->
+    s.spawn(() ->
+      for i in 0 ..< 70000
+        rows.send([i])
+      // Then nothing more, until the channel is closed after the COPY has been cancelled.
+      ())
+    assertEq(withTimeout(millis(500), _ -> c.copyFrom("copy_cancel", [], rows)), None)
+    rows.close())
+  assert(!c.isBroken)
+  assertEq(countOf(c, "copy_cancel")?, long(0))
+  assertEq(c.copyFrom("copy_cancel", [], [[1]])?, long(1))
+  Ok(())
+
+@test(
+  "a cancelled copyIn, its reader blocked, and a cancelled copyTo, its row function slow, leave the connection usable"
+)
+cancelledInAndOut() -> Result[unit, PgError]
+  val c = copyTable("copy_cancel2", "n int") match
+    Some(r) -> r?
+    None -> return Ok(())
+  assertEq(withTimeout(millis(300), _ -> c.copyIn("copy copy_cancel2 from stdin", SlowReader())), None)
+  assert(!c.isBroken)
+  assertEq(countOf(c, "copy_cancel2")?, long(0))
+  c.execute("insert into copy_cancel2 select generate_series(1, 100000)")?
+  var seen = 0
+  assertEq(withTimeout(millis(300), _ -> c.copyTo("select n from copy_cancel2", _ ->
+    seen += 1
+    if seen % 1000 == 0 then sleep(millis(20))
+    Ok(()))), None)
+  assert(seen < 100000)
+  assert(!c.isBroken)
+  assertEq(c.queryValue[long]("select count(*) from copy_cancel2")?, long(100000))
+  // Inside a transaction a cancelled COPY rolls the transaction back.
+  assert(withTimeout(millis(300), _ -> c.transaction(tx ->
+    tx.execute("insert into copy_cancel2 values (-1)")?
+    tx.copyIn("copy copy_cancel2 from stdin", SlowReader()))).isEmpty)
+  assert(!c.isBroken && !c.inTransaction)
+  assertEq(c.queryValue[long]("select count(*) from copy_cancel2 where n = -1")?, long(0))
+  Ok(())
+
+// A reader that gives a row, then waits far longer than any test.
+class SlowReader: Reader
+  var given = false
+
+  override read(max: int) -> Result[Array[byte], IoError]
+    if !given
+      given = true
+      return Ok("1\n".bytes.toArray())
+    sleep(seconds(60))
+    Ok(Array.empty[byte]())
+
+// ---- Scale ----
+
+// This process's resident memory, in bytes.
+private resident() -> long = process.residentBytes(process.pid()).getOrElse(0)
+
+@test("a million rows COPY in and out in bounded memory: the process grows far less than the data")
+millionRows() -> Result[unit, PgError]
+  val c = copyTable("copy_million", "id int8, name text, score float8") match
+    Some(r) -> r?
+    None -> return Ok(())
+  val total = 1000000
+  val pad = "x".repeat(100)
+  val bound: long = 64 * 1024 * 1024
+  val before = resident()
+  var peak = before
+  val rows = (0 ..< total).iterator().map(i ->
+    if i % 50000 == 0
+      val now = resident()
+      if now > peak then peak = now
+    val row: Vector[ToPg] = [long(i), pad, real(i) / 2.0]
+    row)
+  assertEq(c.copyFrom("copy_million", [], rows)?, long(total))
+  // Each row is some 130 bytes in COPY's binary format, so all of them would be well over 100 MB.
+  assert(peak - before < bound)
+  assertEq(c.queryValue[long]("select count(*) from copy_million")?, long(total))
+  var n = 0
+  var sum: long = 0
+  val outBefore = resident()
+  var outPeak = outBefore
+  assertEq(c.copyTo("select id, name, score from copy_million", row ->
+    n += 1
+    sum += row.get[long](0)?
+    if n % 50000 == 0
+      val now = resident()
+      if now > outPeak then outPeak = now
+    Ok(()))?, long(total))
+  assertEq(n, total)
+  assertEq(sum, long(total) * long(total - 1) / 2)
+  assert(outPeak - outBefore < bound)
+  println(
+    s"a million rows: grew ${(peak - before) / 1048576} MB copying in, ${(outPeak - outBefore) / 1048576} MB copying out"
+  )
+  c.simpleQuery("drop table copy_million")?
+  Ok(())
+
+@test("a producer thread feeds copyFrom through a bounded channel")
+producerThread() -> Result[unit, PgError]
+  val c = copyTable("copy_producer", "n int, label text") match
+    Some(r) -> r?
+    None -> return Ok(())
+  val rows = Channel[Vector[ToPg]](64)
+  val n = scope(s ->
+    s.spawn(() ->
+      for i in 0 ..< 100000
+        rows.send([i, s"row $i"])
+      rows.close())
+    c.copyFrom("copy_producer", ["n", "label"], rows))?
+  assertEq(n, long(100000))
+  assertEq(c.queryValue[long]("select sum(n) from copy_producer")?, long(99999) * long(100000) / 2)
+  Ok(())
+
+@test("many COPYs at once on pooled connections, in and out, each answered in full")
+concurrentPool() -> Result[unit, PgError]
+  val db = testPool(6) match
+    Some(r) -> r?
+    None -> return Ok(())
+  db.use(c -> c.simpleQuery("drop table if exists copy_pool; create table copy_pool (t int, n int)").map(_ -> ()))?
+  val threads = 24
+  val each = 5000
+  val results = scope(s ->
+    val handles = (0 ..< threads).map(t ->
+      s.spawn(() ->
+        db.use(c ->
+          val rows = (0 ..< each).iterator().map(i ->
+            val row: Vector[ToPg] = [t, i]
+            row)
+          val copiedIn = c.copyFrom("copy_pool", [], rows)?
+          var out: long = 0
+          c.copyTo(s"select n from copy_pool where t = $t", _ ->
+            out += 1
+            Ok(()))?
+          Ok((copiedIn, out)))))
+    handles.map(h -> h.join()))
+  for r in results
+    assertEq(r, Ok((long(each), long(each))))
+  assertEq(db.use(c -> c.queryValue[long]("select count(*) from copy_pool"))?, long(threads * each))
+  assert(db.stats().total <= 6)
+  db.close()
+  Ok(())
+
+// ---- pgbouncer ----
+
+@test("under pgbouncer, COPY in and out works and nothing is prepared under a name")
+bouncerCopy() -> Result[unit, PgError]
+  val c = testUrl("sslmode=disable&pgbouncer=true").map(u -> pg.connect(u)) match
+    Some(r) -> r?
+    None -> return Ok(())
+  c.simpleQuery("drop table if exists copy_bouncer; create table copy_bouncer (n int, t text, n2 numeric)")?
+  val rows: Vector[Vector[ToPg]] = (0 ..< 1000).map(i -> ([i, s"t$i", BigDecimal(i)]: Vector[ToPg])).toVector
+  assertEq(c.copyFrom("copy_bouncer", [], rows)?, long(1000))
+  assertEq(copied(c, "select * from copy_bouncer")?.length, 1000)
+  assertEq(c.copyIn("copy copy_bouncer (n) from stdin", PieceReader("7\n8\n".bytes.toArray(), 10))?, long(2))
+  assertEq(c.copyOut("copy copy_bouncer to stdout", _ -> Ok(()))?, long(1002))
+  assertEq(c.queryValue[int]("select count(*)::int4 from pg_prepared_statements")?, 0)
+  Ok(())
+
+// ---- Tracing ----
+
+@test("COPY is traced as one statement: one start and one end, with the rows copied, or the error")
+tracedCopy() -> Result[unit, PgError]
+  val r = Recorder()
+  val c = tracedConnection(r) match
+    Some(cr) -> cr?
+    None -> return Ok(())
+  c.simpleQuery("drop table if exists copy_traced; create table copy_traced (n int primary key)")?
+  val before = items(r.queryStarts).length
+  val prepared = items(r.prepareStarts).length
+  assertEq(c.copyFrom("copy_traced", ["n"], [[1], [2], [3]])?, long(3))
+  assertEq(c.copyIn("copy copy_traced from stdin", PieceReader("4\n".bytes.toArray(), 10))?, long(1))
+  assertEq(c.copyOut("copy copy_traced to stdout", _ -> Ok(()))?, long(4))
+  assertEq(copied(c, "select n from copy_traced")?.length, 4)
+  assert(c.copyFrom("copy_traced", [], [[1]]).isErr)
+  val starts = items(r.queryStarts).drop(before).map(s -> s.1.sql)
+  assertEq(
+    starts,
+    [
+      "COPY \"copy_traced\" (\"n\") FROM STDIN",
+      "copy copy_traced from stdin",
+      "copy copy_traced to stdout",
+      "COPY (select n from copy_traced) TO STDOUT",
+      "COPY \"copy_traced\" FROM STDIN"
+    ]
+  )
+  val ends = items(r.queryEnds).drop(before).map(e -> e.1)
+  assertEq(
+    ends.map(e -> (e.rows, e.tag, e.code, e.cancelled)),
+    [
+      (long(3), "COPY 3", None, false),
+      (long(1), "COPY 1", None, false),
+      (long(4), "COPY 4", None, false),
+      (long(4), "COPY 4", None, false),
+      (long(0), "", Some("23505"), false)
+    ]
+  )
+  // Asking the server for the table's columns prepares nothing of the program's.
+  assertEq(items(r.prepareStarts).length, prepared)
+  // A cancelled COPY's end says so.
+  assertEq(withTimeout(millis(300), _ -> c.copyIn("copy copy_traced from stdin", SlowReader())), None)
+  val last = items(r.queryEnds).last.1
+  assert(last.cancelled && last.sql == "copy copy_traced from stdin")
+  Ok(())

@@ -263,7 +263,7 @@ class Connection(
           rows = Buffer[Row]()
           columns = []
         'I' -> ()
-        'G' -> send(Out().begin('f').cstring("COPY is not supported by this client").close())?
+        'G' -> send(Out().begin('f').cstring("simpleQuery does not send COPY data; copyIn and copyFrom do").close())?
         'H' | 'd' | 'c' -> ()
         _ -> return Err(Protocol(s"unexpected message `${m.kind}` answering a query"))
       Ok(()))?

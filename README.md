@@ -4,7 +4,8 @@ A PostgreSQL client for Avin: the frontend/backend protocol (version 3) over TCP
 SCRAM-SHA-256, MD5, cleartext and trust authentication, simple queries and the extended protocol with
 a statement cache, typed parameters and results, rows read by column or into derived types, the
 server's errors with every field, transactions with savepoints, a connection pool, statements
-cancelled when their thread is, and LISTEN/NOTIFY delivered to a channel or an actor.
+cancelled when their thread is, LISTEN/NOTIFY delivered to a channel or an actor, and COPY in and out,
+typed rows in the binary format or raw text and CSV, streamed in bounded memory.
 
 The package's module is **`dev.avinlang.pg`**, written in Avin. A program depends on it in its
 `avin.hocon`:
@@ -314,6 +315,73 @@ the batch creates, is sent unprepared and runs in its place. A batch of any size
 32 KiB at a time, so a batch of thousands of statements with large answers never leaves both ends
 waiting to write. A batch whose thread is cancelled is cancelled as a single statement is.
 
+## COPY
+
+`copyFrom` streams rows into a table with `COPY … FROM STDIN` in COPY's binary format, each value
+written as its column's type, and answers how many rows went in. The rows may be a vector, an
+iterator, or a `Channel` a producer thread feeds and closes; they are read as the data is sent, a
+64 KiB chunk at a time, so a million rows take no more memory than a few. On a local server a million rows of three columns
+went in by `copyFrom` in 1.1 to 1.6 s, against 6.1 s as INSERTs sent in batches of 10,000, and the
+process grew by 8 MB while it ran.
+
+```avin
+db.execute("create temporary table readings (sensor int, at timestamptz, value float8)")?
+val rows: Vector[Vector[ToPg]] = [[1, Instant(1700000000000000), 20.5], [2, Instant(1700000000000000), PgNull]]
+val n = db.copyFrom("readings", ["sensor", "at", "value"], rows)?   // 2
+```
+
+From a producer thread, through a bounded channel, so the producer waits while the server catches
+up:
+
+```avin
+val feed = Channel[Vector[ToPg]](256)
+val copied = scope(s ->
+  s.spawn(() ->
+    for i in 0 ..< 100000
+      feed.send([i % 10, Instant(1700000000000000 + long(i)), real(i)])
+    feed.close())
+  db.copyFrom("readings", [], feed))?                               // 100000
+```
+
+`copyTo` runs a query (`SELECT`, `VALUES` or `TABLE t`) with `COPY (…) TO STDOUT` and hands each row
+to a function as it arrives, read just as `query` reads it; `copyToAs[T]` reads each as a derived
+type. Only one row is held at a time, and the next is read once the function has answered.
+
+```avin
+data Reading(sensor: int, value: real) derives FromRow
+
+var total = 0.0
+val n = db.copyToAs[Reading]("select sensor, value from readings where value is not null", r ->
+  total += r.value
+  Ok(()))?
+```
+
+`copyIn` and `copyOut` carry a COPY statement's own data, text, CSV or binary, as it is: `copyIn`
+reads it from any `Reader` (a file, a connection), a chunk at a time, and `copyOut` gives it to a
+function a chunk at a time. Each waits for the other end: the next chunk is read only once the last
+has been sent, or once the function has answered.
+
+```avin
+val file = fs.open("readings.csv").mapErr(e -> Io(e))?
+val n = db.copyIn("copy readings from stdin (format csv, header true)", file)?
+val out = fs.create("backup.csv").mapErr(e -> Io(e))?
+db.copyOut("copy readings to stdout (format csv)", chunk -> out.write(chunk))?
+```
+
+A table whose columns include a type the client does not decode (`inet`, an enum, `interval`) is
+copied in COPY's text format instead, its values written as their text. A value of another type than
+its column's is converted as a parameter is (`"42"` into an `integer`, an `int` into a `numeric`).
+
+When something goes wrong part-way the connection can be used on. A row with the wrong number of
+values, or a value that cannot be written as its column's type, stops the COPY with CopyFail and
+answers a `Config` error naming the row and column; nothing is copied. A value the server refuses or
+a constraint a row breaks answers the server's error, and the client stops sending as soon as it
+sees it. A reader that fails stops the COPY the same way and answers `Io`. A function given to
+`copyOut` or `copyTo` that answers an `Err` has the server cancel the COPY, and its error is the
+answer. Inside a transaction a failed COPY fails the transaction, as any failed statement does. A
+COPY whose thread is cancelled is stopped: CopyFail for one going in, a CancelRequest for one coming
+out. A tracer sees a COPY as one statement, with the rows copied.
+
 ## Cancellation
 
 A statement whose thread is cancelled, by `withTimeout` or a scope, is cancelled on the server too:
@@ -478,10 +546,6 @@ import dev.avinlang.pg.QueryTracers
 
 val both = config with {queryTracer = Some(QueryTracers([SlowQueryLog(millis(250)), Numbered(line -> println(line))]))}
 ```
-
-## Not yet
-
-`COPY` comes next, and is refused.
 
 ## Tests
 
