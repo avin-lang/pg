@@ -311,9 +311,12 @@ on one thread and sent on another; `PgPool.sendBatch` sends one on a pooled conn
 
 The statements are prepared through the statement cache, those not yet prepared all together in one
 more round trip. One the server cannot prepare yet, because it names a table an earlier statement of
-the batch creates, is sent unprepared and runs in its place. A batch of any size is sent a window of
-32 KiB at a time, so a batch of thousands of statements with large answers never leaves both ends
-waiting to write. A batch whose thread is cancelled is cancelled as a single statement is.
+the batch creates, is sent unprepared and runs in its place. A batch of more than 32 KiB is written
+by a thread of its own while the answers are read, over the connection split into a reading and a
+writing half, so the whole batch is in flight at once, and a batch of a hundred thousand statements
+or of megabytes each way never leaves both ends waiting to write. An atomic batch that fails stops
+the writing there. A batch whose thread is cancelled is cancelled as a single statement is, and no
+statement it had not yet written is sent.
 
 ## COPY
 

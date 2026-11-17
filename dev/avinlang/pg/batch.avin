@@ -2,6 +2,11 @@ module dev.avinlang.pg
 
 // Batches: statements queued, sent to the server together, and their results read back in order.
 
+import avin.io.IoError
+import avin.net.StreamWriter
+import avin.threads.{Channel, Thread, spawn}
+import avin.time.Duration
+
 // A statement queued in a batch: its text, or a statement prepared on the connection, and its
 // parameters as they are bound.
 data BatchItem(sql: string, statement: Option[Statement], params: Vector[Typed])
@@ -100,3 +105,105 @@ class BatchReader(private val batch: BatchResults)
 
   // How many rows the next statement touched, as its command tag counts them.
   execute() -> Result[long, PgError] = next().map(r -> r.affected)
+
+// How many bytes a batch's writing thread writes at a time, at the least: a whole number of the
+// batch's statements, since it stops only between them, so a stopped batch never leaves half a
+// message on the wire.
+private val ChunkBytes = 65536
+
+// What a batch's writing thread did: how many Syncs it wrote, and the write that failed, where one
+// did.
+private data Sent(syncs: int, failure: Option[IoError])
+
+// The thread writing a batch too large to write before its answers are read, which the thread that
+// sent the batch reads meanwhile.
+private class BatchSender(
+  private val thread: Thread[Sent],
+  private val halt: Channel[unit],
+  // Closed once the thread has written all it will.
+  val done: Channel[unit],
+  // How many Syncs the batch holds.
+  val syncs: int
+)
+  // Asks the thread to write no statement it has not begun; a batch that does not sync each
+  // statement is then ended with a Sync. Asking again does nothing.
+  stop()
+    if !halt.isClosed() then halt.close()
+
+  // Stops the thread and waits for it: what it wrote.
+  finish() -> Sent
+    stop()
+    thread.join()
+
+object BatchSender
+  // Starts a thread writing to `w` the units in `out`, unit `i` ending at `ends(i)`; the ones not
+  // `synced` are followed in `out` by the batch's one Sync, written with the last of them. `syncs` is
+  // how many Syncs that is.
+  start(w: StreamWriter, out: Out, ends: Vector[int], synced: bool, syncs: int) -> BatchSender
+    val cuts = Buffer[int]()
+    val counts = Buffer[int]()
+    var from = 0
+    var units = 0
+    for i in 0 ..< ends.length
+      units += 1
+      val last = i == ends.length - 1
+      val end = if last then out.length else ends(i)
+      if last || end - from >= ChunkBytes
+        cuts.addOne(end)
+        counts.addOne(if synced then units elif last then 1 else 0)
+        from = end
+        units = 0
+    val halt = Channel[unit]()
+    val done = Channel[unit]()
+    val payload = out.toArraySeq()
+    val at = cuts.toVector
+    val held = counts.toVector
+    val thread = spawn(() -> writeBatch(w, payload, at, held, synced, halt, done))
+    BatchSender(thread, halt, done, syncs)
+
+// The body of a batch's writing thread: writes `payload` up to each of `cuts` in turn, the part ending
+// at `cuts(i)` holding `counts(i)` Syncs, waiting for room or for `halt` to close, and closes `done`
+// once it has written all it will. Once `halt` has closed, the part begun is written whole, waiting
+// at most the drain limit, and no other is begun; where the parts do not each end with a Sync, one is
+// written after the last part written.
+private writeBatch(
+    w: StreamWriter,
+    payload: ArraySeq[byte],
+    cuts: Vector[int],
+    counts: Vector[int],
+    synced: bool,
+    halt: Channel[unit],
+    done: Channel[unit]
+) -> Sent
+  defer done.close()
+  var from = 0
+  var syncs = 0
+  var i = 0
+  while i < cuts.length && !halt.isClosed()
+    val part = payload.slice(from, cuts(i)).toArray()
+    var at = 0
+    while at < part.length
+      if halt.isClosed()
+        _ = w.setTimeout(DrainLimit)
+        val rest = w.write(part.slice(at, part.length))
+        _ = w.setTimeout(Duration(0))
+        rest match
+          Ok(_) -> at = part.length
+          Err(e) -> return Sent(syncs, Some(e))
+      else
+        select
+          w.writable() -> w.writeSome(if at == 0 then part else part.slice(at, part.length)) match
+            Ok(n) -> at += n
+            Err(e) -> return Sent(syncs, Some(e))
+          halt.receive() as None -> ()
+    syncs += counts(i)
+    from = cuts(i)
+    i += 1
+  if !synced && 0 < i < cuts.length
+    _ = w.setTimeout(DrainLimit)
+    val ended = w.write(Out().begin('S').close().toArray())
+    _ = w.setTimeout(Duration(0))
+    ended match
+      Ok(_) -> syncs += 1
+      Err(e) -> return Sent(syncs, Some(e))
+  Sent(syncs, None)

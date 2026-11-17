@@ -340,30 +340,58 @@ prepared fails the whole batch (so a batch cannot create a table and use it); an
 in the same pipeline, which needs the parameter types before they are known. **Review with the
 user**: the unprepared fallback is invisible except in its text encoding of parameters.
 
-## Batches are sent a 32 KiB window at a time
+## A large batch is written by a thread of its own over a split connection
 
-The server stops reading while it cannot write, so a client that writes a whole large batch before
-reading deadlocks once both directions' socket buffers fill. avin's streams belong to one thread at
-a time and have no non-blocking write, so a writer thread and a reader thread cannot share one; the
-batch instead sends a window of at most 32 KiB of statements (one at least), followed by a Flush
-(the server buffers its answers otherwise), reads every answer to it, and only then sends the next.
-The bytes written ahead of what is read stay well under the 128 KiB a socket buffers by default at
-each end, so no write waits on a server that is itself waiting. It costs one round trip per window,
-about a thousand small statements. Alternatives weighed: a writer/reader split on two lightweight
-threads (needs a stream that can be read and written from two threads, which avin does not offer),
-and a non-blocking write that reads when the socket is full (pgx's way; needs a writable-readiness
-or partial-write primitive). **Review with the user**: whether `avin.net` should grow either, which
-would let the whole batch be in flight at once.
+Settled on the user's delegation 2026-11-16. The server stops reading while it cannot write, so a
+client that writes a whole large batch before reading deadlocks once both directions' socket buffers
+fill. Every connection is split (`ByteStream.split()`) into a reading and a writing half as it is
+made. A batch of at most 32 KiB is written whole and then read, on the calling thread, as before: that
+is well under what the sockets hold, and it spares a small batch a thread. A larger one is handed, as
+one immutable `ArraySeq[byte]`, to a lightweight thread that owns the writing half for as long as it
+writes, while the calling thread reads the answers; the whole batch is in flight at once, with no
+round trip but the batch's own. The writer waits for room with a `select` on `writable()` beside a
+stop channel and writes in parts of at least 64 KiB, each a whole number of statements: an atomic
+batch whose answer fails stops it after the part under way and has it write the Sync, so the
+statements not yet written are never sent. The writing half is the connection's again once the thread
+ends, and the batch waits for it before it returns, so nothing else ever writes while it does. A statement of an atomic batch is never followed by a Flush now: the one Sync comes
+last. Alternatives weighed: keeping the 32 KiB windows (one round trip per thousand small
+statements, which a split makes needless); a non-blocking write that reads whenever the socket is
+full, on one thread, as pgx does (possible with `writeSome` and `writable()`, but it interleaves two
+state machines in the reader where the split keeps each simple); spawning a writer for every batch
+however small (a thread for a batch that fits the buffers anyway). **Review with the user**: the 32
+KiB below which a batch is written inline, chosen as the old window was.
 
-## A cancelled batch: Sync, drain every ReadyForQuery owed; a cut write breaks the connection
+## A cancelled batch: stop the writer, drain every ReadyForQuery owed; a cut write breaks the connection
 
-A batch keeps count of the ReadyForQuery messages owed and whether messages are out since the last
-Sync. A cancelled batch sends the CancelRequest, a Sync where one is missing, and reads until
-nothing is owed, within the drain limit; an atomic batch then has kept nothing. An independent batch
-keeps what its statements before the cancelled one committed, and the ones already sent after it
-still run. A thread cancelled while a write is under way may have sent half a message, so the
-connection is broken at once rather than drained to the limit; this holds for single statements
-too.
+A batch keeps count of the ReadyForQuery messages owed, counting every Sync its writing thread may
+write. A cancelled batch sends the CancelRequest, stops the writing thread, which finishes the part
+under way and, for an atomic batch, writes the Sync, and reads the answers while it does, since the
+server may be waiting for them to be read before it reads more; once the thread has ended, the Syncs
+it did not write are owed no longer, and the rest is read until nothing is owed, each wait within
+the drain limit. An atomic batch then has kept nothing. An independent batch keeps what its
+statements before the cancelled one committed, and the ones written after it still run; those not
+yet written are not sent. A thread cancelled while a write of its own is under way (a batch written
+inline, or a single statement) may have sent half a message, so the connection is broken at once
+rather than drained to the limit; the writing thread is never cancelled, so it never cuts a message.
+A connection that broke while its writing thread still runs waits for it, at most the drain limit, as
+it is closed.
+
+## The superlinear time of large batches is the collector's
+
+Settled on the user's delegation 2026-11-16. Batches of 10 000 and 50 000 statements took 9 and 12 µs
+a statement against 3 µs at 1 000. A sampling profile of a 50 000 batch put about 70% of the reading
+thread in the collector, most of it the sweep, and keeping 64 MiB of byte arrays live, which raises
+the collector's budget past its 8 MiB floor, brought the 10 000 batch to 3 µs. The client's part was
+its garbage: each statement's messages were built in an `Out` of their own, copied into a
+`Vector[byte]` and copied again into the window, and each statement's cache key was made afresh. A
+batch is now written into one `Out`, its statements' ends noted, and a statement with the text and
+parameter types of the one before it takes that one's plan without a key being made. The message
+reader also copies a message that arrives in many chunks once, into a buffer sized for the whole
+message, rather than joining it again for every chunk. What remains is the collector's: a
+non-generational mark and sweep traces every result already read at every collection, and the cost
+an object adds grows as the live heap outgrows the caches; a pure avin program that keeps small
+objects while it makes garbage shows the same curve, per element 270 ns at 10 000 and 1.4 µs at
+400 000, levelling off after. Reported to avin rather than worked around.
 
 ## `connectTimeout` is one deadline per server, over the whole connection
 
