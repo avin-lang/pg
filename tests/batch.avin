@@ -318,7 +318,8 @@ largeBatches() -> Result[unit, PgError]
   val failing = c.sendBatch(small.queue("select 1 / 0"))?
   assertEq((failing.get(9999)?.affected, codeAt(failing, 10000)), (long(1), Some("22012")))
   assertEq(countOf(c, "batch_large"), Ok(long(10000)))
-  // A failure early in a batch of many windows: none after it runs, and none is answered but Skipped.
+  // A failure early in a batch written by its own thread: none after it runs, and none is answered
+  // but Skipped.
   val early = c.sendBatch(Batch(Batch().queue("select 1 / 0").items ++ small.items))?
   assertEq(codeAt(early, 0), Some("22012"))
   assertEq(early.get(10000).err, Some(Skipped))
@@ -431,7 +432,8 @@ cancelledBatch() -> Result[unit, PgError]
     tail = tail.queue("insert into batch_cancel values ($1)", i)
   val started = monotonic()
   for mode in [Atomic, Independent]
-    // The sleep is in the first window, so the cancellation finds the batch with no Sync sent.
+    // The sleep comes first and the batch is written by its own thread, so the cancellation finds
+    // the batch's Sync not yet read, and perhaps not yet written.
     val b = Batch(
       Batch().queue("insert into batch_cancel values (-1)").queue("select pg_sleep(30)").items ++ tail.items
     )

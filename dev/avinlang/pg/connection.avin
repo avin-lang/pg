@@ -6,8 +6,9 @@ module dev.avinlang.pg
 
 import avin.io
 import avin.io.IoError
-import avin.net.{ByteStream, TcpStream}
+import avin.net.{ByteStream, StreamReader, StreamWriter, TcpStream}
 import avin.net.tls.{TlsClient, TlsStream}
+import avin.threads.after
 import avin.time.{Duration, monotonic, seconds}
 
 // A statement prepared on a connection: its name there, its text, the types of its parameters as
@@ -44,10 +45,11 @@ private paramOf(p: ToPg) -> Typed = Typed(p.pgOid, p.toPg)
 // connection is given up as broken.
 private val DrainLimit: Duration = 30.seconds
 
-// How many bytes of a batch are sent ahead of the answers read: well under what a socket's buffers
-// hold at either end, so the server, which stops reading while it cannot write, never leaves a write
-// of the client's waiting.
-private val PipelineWindow = 32768
+// The most bytes of a batch written before its answers are read, on the reading thread: well under
+// what a socket's buffers hold at either end, so the server, which stops reading while it cannot
+// write, never leaves that write waiting. A batch of more is written by a thread of its own while
+// its answers are read.
+private val InlineLimit = 32768
 
 // A distinct statement a batch runs: its cache key (empty for a statement the program prepared), its
 // text and parameter types, and the statement itself where it is already prepared.
@@ -69,13 +71,18 @@ private cacheKey(sql: string, oids: Vector[int]) -> string = oids.mkString(",") 
 // (a CancelRequest on a connection of its own) and reads what the server still sends until it is
 // ready again, so the connection can be used on; where that fails the connection is broken, and
 // `isBroken` says so. A transaction a cancellation stops is rolled back.
+//
+// The connection's socket is split into a reading half and a writing half, so a batch too large for
+// the sockets' buffers is written by a thread of its own while the thread that sent it reads the
+// answers.
 class Connection(
-  private var stream: ByteStream,
+  private val input: StreamReader,
+  private val output: StreamWriter,
   private val config: PgConfig,
   // Whether the connection is encrypted.
   val isTls: bool
 )
-  private var reader = MessageReader(stream)
+  private var reader = MessageReader(input)
   private var pid = 0
   private var secret = 0
   // The transaction status of the last ReadyForQuery: `I` idle, `T` in a transaction, `E` in a
@@ -86,12 +93,13 @@ class Connection(
   // Set while a request's answer is being read, so a cancellation in the middle knows to drain it.
   private var awaiting = false
   // While an answer is being read: how many ReadyForQuery messages are still owed, one for each Sync
-  // or simple query sent, and whether messages have been sent since the last Sync.
+  // or simple query sent, or to be sent by the batch's writing thread.
   private var owed = 0
-  private var unsynced = false
   // Set while bytes are being written, so a cancellation in the middle of a write knows the stream
   // may hold half a message.
   private var writing = false
+  // The thread writing a batch, while it may still be running.
+  private var sending: Option[BatchSender] = None
   private var parameters = HashMap.empty[string, string]()
   private var cache = HashMap.empty[string, Statement]()
   // Cache keys, the least recently used first.
@@ -135,9 +143,9 @@ class Connection(
   // idle a while before lending it.
   ping(timeout: Duration) -> Result[unit, PgError]
     usable()?
-    stream.setTimeout(timeout).mapErr(e -> Io(e))?
+    setTimeouts(timeout).mapErr(e -> Io(e))?
     val answered = simple("")
-    if stream.setTimeout(Duration(0)).isErr then broken = true
+    if setTimeouts(Duration(0)).isErr then broken = true
     answered
 
   // ---- Running statements ----
@@ -271,14 +279,19 @@ class Connection(
 
   // Whether the connection can be used at once: it is open, not broken, in no transaction, and the
   // server has sent nothing unasked, as it does when it ends the session.
-  isHealthy -> bool = !closed && !broken && status == 'I' && !stream.readable()
+  isHealthy -> bool = !closed && !broken && status == 'I' && !input.readable()
 
   // Says goodbye to the server and closes the connection. Closing a closed connection does nothing.
   close() -> Result[unit, PgError]
     if closed then return Ok(())
     closed = true
-    if !broken then _ = stream.write(Out().begin('X').close().toArray())
-    stream.close().mapErr(e -> Io(e))
+    // A batch's writing thread left running by a connection that broke ends within the drain limit,
+    // and the writing half is the connection's again once it has.
+    _ = sent()
+    if !broken then _ = output.write(Out().begin('X').close().toArray())
+    val wrote = output.close()
+    val read = input.close()
+    wrote.flatMap(_ -> read).mapErr(e -> Io(e))
 
   // ---- Batches ----
 
@@ -315,10 +328,11 @@ class Connection(
   private pipelined(items: Vector[BatchItem], mode: BatchMode) -> Result[(BatchResults, bool), PgError]
     awaiting = true
     owed = 0
-    unsynced = false
     defer
       if awaiting && !broken then recover()
-    // One plan for each distinct statement, and the plan each item runs.
+    // One plan for each distinct statement, and the plan each item runs. An item with the text and
+    // parameter types of the one before it, as most of a batch of one statement repeated are, runs
+    // that one's plan without its cache key being made again.
     val plans = Buffer[Plan]()
     val planOf = Buffer[int]()
     var keys = HashMap.empty[string, int]()
@@ -328,28 +342,32 @@ class Connection(
           plans.addOne(Plan("", s.sql, [], Some(s)))
           planOf.addOne(plans.length - 1)
         None ->
-          val oids = item.params.map(p -> p.oid)
-          val key = cacheKey(item.sql, oids)
-          keys.get(key) match
-            Some(i) -> planOf.addOne(i)
-            None ->
-              val known = cache.get(key)
-              if known.isDefined then order = order.filter(k -> k != key) :+ key
-              keys = keys.updated(key, plans.length)
-              planOf.addOne(plans.length)
-              plans.addOne(Plan(key, item.sql, oids, known))
+          val last = if planOf.length == 0 then -1 else planOf(planOf.length - 1)
+          if last >= 0 && plans(last).key != "" && sameShape(item, plans(last))
+            planOf.addOne(last)
+          else
+            val oids = item.params.map(p -> p.oid)
+            val key = cacheKey(item.sql, oids)
+            keys.get(key) match
+              Some(i) -> planOf.addOne(i)
+              None ->
+                val known = cache.get(key)
+                if known.isDefined then order = order.filter(k -> k != key) :+ key
+                keys = keys.updated(key, plans.length)
+                planOf.addOne(plans.length)
+                plans.addOne(Plan(key, item.sql, oids, known))
     val statements = prepared(plans.toVector)?
-    // Each item's messages, or why it cannot be sent. An item whose statement could not be prepared,
-    // perhaps because it names a table an earlier item makes, is sent unprepared, its parameters as
-    // text: where it fails, it fails where it stands among the others.
+    // Each item's messages, written one after another, or why it cannot be sent. An item whose
+    // statement could not be prepared, perhaps because it names a table an earlier item makes, is sent
+    // unprepared, its parameters as text: where it fails, it fails where it stands among the others.
     val results = Buffer[Result[QueryResult, PgError]]()
     val sent = Buffer[(int, Option[Statement])]()
-    val units = Buffer[Vector[byte]]()
+    val out = Out()
+    val ends = Buffer[int]()
     var refused = false
     for i in 0 ..< items.length
       results.addOne(Err(Skipped))
       if !refused
-        val out = Out()
         val statement = statements(planOf(i))
         val made = statement match
           Some(s) -> bindAndExecute(out, s, items(i).params)
@@ -357,7 +375,7 @@ class Connection(
         made match
           Ok(_) ->
             if mode == Independent then out.begin('S').close()
-            units.addOne(out.toVector())
+            ends.addOne(out.length)
             sent.addOne((i, statement))
           Err(e) ->
             results(i) = Err(e)
@@ -365,7 +383,7 @@ class Connection(
             if mode == Atomic then refused = true
     var stale = false
     if !refused
-      pipeline(units.toVector, mode == Independent, u ->
+      pipeline(out, ends.toVector, mode == Independent, u ->
         val (i, s) = sent(u)
         val r = executed(s, mode == Independent)?
         results(i) = r
@@ -391,16 +409,18 @@ class Connection(
     val statements = Buffer[Option[Statement]]()
     val fresh = Buffer[int]()
     val names = Buffer[string]()
-    val units = Buffer[Vector[byte]]()
+    val out = Out()
+    val ends = Buffer[int]()
     val guarded = status == 'T'
-    if guarded then units.addOne(Out().begin('Q').cstring("SAVEPOINT pg_batch").close().toVector())
+    if guarded
+      out.begin('Q').cstring("SAVEPOINT pg_batch").close()
+      ends.addOne(out.length)
     for p in plans
       p.known match
         Some(s) -> statements.addOne(Some(s))
         None ->
           counter += 1
           val name = if config.statementCacheSize == 0 then s"pgb_$counter" else s"pgs_$counter"
-          val out = Out()
           if names.length == 0
             for old in evicted
               out.begin('C').byte1(int('S')).cstring(old).close()
@@ -411,16 +431,16 @@ class Connection(
           out.close()
           out.begin('D').byte1(int('S')).cstring(name).close()
           out.begin('S').close()
+          ends.addOne(out.length)
           fresh.addOne(statements.length)
           names.addOne(name)
-          units.addOne(out.toVector())
           statements.addOne(None)
     if names.length == 0 then return Ok(statements.toVector)
-    if guarded then units.addOne(
-      Out().begin('Q').cstring("ROLLBACK TO SAVEPOINT pg_batch; RELEASE SAVEPOINT pg_batch").close().toVector()
-    )
+    if guarded
+      out.begin('Q').cstring("ROLLBACK TO SAVEPOINT pg_batch; RELEASE SAVEPOINT pg_batch").close()
+      ends.addOne(out.length)
     val first = if guarded then 1 else 0
-    pipeline(units.toVector, true, u ->
+    pipeline(out, ends.toVector, true, u ->
       val j = u - first
       if 0 <= j < names.length
         statements(fresh(j)) = described(names(j), plans(fresh(j)).sql)?
@@ -451,42 +471,58 @@ class Connection(
         _ -> return broke(Protocol(s"unexpected message `${m.kind}` answering a query"))
     Ok(())
 
-  // Sends `units` a window at a time and gives the index of each to `answer` to read its answer,
-  // which says whether to go on. A window is as many units as fit in `PipelineWindow` bytes, one at
-  // least, and the next is sent only once every answer to the last is read: the server stops reading
-  // while it cannot write, so the bytes sent ahead of what is read are kept below what the sockets
-  // between the two ends can hold. Units `synced` end with a Sync of their own; the others are
-  // followed by a Flush between windows and a Sync after the last, or after the one whose answer
-  // stops them, the rest not being sent.
+  // Sends the units written to `out`, unit `i` ending at `ends(i)`, and gives the index of each to
+  // `answer` to read its answer, which says whether to go on. Units `synced` end with a Sync of their
+  // own; the others are followed by one Sync after the last. The server stops reading while it cannot
+  // write, so a batch of more than `InlineLimit` bytes is written by a thread of its own while this
+  // one reads; the whole batch is then in flight at once, and an answer that stops the batch stops
+  // the writing too, the units not yet written being left out and a Sync written after the others.
   private pipeline(
-      units: Vector[Vector[byte]],
+      out: Out,
+      ends: Vector[int],
       synced: bool,
       answer: (int) -> Result[bool, PgError]
   ) -> Result[unit, PgError]
-    var next = 0
+    if !synced then out.begin('S').close()
+    val syncs = if synced then ends.length else 1
+    owed += syncs
+    if out.length <= InlineLimit then send(out)? else sending = Some(
+      BatchSender.start(output, out, ends, synced, syncs)
+    )
     var done = 0
-    while done < units.length
-      val out = Out()
-      while next < units.length && (next == done || out.length + units(next).length <= PipelineWindow)
-        out.raw(units(next))
-        next += 1
-      val last = next == units.length
-      if synced
-        owed += next - done
-      else
-        out.begin(if last then 'S' else 'H').close()
-        if last then owed += 1
-        unsynced = !last
-      send(out)?
-      while done < next
-        if !answer(done)?
-          if unsynced
-            send(Out().begin('S').close())?
-            unsynced = false
-            owed += 1
-          return settle()
-        done += 1
+    while done < ends.length
+      val going = answer(done) match
+        Ok(g) -> g
+        Err(e) ->
+          _ = sent()
+          return Err(e)
+      if !going then break
+      done += 1
+    sent()?
     settle()
+
+  // Waits for the batch's writing thread, where there is one, stopping it first: owes no
+  // ReadyForQuery for the Syncs it did not write, and fails, broken, where its writing failed.
+  private sent() -> Result[unit, PgError] = sending match
+    Some(s) ->
+      // Left set until the thread has ended, so a cancellation while this waits leaves it to
+      // `recover`.
+      val outcome = s.finish()
+      sending = None
+      owed -= s.syncs - outcome.syncs
+      outcome.failure match
+        Some(e) -> broke(Io(e))
+        None -> Ok(())
+    None -> Ok(())
+
+  // Whether the parameters of `item` are of the types `plan` was made for, and its text is the plan's.
+  private sameShape(item: BatchItem, plan: Plan) -> bool
+    if item.params.length != plan.oids.length || item.sql != plan.sql then return false
+    var i = 0
+    while i < plan.oids.length
+      if item.params(i).oid != plan.oids(i) then return false
+      i += 1
+    true
 
   // Reads the answer to a Parse and Describe of `name`, up to its ReadyForQuery: the statement, or
   // `None` where the server refused it.
@@ -678,7 +714,7 @@ class Connection(
   // Sends `out`; a failure breaks the connection.
   private send(out: Out) -> Result[unit, PgError]
     writing = true
-    val written = stream.write(out.toArray())
+    val written = output.write(out.toArray())
     writing = false
     written match
       Ok(_) -> Ok(())
@@ -722,7 +758,6 @@ class Connection(
   private exchange(out: Out, handle: (Message, bool) -> Result[unit, PgError]) -> Result[unit, PgError]
     awaiting = true
     owed = 1
-    unsynced = false
     defer
       if awaiting && !broken then recover()
     send(out)?
@@ -747,9 +782,10 @@ class Connection(
     Ok(())
 
   // A request's answer was left unread by a cancelled thread: asks the server to cancel the request,
-  // ends a pipeline left open with a Sync, then reads the rest of the answer, up to every
-  // ReadyForQuery still owed, waiting at most `DrainLimit` for each read. Where that fails, or the
-  // thread was cancelled in the middle of a write, the connection is broken.
+  // stops a batch's writing thread, then reads the rest of the answer, up to every ReadyForQuery
+  // owed, waiting at most `DrainLimit` for each read. The answers are read while the writing thread
+  // finishes, since the server may be waiting for them to be read before it reads more. Where that
+  // fails, or the thread was cancelled in the middle of a write, the connection is broken.
   private recover()
     awaiting = false
     if writing
@@ -757,18 +793,36 @@ class Connection(
       broken = true
       return
     cancelRequest()
-    _ = stream.setTimeout(DrainLimit)
-    if unsynced && send(Out().begin('S').close()).isOk then owed += 1
-    unsynced = false
+    _ = input.setTimeout(DrainLimit)
+    sending.foreach(s -> s.stop())
+    while !broken && sending.isDefined
+      val s = sending.get
+      var readable = reader.hasBuffered
+      if !readable
+        val limit = after(DrainLimit)
+        select
+          input.readable() -> readable = true
+          s.done.receive() as None -> ()
+          limit.receive() -> broken = true
+      if readable then drained() elif !broken then _ = sent()
     while !broken && owed > 0
-      reader.next() match
-        Ok(m) ->
-          if m.kind == 'Z'
-            status = char(In(m.body).byte1())
-            owed -= 1
-        Err(_) -> broken = true
+      drained()
     owed = 0
-    if stream.setTimeout(Duration(0)).isErr then broken = true
+    if input.setTimeout(Duration(0)).isErr then broken = true
+
+  // Reads one message of an answer being drained: a ReadyForQuery is one fewer owed.
+  private drained()
+    reader.next() match
+      Ok(m) ->
+        if m.kind == 'Z'
+          status = char(In(m.body).byte1())
+          owed -= 1
+      Err(_) -> broken = true
+
+  // Sets the limit on every wait for the server, reading and writing.
+  private setTimeouts(d: Duration) -> Result[unit, IoError]
+    input.setTimeout(d)?
+    output.setTimeout(d)
 
   // Asks the server, on a connection of its own, to cancel what this connection is running.
   private cancelRequest()
@@ -1037,17 +1091,18 @@ object Connection
       Ok(c) ->
         c.startup() match
           Ok(_) ->
-            _ = c.stream.setTimeout(Duration(0))
+            _ = c.setTimeouts(Duration(0))
             Ok(c)
           Err(e) ->
-            _ = c.stream.close()
+            _ = c.output.close()
+            _ = c.input.close()
             Err(e)
       Err(e) ->
         _ = tcp.close()
         Err(e)
 
   private over(tcp: TcpStream, config: PgConfig, tls: bool) -> Result[Connection, PgError]
-    if !tls then return Ok(Connection(tcp, config, false))
+    if !tls then return Ok(halved(tcp, config, false))
     tcp.write(Out().beginUntyped().int32(SslRequestCode).close().toArray()).mapErr(e -> Io(e))?
     val answer = tcp.read(1).mapErr(e -> Io(e))?
     if answer.length == 0 then return Err(
@@ -1059,6 +1114,11 @@ object Connection
           Some(pem) -> TlsClient().trust(pem)
           None -> TlsClient()
         val secured = TlsStream.client(tcp, config.host, settings).mapErr(e -> Tls(e))?
-        Ok(Connection(secured, config, true))
-      'N' -> if config.sslMode == Require then Err(TlsRefused) else Ok(Connection(tcp, config, false))
+        Ok(halved(secured, config, true))
+      'N' -> if config.sslMode == Require then Err(TlsRefused) else Ok(halved(tcp, config, false))
       c -> Err(Protocol(s"the server answered the TLS request with `$c`"))
+
+  // A connection over `stream`, split into its reading and its writing half.
+  private halved(stream: ByteStream, config: PgConfig, tls: bool) -> Connection
+    val (r, w) = stream.split()
+    Connection(r, w, config, tls)

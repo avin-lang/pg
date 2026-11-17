@@ -1,0 +1,237 @@
+module tests
+
+// Batches too large for the sockets' buffers, written by a thread of their own while their answers
+// are read: a hundred thousand statements and megabytes of parameters without deadlock, in either
+// mode and over TLS; a failure part-way through such a batch in either mode, and inside a
+// transaction; the preparing of thousands of distinct statements; and many such batches at once on
+// connections of their own.
+
+import avin.threads.{scope, withTimeout}
+import avin.time.seconds
+import dev.avinlang.pg
+
+import dev.avinlang.pg.{Atomic, Batch, BatchMode, BatchResults, Connection, Independent, PgError, Skipped}
+
+// A connection and a fresh table `name` of its own.
+private pipelineTable(name: string, columns: string = "n int") -> Option[Result[Connection, PgError]] =
+  testConnection().map(r ->
+    val c = r?
+    c.simpleQuery(s"drop table if exists $name; create table $name ($columns)")?
+    Ok(c))
+
+// `n` inserts into `table`, of 0 up to `n`.
+private inserts(table: string, n: int) -> Batch
+  var b = Batch()
+  for i in 0 ..< n
+    b = b.queue(s"insert into $table values ($$1)", i)
+  b
+
+// Sends `b` in `mode` on `c`, giving up after two minutes, which a deadlocked batch would reach.
+private within(c: Connection, b: Batch, mode: BatchMode) -> Result[BatchResults, PgError] =
+  withTimeout(seconds(120), _ -> c.sendBatch(b, mode)).getOrElse(Err(pg.Closed))
+
+private rowsIn(c: Connection, table: string) -> Result[long, PgError] = c.queryValue[long](
+  s"select count(*) from $table"
+)
+
+private sqlstate(results: BatchResults, index: int) -> Option[string] = results.get(index).err.flatMap(e -> e.code)
+
+@test("a batch of a hundred thousand statements is answered in full, in either mode, without deadlock")
+hundredThousand() -> Result[unit, PgError]
+  val c = pipelineTable("pipe_many") match
+    Some(r) -> r?
+    None -> return Ok(())
+  val b = inserts("pipe_many", 100000)
+  for mode in [Atomic, Independent]
+    c.execute("truncate pipe_many")?
+    val results = within(c, b, mode)?
+    assertEq(results.length, 100000)
+    assertEq(results.failure, None)
+    assertEq(results.get(0)?.affected, long(1))
+    assertEq(results.get(99999)?.affected, long(1))
+    assertEq(rowsIn(c, "pipe_many"), Ok(long(100000)))
+    assert(!c.isBroken)
+    assert(!c.inTransaction)
+  c.simpleQuery("drop table pipe_many")?
+  c.close()
+
+@test("megabytes of parameters, each larger than a write at a time, are sent whole")
+largeParameters() -> Result[unit, PgError]
+  val c = pipelineTable("pipe_wide", "n int, body text") match
+    Some(r) -> r?
+    None -> return Ok(())
+  val wide = "w".repeat(1048576)
+  for mode in [Atomic, Independent]
+    c.execute("truncate pipe_wide")?
+    var b = Batch()
+    for i in 0 ..< 24
+      b = b.queue("insert into pipe_wide values ($1, $2)", i, wide)
+      b = b.queue("select length(body) from pipe_wide where n = $1", i)
+    val results = within(c, b, mode)?
+    assertEq(results.failure, None)
+    assertEq(results.get(47)?.rows(0).get[int](0), Ok(1048576))
+    assertEq(c.queryValue[long]("select sum(length(body)) from pipe_wide"), Ok(long(24 * 1048576)))
+  // Answers of megabytes each, read while more is written.
+  val back = within(
+    c,
+    Batch().queue("select body from pipe_wide where n = 0").queue("select body from pipe_wide where n = 23"),
+    Atomic
+  )?
+  assertEq(back.get(1)?.rows(0).get[string](0).map(s -> s.byteLength), Ok(1048576))
+  c.simpleQuery("drop table pipe_wide")?
+  c.close()
+
+@test("a failure half-way through a batch written by its own thread: atomic keeps nothing and skips the rest")
+atomicMidFailure() -> Result[unit, PgError]
+  val c = pipelineTable("pipe_atomic") match
+    Some(r) -> r?
+    None -> return Ok(())
+  val b = Batch(
+    inserts("pipe_atomic", 20000).items ++ Batch().queue("select 1 / 0").items ++ inserts("pipe_atomic", 20000).items
+  )
+  val results = within(c, b, Atomic)?
+  assertEq(results.length, 40001)
+  assertEq(results.get(19999)?.affected, long(1))
+  assertEq(sqlstate(results, 20000), Some("22012"))
+  assertEq(results.get(20001).err, Some(Skipped))
+  assertEq(results.get(40000).err, Some(Skipped))
+  assertEq(rowsIn(c, "pipe_atomic"), Ok(long(0)))
+  assert(!c.isBroken)
+  assert(!c.inTransaction)
+  // The connection goes on, and the same batch without the failure runs whole.
+  assertEq(within(c, inserts("pipe_atomic", 40000), Atomic)?.failure, None)
+  assertEq(rowsIn(c, "pipe_atomic"), Ok(long(40000)))
+  c.simpleQuery("drop table pipe_atomic")?
+  c.close()
+
+@test("a failure half-way through a batch written by its own thread: independent fails it alone")
+independentMidFailure() -> Result[unit, PgError]
+  val c = pipelineTable("pipe_indep") match
+    Some(r) -> r?
+    None -> return Ok(())
+  val b = Batch(
+    inserts("pipe_indep", 20000).items ++ Batch().queue("select 1 / 0").items ++ inserts("pipe_indep", 20000).items
+  )
+  val results = within(c, b, Independent)?
+  assertEq(results.length, 40001)
+  assertEq(sqlstate(results, 20000), Some("22012"))
+  assertEq(results.get(20001)?.affected, long(1))
+  assertEq(results.get(40000)?.affected, long(1))
+  assertEq(rowsIn(c, "pipe_indep"), Ok(long(40000)))
+  // Failures scattered through it, every one its own.
+  var scattered = Batch()
+  for i in 0 ..< 30000
+    scattered = if i % 1000 == 999 then scattered.queue("select 1 / 0") else scattered.queue("select $1::int", i)
+  val many = within(c, scattered, Independent)?
+  var failed = 0
+  for i in 0 ..< 30000
+    if many.get(i).isErr then failed += 1
+  assertEq(failed, 30)
+  assertEq(many.get(29998)?.rows(0).get[int](0), Ok(29998))
+  assert(!c.isBroken)
+  c.simpleQuery("drop table pipe_indep")?
+  c.close()
+
+@test("a large batch failing inside a transaction fails the transaction, which is rolled back")
+largeInTransaction() -> Result[unit, PgError]
+  val c = pipelineTable("pipe_tx") match
+    Some(r) -> r?
+    None -> return Ok(())
+  for mode in [Atomic, Independent]
+    val failing = c.transaction(tx ->
+      val r = tx.sendBatch(Batch(inserts("pipe_tx", 10000).items ++ Batch().queue("select 1 / 0").items), mode)?
+      r.failure match
+        Some(e) -> Err(e)
+        None -> Ok(()))
+    assertEq(failing.err.flatMap(e -> e.code), Some("22012"))
+    assertEq(rowsIn(c, "pipe_tx"), Ok(long(0)))
+  assertEq(c.transaction(tx -> tx.sendBatch(inserts("pipe_tx", 10000))).map(r -> r.length), Ok(10000))
+  assertEq(rowsIn(c, "pipe_tx"), Ok(long(10000)))
+  assert(!c.inTransaction)
+  c.simpleQuery("drop table pipe_tx")?
+  c.close()
+
+@test("thousands of distinct statements are prepared together by the writing thread, in a transaction too")
+manyDistinct() -> Result[unit, PgError]
+  val c = testConnection() match
+    Some(r) -> r?
+    None -> return Ok(())
+  var b = Batch()
+  for k in 0 ..< 3000
+    b = b.queue(s"select $$1::int + $k", k)
+  val results = within(c, b, Atomic)?
+  assertEq(results.failure, None)
+  assertEq(results.get(2999)?.rows(0).get[int](0), Ok(5998))
+  // Inside a transaction the preparing is guarded by a savepoint; a statement the server refuses is
+  // sent unprepared and fails where it stands.
+  val inside = c.transaction(tx ->
+    val r = tx.sendBatch(Batch(b.items ++ Batch().queue("select from no_such_table").items), Independent)?
+    assertEq(r.get(1500)?.rows(0).get[int](0), Ok(3000))
+    assertEq(sqlstate(r, 3000), Some("42P01"))
+    Ok(()))
+  assertEq(inside, Err(pg.RolledBack))
+  assert(!c.inTransaction)
+  assert(!c.isBroken)
+  c.close()
+
+@test("a batch of fifty thousand statements over TLS is answered in full, in either mode")
+overTls() -> Result[unit, PgError]
+  val ca = testCa() match
+    Some(p) -> p
+    None -> return Ok(())
+  val c = pg.connect(testUrl(s"sslmode=require&sslrootcert=$ca").get)?
+  assert(c.isTls)
+  c.simpleQuery("drop table if exists pipe_tls; create table pipe_tls (n int, body text)")?
+  for mode in [Atomic, Independent]
+    c.execute("truncate pipe_tls")?
+    var b = Batch()
+    for i in 0 ..< 50000
+      b = b.queue("insert into pipe_tls values ($1, $2)", i, if i % 5000 == 0 then "t".repeat(200000) else "t")
+    val results = within(c, b, mode)?
+    assertEq(results.length, 50000)
+    assertEq(results.failure, None)
+    assertEq(rowsIn(c, "pipe_tls"), Ok(long(50000)))
+  // A failure half-way, and the connection goes on.
+  val failed = within(
+    c,
+    Batch(inserts("pipe_tls", 20000).items ++ Batch().queue("select 1 / 0").items ++ inserts("pipe_tls", 20000).items),
+    Atomic
+  )?
+  assertEq(sqlstate(failed, 20000), Some("22012"))
+  assertEq(c.queryValue[string]("select $1", "still over TLS"), Ok("still over TLS"))
+  c.simpleQuery("drop table pipe_tls")?
+  c.close()
+
+// Thread `t` sends `rounds` batches of `per` inserts of its own on a connection of its own, each
+// followed by a count of its rows, in `mode`; answers the counts.
+private pipelineRounds(t: int, rounds: int, per: int, mode: BatchMode) -> Result[Vector[long], PgError]
+  val c = testConnection().get?
+  var counts: Vector[long] = []
+  for round in 0 ..< rounds
+    var b = Batch()
+    for i in 0 ..< per
+      b = b.queue("insert into pipe_threads values ($1, $2)", t, round * per + i)
+    b = b.queue("select count(*) from pipe_threads where t = $1", t)
+    val results = within(c, b, mode)?
+    assertEq(results.length, per + 1)
+    counts = counts :+ results.get(per)?.rows(0).get[long](0)?
+  c.close()?
+  Ok(counts)
+
+@test("many large batches at once, each on a connection of its own, each answered in full")
+concurrentLarge() -> Result[unit, PgError]
+  val c = pipelineTable("pipe_threads", "t int, n int") match
+    Some(r) -> r?
+    None -> return Ok(())
+  val threads = 12
+  val rounds = 3
+  val per = 15000
+  val answers = scope(s ->
+    val started = (0 ..< threads).map(t ->
+      s.spawn(() -> pipelineRounds(t, rounds, per, if t % 2 == 0 then Atomic else Independent)))
+    started.map(th -> th.join()))
+  for a in answers
+    assertEq(a?, (1 .. rounds).map(k -> long(k * per)).toVector)
+  assertEq(rowsIn(c, "pipe_threads"), Ok(long(threads * rounds * per)))
+  c.simpleQuery("drop table pipe_threads")?
+  c.close()
