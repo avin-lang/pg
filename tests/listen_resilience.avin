@@ -1,0 +1,206 @@
+module tests
+
+// Notifications and the connection's resilience together: a notification that arrives between
+// requests goes to the hook and is not an unexpected message, the pool's check of an idle connection
+// and a wait for a notification leave it alone, and a listener reconnects through the connect
+// deadline, a host list and PgBouncer mode.
+
+import avin.io
+import avin.threads.{Atomic, sleep}
+import avin.time.{Duration, millis, monotonic, seconds}
+import dev.avinlang.pg
+
+import dev.avinlang.pg.{
+  Disconnected, Host, ListenEvent, Listener, NotSent, Notification, Notified, PgConfig, PgError, PgPool, Reconnected,
+  ReadWrite, Server
+}
+
+// A NotificationResponse from backend 9.
+private note(channel: string, payload: string) -> Vector[byte] =
+  msg('A', int32(9) ++ cstr(channel) ++ cstr(payload))
+
+private heardBy(
+    heard: Atomic[Vector[Notification]]
+) -> @sendable (Notification) -> unit = n -> _ = heard.update(v -> v :+ n)
+
+private val answer = msg('C', cstr("SELECT 0")) ++ ready
+
+@test("a notification between requests goes to the hook; the next statement is sent and answered")
+idleNotificationToHook() -> Result[unit, PgError]
+  val heard = Atomic[Vector[Notification]]([])
+  val steps = [ReadUntyped, Send(started), Send(note("jobs", "one")), ReadTyped, Send(answer)]
+  withServer(steps, port ->
+    val c = pg.connect(config(port) with {notifications = Some(heardBy(heard))})?
+    sleep(millis(200))
+    assertEq(c.simpleQuery("select")?.map(r -> r.tag), ["SELECT 0"])
+    assertEq(heard.load(), [Notification("jobs", "one", 9)])
+    assert(!c.isBroken)
+    c.close())
+
+@test("a notification between requests with no hook is dropped, not taken for an unexpected message")
+idleNotificationDropped() -> Result[unit, PgError]
+  val steps = [ReadUntyped, Send(started), Send(note("jobs", "one")), ReadTyped, Send(answer)]
+  connectTo(steps, use = c ->
+    sleep(millis(200))
+    assertEq(c.simpleQuery("select")?.map(r -> r.tag), ["SELECT 0"])
+    assert(!c.isBroken)
+    Ok(()))
+
+@test("a notification followed by the server ending the session: the hook has it, then NotSent")
+notificationThenFatal() -> Result[unit, PgError]
+  val heard = Atomic[Vector[Notification]]([])
+  val steps = [ReadUntyped, Send(started), Send(note("jobs", "one") ++ fatal()), HangUp]
+  withServer(steps, port ->
+    val c = pg.connect(config(port) with {notifications = Some(heardBy(heard))})?
+    sleep(millis(200))
+    val r = c.query("select 1")
+    r match
+      Err(NotSent(Server(d))) -> assertEq(d.code, "57P01")
+      _ -> assert(false, "not NotSent(Server)")
+    assertEq(heard.load(), [Notification("jobs", "one", 9)])
+    c.close())
+
+@test("isHealthy: a notification that arrived while idle leaves the connection healthy and goes to the hook")
+healthyWithNotification() -> Result[unit, PgError]
+  val heard = Atomic[Vector[Notification]]([])
+  val steps = [ReadUntyped, Send(started), Send(note("jobs", "one")), ReadTyped, Send(answer)]
+  withServer(steps, port ->
+    val c = pg.connect(config(port) with {notifications = Some(heardBy(heard))})?
+    sleep(millis(200))
+    assert(c.isHealthy)
+    assertEq(heard.load(), [Notification("jobs", "one", 9)])
+    assertEq(c.simpleQuery("select")?.map(r -> r.tag), ["SELECT 0"])
+    c.close())
+
+@test("isHealthy: an error the server sent is still unhealthy, and the connection is broken")
+unhealthyWithFatal() -> Result[unit, PgError]
+  val steps = [ReadUntyped, Send(started), Send(note("jobs", "one") ++ fatal()), HangUp]
+  connectTo(steps, use = c ->
+    sleep(millis(200))
+    assert(!c.isHealthy)
+    assert(c.isBroken)
+    Ok(()))
+
+@test("waitForNotification gets a notification that arrived idle, which the hook is not also given")
+waitGetsIdleNotification() -> Result[unit, PgError]
+  val heard = Atomic[Vector[Notification]]([])
+  val steps = [ReadUntyped, Send(started), Send(note("jobs", "one")), Pause(seconds(2)), HangUp]
+  withServer(steps, port ->
+    val c = pg.connect(config(port) with {notifications = Some(heardBy(heard))})?
+    sleep(millis(200))
+    assertEq(c.waitForNotification(seconds(5)), Ok(Some(Notification("jobs", "one", 9))))
+    assertEq(heard.load(), [])
+    c.close())
+
+@test("a pooled connection that LISTENs and is notified while idle is lent again, the hook has the notification")
+notifiedWhileIdleInPool() -> Result[unit, PgError]
+  val config = testUrl() match
+    Some(u) -> PgConfig.parse(u)?
+    None -> return Ok(())
+  val heard = Atomic[Vector[Notification]]([])
+  val db = PgPool.of(
+    config with {notifications = Some(heardBy(heard))},
+    maxSize = 1,
+    pingAfter = None,
+    healthCheck = None
+  )
+  val pid = db.use(c ->
+    c.simpleQuery("listen idlepool")?
+    Ok(c.backendPid))?
+  val sender = pg.connect(config)?
+  sender.query("select pg_notify($1, $2)", "idlepool", "while idle")?
+  sleep(millis(200))
+  assertEq(db.use(c -> Ok(c.backendPid)), Ok(pid))
+  assertEq(heard.load().map(n -> n.payload), ["while idle"])
+  assertEq(db.stats().created, long(1))
+  // With a ping before lending too.
+  val pinging = PgPool.of(
+    config with {notifications = Some(heardBy(heard))},
+    maxSize = 1,
+    pingAfter = Some(Duration(0)),
+    healthCheck = None
+  )
+  val pingPid = pinging.use(c ->
+    c.simpleQuery("listen idlepool")?
+    Ok(c.backendPid))?
+  sender.query("select pg_notify($1, $2)", "idlepool", "pinged")?
+  sleep(millis(200))
+  assertEq(pinging.use(c -> Ok(c.backendPid)), Ok(pingPid))
+  assertEq(heard.load().map(n -> n.payload), ["while idle", "pinged"])
+  assertEq(pinging.stats().created, long(1))
+  sender.close()?
+  db.close()
+  pinging.close()
+  Ok(())
+
+@test(
+  "a listener on a host list passes over a refusing host and a silent one, within the connect timeout, and reconnects the same way"
+)
+listenerMultiHost() -> Result[unit, PgError]
+  val (base, rw, ro) = bothServers() match
+    Some(b) -> b
+    None -> return Ok(())
+  val config = base with {
+    hosts = [Host("127.0.0.1", 1), Host(unanswered, 5432), Host("127.0.0.1", ro), Host("127.0.0.1", rw)],
+    targetSessionAttrs = ReadWrite,
+    connectTimeout = Some(millis(300)),
+    applicationName = Some("listen-multihost")
+  }
+  val began = monotonic()
+  val l = Listener.open(config, ["mh"], minBackoff = millis(20))?
+  assert(monotonic() - began < seconds(10))
+  val admin = pg.connect(base with {applicationName = Some("listen-multihost-admin")})?
+  assertEq(admin.queryValue[int]("select current_setting('port')::int4"), Ok(rw))
+  admin.query("select pg_notify($1, $2)", "mh", "first")?
+  assertEq(nextEvent(l), Notified(Notification("mh", "first", admin.backendPid)))
+  // The listener's connection is the read-write server's, not the read-only one's.
+  terminate(admin, "listen-multihost")?
+  nextEvent(l) match
+    Disconnected(e) -> assertEq(e.code, Some("57P01"))
+    other -> fail(s"expected Disconnected, got $other")
+  nextEvent(l) match
+    Reconnected(_) -> ()
+    other -> fail(s"expected Reconnected, got $other")
+  admin.query("select pg_notify($1, $2)", "mh", "second")?
+  assertEq(nextEvent(l), Notified(Notification("mh", "second", admin.backendPid)))
+  l.close()
+  admin.close()
+
+@test("a listener whose hosts all lack the kind it needs fails to open with NoTarget, and is never left running")
+listenerNoTarget() -> Result[unit, PgError]
+  val (base, _, ro) = bothServers() match
+    Some(b) -> b
+    None -> return Ok(())
+  val config = base with {hosts = [Host("127.0.0.1", ro)], targetSessionAttrs = ReadWrite}
+  Listener.open(config, ["nt"]) match
+    Err(pg.NoTarget(_)) -> ()
+    _ -> assert(false, "not NoTarget")
+  Ok(())
+
+@test("a listener within the connect deadline: a host that never answers fails Listener.open as TimedOut")
+listenerConnectDeadline() -> Result[unit, PgError]
+  val base = testUrl() match
+    Some(u) -> PgConfig.parse(u)?
+    None -> return Ok(())
+  val config = base with {hosts = [Host(unanswered, 5432)], connectTimeout = Some(millis(300))}
+  val began = monotonic()
+  Listener.open(config, ["dl"]) match
+    Err(pg.Io(e)) -> assertEq(e.kind, io.TimedOut)
+    _ -> assert(false, "not Io(TimedOut)")
+  assert(monotonic() - began < seconds(5))
+  Ok(())
+
+@test("a listener in PgBouncer mode LISTENs, is notified, and listens at run time")
+listenerPgbouncer() -> Result[unit, PgError]
+  val base = testUrl() match
+    Some(u) -> PgConfig.parse(u)?
+    None -> return Ok(())
+  val l = Listener.open(base with {pgbouncer = true}, ["pb1"])?
+  val sender = pg.connect(base)?
+  sender.query("select pg_notify($1, $2)", "pb1", "one")?
+  assertEq(nextEvent(l), Notified(Notification("pb1", "one", sender.backendPid)))
+  assertEq(l.listen("pb2"), Ok(()))
+  sender.query("select pg_notify($1, $2)", "pb2", "two")?
+  assertEq(nextEvent(l), Notified(Notification("pb2", "two", sender.backendPid)))
+  l.close()
+  sender.close()

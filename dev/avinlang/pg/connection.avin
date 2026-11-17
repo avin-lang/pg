@@ -8,7 +8,7 @@ import avin.io
 import avin.io.IoError
 import avin.net.{ByteStream, StreamReader, StreamWriter, TcpStream}
 import avin.net.tls.{TlsClient, TlsStream}
-import avin.threads.after
+import avin.threads.{Readiness, withTimeout}
 import avin.time.{Duration, monotonic, seconds}
 
 // A statement prepared on a connection: its name there, its text, the types of its parameters as
@@ -81,7 +81,7 @@ class Connection(
   private val config: PgConfig,
   // Whether the connection is encrypted.
   val isTls: bool
-)
+): Readiness
   private var reader = MessageReader(input)
   private var pid = 0
   private var secret = 0
@@ -89,6 +89,8 @@ class Connection(
   // failed one.
   private var status = 'I'
   private var broken = false
+  // What the server ended the session with, found while the connection was idle and not yet answered.
+  private var ended: Option[PgError] = None
   private var closed = false
   // Set while a request's answer is being read, so a cancellation in the middle knows to drain it.
   private var awaiting = false
@@ -148,6 +150,46 @@ class Connection(
     if setTimeouts(Duration(0)).isErr then broken = true
     answered
 
+  // ---- Notifications ----
+
+  // Waits at most `timeout` while the connection is idle for a notification on a channel it has
+  // LISTENed to, and answers it, or `None` where none came in time. A timeout of zero or less reads
+  // only what has already arrived. A notification that arrives while a statement runs goes to the
+  // configuration's `notifications` hook instead, and is dropped without one, so a connection that
+  // both runs statements and waits sets the hook, or a `Listener` is used. Notices and parameter
+  // changes that arrive meanwhile are dealt with as they are during a statement. The server ending
+  // the connection breaks it and answers the error it sent, `Server` with SQLSTATE `57P01` where an
+  // administrator terminated it.
+  waitForNotification(timeout: Duration) -> Result[Option[Notification], PgError]
+    if closed || broken then return Err(Closed)
+    val deadline = monotonic() + timeout
+    while true
+      if !readable()
+        val left = deadline - monotonic()
+        if left.micros <= 0 then return Ok(None)
+        val arrived = select
+          input.readable() -> true
+          after left -> false
+        if !arrived then return Ok(None)
+      val m = reader.next() match
+        Ok(m) -> m
+        Err(e) ->
+          broken = true
+          return Err(e)
+      heard = monotonic()
+      m.kind match
+        'A' -> return Ok(Some(notificationOf(m)))
+        'E' -> return broke(Server(diagnosticOf(m)))
+        _ -> if !asynchronous(m) then return broke(Protocol(s"unexpected message `${m.kind}` while idle"))
+    Ok(None)
+
+  // Whether a read would answer without waiting: a message is buffered or bytes have arrived, or the
+  // connection has ended. A `select` waits for a notification with a `connection.readable()` arm,
+  // then reads it with `waitForNotification`; only the thread that owns the connection may.
+  override readable() -> bool = reader.pending || input.readable()
+
+  override readinessDescriptor() -> int = input.readinessDescriptor()
+
   // ---- Running statements ----
 
   // The rows `sql` returns, its parameters `$1`, `$2`… bound to `params`.
@@ -189,8 +231,10 @@ class Connection(
     runStatement(statement, params.map(paramOf)).map(r -> affectedBy(r.tag))
 
   // Prepares `sql` under a name of its own, its parameters' types inferred by the server. The
-  // statement stays prepared until the connection closes or `deallocate` closes it.
+  // statement stays prepared until the connection closes or `deallocate` closes it. Under the
+  // configuration's `pgbouncer`, which prepares nothing under a name, it is refused.
   prepare(sql: string) -> Result[Statement, PgError]
+    if config.pgbouncer then return Err(Config("statements are not prepared under `pgbouncer`"))
     counter += 1
     parse(s"pgp_$counter", sql, [])
 
@@ -278,8 +322,31 @@ class Connection(
     simple("ROLLBACK")
 
   // Whether the connection can be used at once: it is open, not broken, in no transaction, and the
-  // server has sent nothing unasked, as it does when it ends the session.
-  isHealthy -> bool = !closed && !broken && status == 'I' && !input.readable()
+  // server has not ended the session. What the server sent unasked is read, never waited for: a
+  // notice, a parameter's new value or a notification is dealt with as during a statement (a
+  // notification goes to the `notifications` hook), so one that arrived while the connection was
+  // idle does not make it unfit; an error or the end of the connection does, and breaks it, the
+  // failure being what the next request answers (`NotSent`), as if that request had found it.
+  isHealthy -> bool
+    if closed || broken || status != 'I' then return false
+    drained().isEmpty
+
+  // Reads what the server has sent unasked, without waiting, dealing with what may come at any time.
+  // Answers the failure where the server ended the session, which breaks the connection and is kept
+  // for the next request to answer.
+  private drained() -> Option[PgError]
+    while reader.pending || input.readable()
+      val failure = reader.next() match
+        Ok(m) ->
+          if asynchronous(m) then continue
+          if m.kind == 'E' then Server(diagnosticOf(m)) else Protocol(
+            s"unexpected message `${m.kind}` between requests"
+          )
+        Err(e) -> e
+      broken = true
+      ended = Some(failure)
+      return Some(failure)
+    None
 
   // Says goodbye to the server and closes the connection. Closing a closed connection does nothing.
   close() -> Result[unit, PgError]
@@ -418,6 +485,8 @@ class Connection(
     for p in plans
       p.known match
         Some(s) -> statements.addOne(Some(s))
+        // Under `pgbouncer` nothing is prepared: each item is parsed unnamed with its run.
+        None if config.pgbouncer -> statements.addOne(None)
         None ->
           counter += 1
           val name = if config.statementCacheSize == 0 then s"pgb_$counter" else s"pgs_$counter"
@@ -611,6 +680,7 @@ class Connection(
 
   private runCached(sql: string, params: Vector[Typed]) -> Result[QueryResult, PgError]
     usable()?
+    if config.pgbouncer then return runUnnamed(sql, params)
     val statement = statementFor(sql, params)?
     runPrepared(statement, params) match
       Err(Server(d)) ->
@@ -701,6 +771,25 @@ class Connection(
       Ok(()))?
     Ok(QueryResult(tag, rows.toVector))
 
+  // Parses `sql` unnamed, binds `params` to it, runs it and reads its rows, in one round trip, so
+  // nothing outlives the request: the way statements run under `pgbouncer`.
+  private runUnnamed(sql: string, params: Vector[Typed]) -> Result[QueryResult, PgError]
+    val out = Out()
+    parseAndExecute(out, Plan("", sql, params.map(p -> p.oid), None), params)?
+    out.begin('S').close()
+    val rows = Buffer[Row]()
+    var columns: Vector[Column] = []
+    var tag = ""
+    exchange(out, (m, failed) ->
+      m.kind match
+        '1' | '2' | 'n' | 'I' -> ()
+        'T' -> columns = describe(m)?.map(c -> c.0)
+        'D' -> if !failed then rows.addOne(textRow(columns, m)?)
+        'C' -> tag = In(m.body).cstring()
+        _ -> return Err(Protocol(s"unexpected message `${m.kind}` answering Execute"))
+      Ok(()))?
+    Ok(QueryResult(tag, rows.toVector))
+
   // Runs `sql`, a statement with no parameters and no rows to keep, by the simple protocol.
   private simple(sql: string) -> Result[unit, PgError]
     simpleQuery(sql)?
@@ -708,8 +797,24 @@ class Connection(
 
   // ---- Talking to the server ----
 
-  // Fails where the connection cannot be used.
-  private usable() -> Result[unit, PgError] = if closed || broken then Err(Closed) else Ok(())
+  // Fails where the connection cannot be used. Between requests it first reads what the server has
+  // sent unasked: a notice, a parameter's new value or a notification is dealt with as `receive` deals
+  // with it (a notification goes to the `notifications` hook, not to be mistaken for an unexpected
+  // message), while an error, which the server sends as it ends the session, or the connection's
+  // end, breaks the connection (a failure `isHealthy` found first is answered here, once). Outside a
+  // transaction that failure is `NotSent`, since nothing of the request has been sent.
+  private usable() -> Result[unit, PgError]
+    if closed then return Err(Closed)
+    if broken
+      val found = ended
+      ended = None
+      return Err(if found is Some(f) then NotSent(f) else Closed)
+    if awaiting then return Ok(())
+    drained() match
+      Some(failure) ->
+        ended = None
+        Err(if status == 'I' && depth == 0 then NotSent(failure) else failure)
+      None -> Ok(())
 
   // Sends `out`; a failure breaks the connection.
   private send(out: Out) -> Result[unit, PgError]
@@ -727,9 +832,8 @@ class Connection(
     broken = true
     Err(e)
 
-  // The next message, with the ones that can come at any time dealt with on the way: a notice goes
-  // to the configuration's sink, a parameter's new value is kept, a notification is dropped. A
-  // failure to read breaks the connection.
+  // The next message, with the ones that can come at any time dealt with on the way. A failure to
+  // read breaks the connection.
   private receive() -> Result[Message, PgError]
     while true
       val m = reader.next() match
@@ -738,18 +842,25 @@ class Connection(
           broken = true
           return Err(e)
       heard = monotonic()
-      m.kind match
-        'N' ->
-          config.notices match
-            Some(sink) -> sink(diagnosticOf(m))
-            None -> ()
-        'S' ->
-          val r = In(m.body)
-          val name = r.cstring()
-          parameters = parameters.updated(name, r.cstring())
-        'A' -> ()
-        _ -> return Ok(m)
+      if !asynchronous(m) then return Ok(m)
     Err(Protocol("unreachable"))
+
+  // Deals with `m` where it is a message that can come at any time, and answers whether it was: a
+  // notice goes to the configuration's sink, a parameter's new value is kept, a notification goes to
+  // the configuration's hook, each dropped where there is none.
+  private asynchronous(m: Message) -> bool = m.kind match
+    'N' ->
+      if config.notices is Some(sink) then sink(diagnosticOf(m))
+      true
+    'S' ->
+      val r = In(m.body)
+      val name = r.cstring()
+      parameters = parameters.updated(name, r.cstring())
+      true
+    'A' ->
+      if config.notifications is Some(hook) then hook(notificationOf(m))
+      true
+    _ -> false
 
   // Sends `out` and reads the answer up to ReadyForQuery, giving each message other than an error to
   // `handle` with whether an error has already come. The first error is the answer; a protocol
@@ -797,21 +908,20 @@ class Connection(
     sending.foreach(s -> s.stop())
     while !broken && sending.isDefined
       val s = sending.get
-      var readable = reader.hasBuffered
+      var readable = reader.pending
       if !readable
-        val limit = after(DrainLimit)
         select
           input.readable() -> readable = true
           s.done.receive() as None -> ()
-          limit.receive() -> broken = true
-      if readable then drained() elif !broken then _ = sent()
+          after DrainLimit -> broken = true
+      if readable then drainOne() elif !broken then _ = sent()
     while !broken && owed > 0
-      drained()
+      drainOne()
     owed = 0
     if input.setTimeout(Duration(0)).isErr then broken = true
 
   // Reads one message of an answer being drained: a ReadyForQuery is one fewer owed.
-  private drained()
+  private drainOne()
     reader.next() match
       Ok(m) ->
         if m.kind == 'Z'
@@ -1057,6 +1167,21 @@ private finished(
     localized: string
 ) -> Diagnostic = if d.severity == "" then d with {severity = localized} else d
 
+// What kind of server a connection reached: a standby or not, and read-only by default or not; a
+// standby is always read-only.
+private data ServerKind(standby: bool, readOnly: bool)
+
+// Whether a server of `kind` is one `target` asks for.
+private accepts(target: TargetSessionAttrs, kind: ServerKind) -> bool = target match
+  AnySession -> true
+  ReadWrite -> !kind.readOnly
+  ReadOnly -> kind.readOnly
+  Primary -> !kind.standby
+  Standby | PreferStandby -> kind.standby
+
+private kindText(kind: ServerKind) -> string =
+  if kind.standby then "a standby" elif kind.readOnly then "read-only" else "a read-write primary"
+
 // ---- Connecting ----
 
 // A connection made with the settings of the URL `url` (`PgConfig.parse`).
@@ -1069,8 +1194,67 @@ connect(config: PgConfig) -> Result[Connection, PgError] = Connection.connect(co
 object Connection
   // A connection made with `config`, as the module's `connect` makes it.
   connect(config: PgConfig) -> Result[Connection, PgError] = config.connectTracer match
-    None -> negotiated(config)
-    Some(t) -> tracedConnect(t, config, () -> negotiated(config))
+    None -> chosen(config)
+    Some(t) -> tracedConnect(t, config, () -> chosen(config))
+
+  // A connection to the first of the configuration's servers that connects, each within the
+  // `connectTimeout`, and is of the kind its `targetSessionAttrs` asks for. Under `PreferStandby` the
+  // first server that connects is kept until a standby is found, and is the answer where none is.
+  // Where no server will do, the answer is the last server's failure.
+  private chosen(config: PgConfig) -> Result[Connection, PgError]
+    val target = config.targetSessionAttrs
+    var last: PgError = NoTarget("the host list is empty")
+    var fallback: Option[Connection] = None
+    for h in config.servers
+      bounded(config with {host = h.name, port = h.port}) match
+        Ok((c, kind)) ->
+          if accepts(target, kind)
+            if fallback is Some(f) then _ = f.close()
+            return Ok(c)
+          if target == PreferStandby && fallback.isEmpty
+            fallback = Some(c)
+          else
+            _ = c.close()
+            last = NoTarget(s"${h.name}:${h.port} is ${kindText(kind)}")
+        Err(e) -> last = e
+    fallback match
+      Some(c) -> Ok(c)
+      None -> Err(last)
+
+  // `attempt`, within the configuration's `connectTimeout` where it sets one: where the time runs
+  // out first, the attempt is cancelled wherever it is, and the answer is a `TimedOut` failure.
+  private bounded(config: PgConfig) -> Result[(Connection, ServerKind), PgError] = config.connectTimeout match
+    Some(d) if d.micros > 0 -> withTimeout(d, _ -> attempt(config)) match
+      Some(r) -> r
+      None -> Err(Io(IoError(io.TimedOut, "connect to", s"${config.host}:${config.port}")))
+    _ -> attempt(config)
+
+  // A connection to the configuration's one server, and, where the configuration asks for a kind of
+  // server, the kind it is.
+  private attempt(config: PgConfig) -> Result[(Connection, ServerKind), PgError]
+    val c = negotiated(config)?
+    if config.targetSessionAttrs == AnySession then return Ok((c, ServerKind(false, false)))
+    var kept = false
+    defer
+      if !kept then _ = c.close()
+    val kind = kindOf(c)?
+    kept = true
+    Ok((c, kind))
+
+  // Whether the server `c` is connected to is a standby, and whether it is read-only by default: as
+  // the server reports them where it does (from version 14), and as it answers when asked otherwise.
+  private kindOf(c: Connection) -> Result[ServerKind, PgError] =
+    (c.parameter("in_hot_standby"), c.parameter("default_transaction_read_only")) match
+      (Some(standby), Some(readOnly)) -> Ok(ServerKind(standby == "on", standby == "on" || readOnly == "on"))
+      _ ->
+        val answer = c.simpleQuery(
+          "SELECT pg_catalog.pg_is_in_recovery(), pg_catalog.current_setting('transaction_read_only')"
+        )?
+        answer.headOption.flatMap(r -> r.rows.headOption) match
+          Some(row) ->
+            val standby = row.get[string](0)? == "t"
+            Ok(ServerKind(standby, standby || row.get[string](1)? == "on"))
+          None -> Err(Protocol("no row answering what kind of server it is"))
 
   // A connection over TLS or plain TCP as `config.sslMode` asks.
   private negotiated(config: PgConfig) -> Result[Connection, PgError] = config.sslMode match

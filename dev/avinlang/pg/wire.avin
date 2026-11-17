@@ -158,6 +158,10 @@ private class MessageReader(private val stream: Reader)
   // Bytes buffered and not yet read.
   private available -> int = end - at
 
+  // Whether bytes have arrived that no message read has taken yet, so the next message may be read
+  // without the connection being readable.
+  pending -> bool = available > 0
+
   // Reads until at least `n` bytes are buffered, or answers an error for a connection that ended. A
   // chunk read while nothing is buffered becomes the buffer as it is; one that has to join bytes
   // already there is copied after them, into a buffer made large enough for all `n` at once, so a
@@ -187,10 +191,6 @@ private class MessageReader(private val stream: Reader)
     fill(1)?
     at += 1
     Ok(int(buffer(at - 1)))
-
-  // Whether bytes have been read past what was consumed, so the next message may be read without the
-  // connection being readable.
-  hasBuffered -> bool = available > 0
 
   // The next message.
   next() -> Result[Message, PgError]

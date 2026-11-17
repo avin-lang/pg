@@ -5,8 +5,8 @@ module tests
 // what the client makes of each checked.
 
 import avin.net.{TcpListener, TcpStream}
-import avin.threads.{Channel, scope}
-import avin.time.millis
+import avin.threads.{Channel, scope, sleep}
+import avin.time.{Duration, millis}
 import dev.avinlang.pg
 import dev.avinlang.pg.{Auth, Connection, PgConfig, PgError, Protocol, Server, SslMode, TlsRefused}
 
@@ -20,23 +20,25 @@ data Step
   Send(bytes: Vector[byte])
   // Closes the connection at once.
   HangUp
+  // Waits this long.
+  Pause(time: Duration)
 
-private int32(n: int) -> Vector[byte] = [
+int32(n: int) -> Vector[byte] = [
   byte((n >> 24) & 0xff),
   byte((n >> 16) & 0xff),
   byte((n >> 8) & 0xff),
   byte(n & 0xff)
 ]
 
-private cstr(s: string) -> Vector[byte] = s.bytes :+ byte(0)
+cstr(s: string) -> Vector[byte] = s.bytes :+ byte(0)
 
 // A message of type `kind` with `body`.
-private msg(kind: char, body: Vector[byte]) -> Vector[byte] = [byte(int(kind))] ++ int32(body.length + 4) ++ body
+msg(kind: char, body: Vector[byte]) -> Vector[byte] = [byte(int(kind))] ++ int32(body.length + 4) ++ body
 
 private val authOk = msg('R', int32(0))
 private val keyData = msg('K', int32(42) ++ int32(7))
-private val ready = msg('Z', [byte(int('I'))])
-private val started = authOk ++ msg('S', cstr("server_version") ++ cstr("16.0")) ++ keyData ++ ready
+val ready = msg('Z', [byte(int('I'))])
+val started = authOk ++ msg('S', cstr("server_version") ++ cstr("16.0")) ++ keyData ++ ready
 
 // Reads exactly `n` bytes, or `None` where the client closed first.
 private readExactly(s: TcpStream, n: int) -> Option[Vector[byte]]
@@ -73,6 +75,7 @@ private serve(listener: TcpListener, steps: Vector[Step])
       HangUp ->
         _ = s.close()
         return
+      Pause(time) -> sleep(time)
   // What the client sends after the script, Terminate among it, until it closes.
   while true
     s.read(4096) match
@@ -81,7 +84,7 @@ private serve(listener: TcpListener, steps: Vector[Step])
   _ = s.close()
 
 // Runs `body` with the port of a server following `steps`.
-private withServer[T](steps: Vector[Step], body: (int) -> T) -> T
+withServer[T](steps: Vector[Step], body: (int) -> T) -> T
   val ports = Channel[int](1)
   scope(sc ->
     sc.spawn(() ->
@@ -93,7 +96,7 @@ private withServer[T](steps: Vector[Step], body: (int) -> T) -> T
         Err(_) -> ports.send(0))
     body(ports.receive().get))
 
-private config(port: int, sslMode: SslMode = SslMode.Disable) -> PgConfig =
+config(port: int, sslMode: SslMode = SslMode.Disable) -> PgConfig =
   PgConfig(
     host = "127.0.0.1",
     port = port,

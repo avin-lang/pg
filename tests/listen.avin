@@ -1,0 +1,424 @@
+module tests
+
+// LISTEN and NOTIFY: a listener's events on many channels, payloads up to the server's limit,
+// notifications held back until their transaction commits, many senders to one listener, a consumer
+// that falls behind, a connection the server terminates, delivery to an actor, notifications on an
+// ordinary connection, and the failures.
+
+import avin.actors.{ActorRef, spawn as spawnActor}
+import avin.threads.{Atomic, Promise, scope, sleep}
+import avin.time.{Duration, millis, monotonic, seconds}
+import dev.avinlang.pg
+
+import dev.avinlang.pg.{
+  Closed, Config, Connection, Disconnected, Dropped, Io, ListenEvent, Listener, Notification, Notified, PgConfig,
+  PgError, Reconnected, Server
+}
+
+// The test server's settings, or `None` where the test is skipped.
+private testConfig() -> Option[PgConfig] = testUrl().map(u -> PgConfig.parse(u) match
+  Ok(c) -> c
+  Err(e) -> fail(s"the test URL: $e"))
+
+// Sends `each` notifications `t:0`, `t:1`… on `load` from a connection of its own.
+private sendAll(config: PgConfig, t: int, each: int) -> Result[unit, PgError]
+  val c = pg.connect(config)?
+  for i in 0 ..< each
+    notify(c, "load", s"$t:$i")?
+  c.close()
+
+// The next event, failing the test where none comes within ten seconds.
+private nextEvent(l: Listener) -> ListenEvent = l.events.receive(seconds(10)) match
+  Some(e) -> e
+  None -> fail("no event within ten seconds")
+
+// The next event, which must be a notification.
+private nextNotification(l: Listener) -> Notification = nextEvent(l) match
+  Notified(n) -> n
+  other -> fail(s"expected a notification, got $other")
+
+// Sends `payload` on `channel` from `c`.
+private notify(c: Connection, channel: string, payload: string) -> Result[unit, PgError]
+  c.query("select pg_notify($1, $2)", channel, payload)?
+  Ok(())
+
+// Waits at most ten seconds for `ready` to hold.
+private eventually(ready: () -> bool)
+  val deadline = monotonic() + seconds(10)
+  while !ready()
+    if monotonic() > deadline then fail("the condition did not come about within ten seconds")
+    sleep(millis(5))
+
+@test("a listener on many channels gets each notification with its channel, payload and sender")
+manyChannels() -> Result[unit, PgError]
+  val config = testConfig() match
+    Some(c) -> c
+    None -> return Ok(())
+  // Names that need quoting: case, a space, a double quote, non-ASCII.
+  val names = ["plain", "Mixed Case", "with \"quote\"", "ünïcödé", "a;drop table x"]
+  val l = Listener.open(config, names)?
+  assertEq(l.channels(), Ok(names))
+  val sender = pg.connect(config)?
+  for (name, i) in names.zipWithIndex
+    notify(sender, name, s"payload $i")?
+  for (name, i) in names.zipWithIndex
+    assertEq(nextNotification(l), Notification(name, s"payload $i", sender.backendPid))
+  // An empty payload, and NOTIFY written in SQL.
+  sender.simpleQuery("notify plain")?
+  assertEq(nextNotification(l), Notification("plain", "", sender.backendPid))
+  // A channel the listener does not LISTEN to delivers nothing; one it does still does.
+  notify(sender, "PLAIN", "other channel")?
+  notify(sender, "plain", "after")?
+  assertEq(nextNotification(l).payload, "after")
+  assertEq(l.dropped, long(0))
+  sender.close()?
+  l.close()
+  Ok(())
+
+@test("a payload of 7999 bytes, the server's limit, arrives whole; 8000 is refused by the server")
+largePayload() -> Result[unit, PgError]
+  val config = testConfig() match
+    Some(c) -> c
+    None -> return Ok(())
+  val l = Listener.open(config, ["big"])?
+  val sender = pg.connect(config)?
+  val ascii = "x".repeat(7999)
+  notify(sender, "big", ascii)?
+  assertEq(nextNotification(l).payload, ascii)
+  // Multi-byte characters: 3999 two-byte ones and one byte more, 7999 bytes.
+  val wide = "é".repeat(3999) + "!"
+  assertEq(wide.byteLength, 7999)
+  notify(sender, "big", wide)?
+  assertEq(nextNotification(l).payload, wide)
+  assertEq(notify(sender, "big", "x".repeat(8000)).mapErr(e -> e.code), Err(Some("22023")))
+  // The listener goes on after the refused one.
+  notify(sender, "big", "small")?
+  assertEq(nextNotification(l).payload, "small")
+  sender.close()?
+  l.close()
+  Ok(())
+
+@test("notifications sent in a transaction arrive only once it commits, and never where it rolls back")
+transactional() -> Result[unit, PgError]
+  val config = testConfig() match
+    Some(c) -> c
+    None -> return Ok(())
+  val l = Listener.open(config, ["tx"])?
+  val sender = pg.connect(config)?
+  sender.simpleQuery("begin")?
+  notify(sender, "tx", "one")?
+  notify(sender, "tx", "two")?
+  // The same payload twice in one transaction is delivered once.
+  notify(sender, "tx", "two")?
+  assertEq(l.events.receive(millis(300)), None)
+  sender.simpleQuery("commit")?
+  assertEq(nextNotification(l).payload, "one")
+  assertEq(nextNotification(l).payload, "two")
+  sender.simpleQuery("begin")?
+  notify(sender, "tx", "rolled back")?
+  sender.simpleQuery("rollback")?
+  notify(sender, "tx", "after")?
+  assertEq(nextNotification(l).payload, "after")
+  // Inside `transaction`, the same.
+  sender.transaction(tx ->
+    notify(tx, "tx", "in transaction")?
+    assertEq(l.events.receive(millis(100)), None)
+    Ok(()))?
+  assertEq(nextNotification(l).payload, "in transaction")
+  sender.close()?
+  l.close()
+  Ok(())
+
+@test("many threads notify one listener at once: every notification arrives, none dropped")
+manySenders() -> Result[unit, PgError]
+  val config = testConfig() match
+    Some(c) -> c
+    None -> return Ok(())
+  val threads = 16
+  val each = 50
+  val l = Listener.open(config, ["load"], capacity = 64)?
+  // The consumer takes events while the senders send, through a queue far smaller than their total.
+  val seen = scope(s ->
+    val consumer = s.spawn(() ->
+      var got: Vector[string] = []
+      while got.length < threads * each
+        nextEvent(l) match
+          Notified(n) -> got = got :+ n.payload
+          other -> fail(s"unexpected $other")
+      got)
+    val senders = (0 ..< threads).map(t -> s.spawn(() -> sendAll(config, t, each)))
+    for sender in senders
+      assertEq(sender.join(), Ok(()))
+    consumer.join())
+  assertEq(seen.length, threads * each)
+  assertEq(seen.distinct.length, threads * each)
+  // Each sender's notifications arrive in the order it sent them.
+  for t in 0 ..< threads
+    val mine = seen.filter(p -> p.startsWith(s"$t:")).map(p -> p.slice(p.indexOf(":") + 1, p.byteLength).toInt())
+    assertEq(mine, (0 ..< each).toVector)
+  assertEq(l.dropped, long(0))
+  l.close()
+  Ok(())
+
+@test("a consumer that falls behind: the queue keeps its capacity, the rest are dropped and counted")
+backPressure() -> Result[unit, PgError]
+  val config = testConfig() match
+    Some(c) -> c
+    None -> return Ok(())
+  val l = Listener.open(config, ["slow"], capacity = 4)?
+  val sender = pg.connect(config)?
+  // Twenty in one transaction, so they reach the listener together, and nothing is taken meanwhile.
+  sender.transaction(tx ->
+    for i in 0 ..< 20
+      notify(tx, "slow", s"$i")?
+    Ok(()))?
+  eventually(() -> l.dropped == 16)
+  for i in 0 ..< 4
+    assertEq(nextNotification(l).payload, s"$i")
+  // The drop is reported once there is room, before anything sent later.
+  notify(sender, "slow", "later")?
+  assertEq(nextEvent(l), Dropped(16))
+  assertEq(nextNotification(l).payload, "later")
+  assertEq(l.dropped, long(16))
+  // Another overflow is reported the same way, without a new notification to carry it.
+  sender.transaction(tx ->
+    for i in 0 ..< 6
+      notify(tx, "slow", s"again $i")?
+    Ok(()))?
+  eventually(() -> l.dropped == 18)
+  for i in 0 ..< 4
+    assertEq(nextNotification(l).payload, s"again $i")
+  assertEq(nextEvent(l), Dropped(2))
+  assertEq(l.events.receive(millis(100)), None)
+  sender.close()?
+  l.close()
+  Ok(())
+
+// Terminates every backend whose application name is `name`, from `admin`.
+private terminate(admin: Connection, name: string) -> Result[unit, PgError]
+  val ended = admin.queryValue[long](
+    "select count(*) from (select pg_terminate_backend(pid) from pg_stat_activity where application_name = $1) t",
+    name
+  )?
+  assertEq(ended, long(1))
+  Ok(())
+
+@test("a listener whose backend is terminated says so, reconnects, LISTENs again and goes on")
+reconnects() -> Result[unit, PgError]
+  val config = testConfig() match
+    Some(c) -> c with {applicationName = Some("listen-reconnect")}
+    None -> return Ok(())
+  val l = Listener.open(config, ["rc1", "rc2"], minBackoff = millis(20))?
+  val admin = pg.connect(config with {applicationName = Some("listen-admin")})?
+  notify(admin, "rc1", "before")?
+  assertEq(nextNotification(l).payload, "before")
+  for round in 1 .. 2
+    terminate(admin, "listen-reconnect")?
+    nextEvent(l) match
+      Disconnected(e) -> assertEq(e.code, Some("57P01"))
+      other -> fail(s"expected Disconnected, got $other")
+    assertEq(nextEvent(l), Reconnected(1))
+    // Both channels are LISTENed to again.
+    notify(admin, "rc1", s"one $round")?
+    notify(admin, "rc2", s"two $round")?
+    assertEq(nextNotification(l), Notification("rc1", s"one $round", admin.backendPid))
+    assertEq(nextNotification(l).payload, s"two $round")
+  assertEq(l.channels(), Ok(["rc1", "rc2"]))
+  admin.close()?
+  l.close()
+  Ok(())
+
+@test("a listener that cannot reconnect keeps trying with its backoff, and listen meanwhile is kept")
+reconnectsLater() -> Result[unit, PgError]
+  val config = testConfig() match
+    Some(c) -> c with {applicationName = Some("listen-later"), user = "listen_later_user", password = Some("pw")}
+    None -> return Ok(())
+  val admin = pg.connect(testConfig().get with {applicationName = Some("listen-later-admin")})?
+  admin.simpleQuery("drop role if exists listen_later_user; create role listen_later_user login password 'pw'")?
+  val l = Listener.open(config, ["later"], minBackoff = millis(20), maxBackoff = millis(80))?
+  // While the role may not log in, every attempt fails.
+  admin.simpleQuery("alter role listen_later_user nologin")?
+  terminate(admin, "listen-later")?
+  nextEvent(l) match
+    Disconnected(_) -> ()
+    other -> fail(s"expected Disconnected, got $other")
+  // A channel listened to while disconnected is LISTENed to on reconnecting.
+  assertEq(l.listen("later two"), Ok(()))
+  sleep(millis(300))
+  admin.simpleQuery("alter role listen_later_user login")?
+  nextEvent(l) match
+    Reconnected(attempts) -> assert(attempts > 1)
+    other -> fail(s"expected Reconnected, got $other")
+  notify(admin, "later two", "back")?
+  assertEq(nextNotification(l).payload, "back")
+  l.close()
+  admin.simpleQuery("drop role listen_later_user")?
+  admin.close()
+
+@test("listen and unlisten at run time; unlistenAll; listening twice does nothing")
+listenAtRunTime() -> Result[unit, PgError]
+  val config = testConfig() match
+    Some(c) -> c
+    None -> return Ok(())
+  val l = Listener.open(config, [])?
+  assertEq(l.channels(), Ok([]))
+  val sender = pg.connect(config)?
+  assertEq(l.listen("a"), Ok(()))
+  assertEq(l.listen("b"), Ok(()))
+  assertEq(l.listen("a"), Ok(()))
+  assertEq(l.channels(), Ok(["a", "b"]))
+  notify(sender, "a", "1")?
+  assertEq(nextNotification(l).channel, "a")
+  assertEq(l.unlisten("a"), Ok(()))
+  // Unlistening a channel not listened to does nothing.
+  assertEq(l.unlisten("never"), Ok(()))
+  assertEq(l.channels(), Ok(["b"]))
+  notify(sender, "a", "2")?
+  notify(sender, "b", "3")?
+  assertEq(nextNotification(l), Notification("b", "3", sender.backendPid))
+  assertEq(l.unlistenAll(), Ok(()))
+  assertEq(l.channels(), Ok([]))
+  notify(sender, "b", "4")?
+  assertEq(l.events.receive(millis(200)), None)
+  // Calls from many threads at once.
+  scope(s ->
+    for i in 0 ..< 20
+      s.spawn(() -> assertEq(l.listen(s"c$i"), Ok(()))))
+  assertEq(l.channels().map(c -> c.length), Ok(20))
+  notify(sender, "c17", "five")?
+  assertEq(nextNotification(l).channel, "c17")
+  sender.close()?
+  l.close()
+  Ok(())
+
+@test("the failures: bad names, a server that refuses, a closed listener")
+failures() -> Result[unit, PgError]
+  val config = testConfig() match
+    Some(c) -> c
+    None -> return Ok(())
+  assert(Listener.open(config, [""]) is Err(Config(_)))
+  assert(Listener.open(config, ["a\u{0}b"]) is Err(Config(_)))
+  assertEq(
+    Listener.open(config with {password = Some("wrong")}, ["x"]).map(_ -> ()).mapErr(e -> e.code),
+    Err(Some("28P01"))
+  )
+  assert(Listener.open(config with {port = 1}, ["x"]) is Err(Io(_)))
+  val l = Listener.open(config, ["x"])?
+  assert(l.listen("") is Err(Config(_)))
+  assert(l.unlisten("a\u{0}") is Err(Config(_)))
+  // A name over the server's 63 bytes is truncated by it, as SQL identifiers are.
+  assertEq(l.listen("n".repeat(70)), Ok(()))
+  l.close()
+  // Closing again does nothing, and every call after fails.
+  l.close()
+  assertEq(l.listen("y"), Err(Closed))
+  assertEq(l.unlisten("x"), Err(Closed))
+  assertEq(l.unlistenAll(), Err(Closed))
+  assertEq(l.channels(), Err(Closed))
+  // The events channel is closed.
+  assertEq(l.events.receive(millis(100)), None)
+  Ok(())
+
+// What a test actor is sent: an event, and where to say it was handled.
+private data Delivery
+  Event(event: ListenEvent, ack: ActorRef[unit])
+
+// Counts the notifications it is sent and completes `done` with them once it has `target`.
+private actor Collector(target: int, done: Promise[Vector[string]]) receives Delivery
+  var got: Vector[string] = []
+  receive
+    Event(Notified(n), ack) ->
+      got = got :+ n.payload
+      ack.tell(())
+      if got.length == target then _ = done.complete(got)
+    Event(_, ack) -> ack.tell(())
+
+// Stops at the first event, without replying.
+private actor Quitter() receives Delivery
+  receive
+    Event(_, _) -> stop()
+
+@test("a listener delivers to an actor, which acknowledges each event")
+toActor() -> Result[unit, PgError]
+  val config = testConfig() match
+    Some(c) -> c
+    None -> return Ok(())
+  val done = Promise[Vector[string]]()
+  val collector = spawnActor(Collector(100, done))
+  val l = Listener.toActor(config, ["actor"], collector, (e, ack) -> Event(e, ack), window = 2)?
+  val sender = pg.connect(config)?
+  for i in 0 ..< 100
+    notify(sender, "actor", s"$i")?
+  assertEq(done.future.await(seconds(10)), Some((0 ..< 100).map(i -> s"$i").toVector))
+  assertEq(l.dropped, long(0))
+  sender.close()?
+  l.close()
+  Ok(())
+
+@test("a listener delivering to an actor closes once the actor ends")
+actorEnds() -> Result[unit, PgError]
+  val config = testConfig() match
+    Some(c) -> c
+    None -> return Ok(())
+  val quitter = spawnActor(Quitter())
+  val l = Listener.toActor(config, ["quit"], quitter, (e, ack) -> Event(e, ack), window = 1)?
+  val sender = pg.connect(config)?
+  notify(sender, "quit", "one")?
+  notify(sender, "quit", "two")?
+  quitter.ended().await(seconds(10))
+  eventually(() -> l.listen("more") == Err(Closed))
+  sender.close()?
+  l.close()
+  Ok(())
+
+@test("an ordinary connection hands notifications read during a statement to its hook")
+connectionHook() -> Result[unit, PgError]
+  val config = testConfig() match
+    Some(c) -> c
+    None -> return Ok(())
+  val heard = Atomic[Vector[Notification]]([])
+  val c = pg.connect(config with {notifications = Some(n -> _ = heard.update(v -> v :+ n))})?
+  c.simpleQuery("listen hooked")?
+  val sender = pg.connect(config)?
+  notify(sender, "hooked", "one")?
+  notify(sender, "hooked", "two")?
+  // The notifications wait in the socket until the next statement reads them, which still answers.
+  sleep(millis(100))
+  assertEq(c.queryValue[int]("select 7"), Ok(7))
+  assertEq(
+    heard.load(),
+    [Notification("hooked", "one", sender.backendPid), Notification("hooked", "two", sender.backendPid)]
+  )
+  // Without a hook they are dropped, and statements are not disturbed.
+  val plain = pg.connect(config)?
+  plain.simpleQuery("listen hooked")?
+  notify(sender, "hooked", "three")?
+  sleep(millis(100))
+  assertEq(plain.queryValue[int]("select 8"), Ok(8))
+  assertEq(plain.waitForNotification(Duration(0)), Ok(None))
+  sender.close()?
+  plain.close()?
+  c.close()
+
+@test("waitForNotification answers what arrives while idle, None on its timeout, and the server's error")
+waitForNotification() -> Result[unit, PgError]
+  val config = testConfig() match
+    Some(c) -> c with {applicationName = Some("listen-wait")}
+    None -> return Ok(())
+  val c = pg.connect(config)?
+  c.simpleQuery("listen waited")?
+  val started = monotonic()
+  assertEq(c.waitForNotification(millis(150)), Ok(None))
+  assert(monotonic() - started >= millis(150))
+  val sender = pg.connect(config with {applicationName = Some("listen-wait-sender")})?
+  notify(sender, "waited", "one")?
+  notify(sender, "waited", "two")?
+  assertEq(c.waitForNotification(seconds(10)), Ok(Some(Notification("waited", "one", sender.backendPid))))
+  assertEq(c.waitForNotification(seconds(10)).map(n -> n.map(x -> x.payload)), Ok(Some("two")))
+  // The connection still runs statements.
+  assertEq(c.queryValue[int]("select 1"), Ok(1))
+  terminate(sender, "listen-wait")?
+  assertEq(c.waitForNotification(seconds(10)).mapErr(e -> e.code), Err(Some("57P01")))
+  assert(c.isBroken)
+  assertEq(c.waitForNotification(Duration(0)), Err(Closed))
+  sender.close()

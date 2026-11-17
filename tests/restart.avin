@@ -1,0 +1,205 @@
+module tests
+
+// A connection the server has ended, a pool that outlives a server restart, and what is safe to run
+// again: a failure is `NotSent` only where nothing of the statement had left, and nothing runs a
+// statement again by itself.
+
+import avin.process
+import avin.process.Command
+import avin.threads.{scope, sleep}
+import avin.time.{millis, seconds}
+import dev.avinlang.pg
+import dev.avinlang.pg.{Closed, Connection, Io, NotSent, PgConfig, PgError, PgPool, Server}
+
+// A FATAL ErrorResponse with SQLSTATE `code`, as a server sends when it ends a session.
+fatal(code: string = "57P01") -> Vector[byte]
+  val text = cstr("Mterminating connection due to administrator command")
+  msg('E', cstr("SFATAL") ++ cstr("VFATAL") ++ cstr(s"C$code") ++ text ++ [byte(0)])
+
+@test("a session the server ended between statements: NotSent with what it said, safe to retry; then Closed")
+endedBetween() -> Result[unit, PgError]
+  connectTo([ReadUntyped, Send(started), Send(fatal()), HangUp], use = c ->
+    sleep(millis(200))
+    assert(!c.isHealthy)
+    val r = c.query("select 1")
+    r match
+      Err(NotSent(Server(d))) -> assertEq((d.severity, d.code), ("FATAL", "57P01"))
+      _ -> assert(false, "not NotSent(Server)")
+    assert(r.err.get.safeToRetry)
+    assertEq(r.err.get.code, Some("57P01"))
+    assert(r.err.get.message.startsWith("the statement was not sent: the server answered FATAL 57P01"))
+    assert(c.isBroken)
+    // Every way in answers the same before sending anything.
+    assertEq(c.simpleQuery("select 1").err, Some(Closed))
+    assert(Closed.safeToRetry)
+    Ok(()))
+
+@test("a server that hung up between statements: NotSent, its Io failure inside, for every kind of request")
+hungUpBetween() -> Result[unit, PgError]
+  for kind in 0 ..< 4
+    connectTo([ReadUntyped, Send(started), HangUp], use = c ->
+      sleep(millis(200))
+      val r = kind match
+        0 -> c.query("select 1").map(_ -> ())
+        1 -> c.simpleQuery("select 1").map(_ -> ())
+        2 -> c.execute("insert into t values (1)").map(_ -> ())
+        _ -> c.ping(seconds(1))
+      r match
+        Err(NotSent(Io(_))) -> ()
+        _ -> assert(false, s"request $kind: not NotSent(Io)")
+      assert(r.err.get.safeToRetry)
+      Ok(()))?
+  Ok(())
+
+@test("a server that hangs up once it has the statement: Io, not safe to retry, since it may have run")
+hungUpAfterSending() -> Result[unit, PgError]
+  connectTo([ReadUntyped, Send(started), ReadTyped, HangUp], use = c ->
+    val r = c.simpleQuery("update accounts set balance = balance - 10")
+    r match
+      Err(Io(_)) -> ()
+      _ -> assert(false, "not Io")
+    assert(!r.err.get.safeToRetry)
+    assert(c.isBroken)
+    Ok(()))
+
+@test("a session ended inside a transaction is the server's failure, not NotSent: the transaction is lost")
+endedInTransaction() -> Result[unit, PgError]
+  val begun = msg('C', cstr("BEGIN")) ++ msg('Z', [byte(int('T'))])
+  connectTo([ReadUntyped, Send(started), ReadTyped, Send(begun), Send(fatal()), HangUp], use = c ->
+    c.simpleQuery("begin")?
+    sleep(millis(200))
+    val r = c.query("select 1")
+    r match
+      Err(Server(d)) -> assertEq(d.code, "57P01")
+      _ -> assert(false, "not Server")
+    assert(!r.err.get.safeToRetry)
+    Ok(()))
+
+@test("what the server sends unasked between statements, a parameter's new value, is kept and breaks nothing")
+unaskedBetween() -> Result[unit, PgError]
+  val zone = msg('S', cstr("TimeZone") ++ cstr("Asia/Tokyo"))
+  val answer = msg('C', cstr("SELECT 0")) ++ ready
+  connectTo([ReadUntyped, Send(started), Send(zone), ReadTyped, Send(answer)], use = c ->
+    sleep(millis(200))
+    assertEq(c.simpleQuery("select")?.map(r -> r.tag), ["SELECT 0"])
+    assertEq(c.parameter("TimeZone"), Some("Asia/Tokyo"))
+    assert(!c.isBroken)
+    Ok(()))
+
+@test("a pool never lends a connection the server ended, even one whose ending arrived with its last answer")
+poolDropsEnded() -> Result[unit, PgError]
+  // The FATAL comes in the same write as the startup's end, so the client has read it already.
+  val outcome = withServer([ReadUntyped, Send(started ++ fatal()), Pause(millis(300)), HangUp], port ->
+    val db = PgPool.of(config(port), pingAfter = None, healthCheck = None)
+    val first = db.use(c -> Ok(c.backendPid))
+    sleep(millis(500))
+    // The connection is let go; a new one cannot be made, since the script's server took one.
+    val second = db.use(c -> Ok(c.backendPid))
+    val stats = db.stats()
+    db.close()
+    (first, second, stats.created, stats.destroyed))
+  assertEq(outcome.0, Ok(42))
+  outcome.1 match
+    Err(NotSent(Io(_))) -> ()
+    _ -> assert(false, "not NotSent(Io)")
+  assertEq((outcome.2, outcome.3), (long(1), long(1)))
+  Ok(())
+
+@test("a pool never runs a statement again by itself: one cut off after it was sent fails as it failed")
+poolNeverRetries() -> Result[unit, PgError]
+  val outcome = withServer([ReadUntyped, Send(started), ReadTyped, HangUp], port ->
+    val db = PgPool.of(config(port), healthCheck = None)
+    val r = db.use(c -> c.simpleQuery("insert into ledger values (1)").map(_ -> ()))
+    val created = db.stats().created
+    db.close()
+    (r, created))
+  outcome.0 match
+    Err(Io(_)) -> ()
+    _ -> assert(false, "not Io")
+  assert(!outcome.0.err.get.safeToRetry)
+  // One connection only: had the pool tried again, it would have made another.
+  assertEq(outcome.1, long(1))
+  Ok(())
+
+@test("a pool that cannot connect fails NotSent, and a refusal that will not pass answers as it is")
+poolConnectFailures() -> Result[unit, PgError]
+  val refused = PgPool.of(PgConfig(host = "127.0.0.1", port = 1, sslMode = pg.SslMode.Disable), healthCheck = None)
+  val r = refused.query("select 1")
+  r match
+    Err(NotSent(Io(_))) -> ()
+    _ -> assert(false, "not NotSent(Io)")
+  assert(r.err.get.safeToRetry)
+  refused.close()
+  // A server starting up is NotSent too; a wrong password is not.
+  val starting = withServer([ReadUntyped, Send(fatal("57P03"))], port ->
+    val db = PgPool.of(config(port), healthCheck = None)
+    val r = db.query("select 1")
+    db.close()
+    r)
+  assertEq(starting.err.map(e -> e.safeToRetry), Some(true))
+  val url = userUrl("scramuser", "wrong") match
+    Some(u) -> u
+    None -> return Ok(())
+  val denied = PgPool.open(url, healthCheck = None)?
+  val d = denied.query("select 1")
+  d match
+    Err(Server(diag)) -> assertEq(diag.code, "28P01")
+    _ -> assert(false, "not Server")
+  assert(!d.err.get.safeToRetry)
+  denied.close()
+  Ok(())
+
+// The second test server's URL and directory, `PG_TEST_URL2` and `PG_TEST_DIR2`, or `None`, saying
+// the test is skipped, where either is not set. Its tests stop and start it, so it is a server of
+// their own.
+secondServer() -> Option[(string, string)] = (process.env("PG_TEST_URL2"), process.env("PG_TEST_DIR2")) match
+  (Some(u), Some(d)) -> Some((u, d))
+  _ ->
+    println(
+      "skipped: PG_TEST_URL2 and PG_TEST_DIR2 name a second server, `PG_TEST_PORT=<port> scripts/test-db.zsh start <dir>`"
+    )
+    None
+
+// Stops or starts the server in `dir`.
+private serverAction(action: string, dir: string)
+  val ran = Command("zsh", "scripts/test-db.zsh", action, dir).output()
+  assert(ran.isOk, s"test-db.zsh $action failed")
+
+@test("a pool outlives a server restart: dead connections are let go, failures are safe to retry, and it heals")
+poolSurvivesRestart() -> Result[unit, PgError]
+  val (url, dir) = secondServer() match
+    Some(s) -> s
+    None -> return Ok(())
+  for pingAfter in [None, Some(millis(1))]
+    val db = PgPool.open(url + "?sslmode=disable", maxSize = 4, pingAfter = pingAfter, healthCheck = None)?
+    // Four connections at once, so the pool holds four.
+    val before = scope(s ->
+      val threads = (0 ..< 4).map(
+        _ -> s.spawn(() -> db.use(c -> c.queryValue[int]("select pg_backend_pid() from pg_sleep(0.3)")))
+      )
+      threads.map(t -> t.join()))
+    assert(before.forall(r -> r.isOk))
+    assertEq(db.stats().idle, 4)
+    val direct = pg.connect(url + "?sslmode=disable")?
+    serverAction("stop", dir)
+    // The server down: every caller fails, and each failure is safe to run again.
+    val down = scope(s ->
+      val threads = (0 ..< 20).map(_ -> s.spawn(() -> db.query("select 1")))
+      threads.map(t -> t.join()))
+    assert(down.forall(r -> r.isErr && r.err.get.safeToRetry))
+    // The connection held through the shutdown heard the server end it.
+    direct.query("select 1") match
+      Err(NotSent(Server(d))) -> assertEq(d.code, "57P01")
+      Err(NotSent(Io(_))) -> ()
+      _ -> assert(false, "not NotSent")
+    serverAction("start", dir)
+    // Back up: every caller is served, by connections made since.
+    val after = scope(s ->
+      val threads = (0 ..< 100).map(_ -> s.spawn(() -> db.use(c -> c.queryValue[int]("select pg_backend_pid()"))))
+      threads.map(t -> t.join()))
+    assert(after.forall(r -> r.isOk))
+    val old = before.map(r -> r.ok.get)
+    assert(after.forall(r -> !old.contains(r.ok.get)))
+    assert(db.stats().destroyed >= long(4))
+    db.close()
+  Ok(())
