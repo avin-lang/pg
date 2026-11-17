@@ -19,7 +19,9 @@ import dev.avinlang.pg.{
 private note(channel: string, payload: string) -> Vector[byte] =
   msg('A', int32(9) ++ cstr(channel) ++ cstr(payload))
 
-private heardBy(heard: Atomic[Vector[Notification]]) -> @sendable (Notification) -> unit = n -> _ = heard.update(v -> v :+ n)
+private heardBy(
+    heard: Atomic[Vector[Notification]]
+) -> @sendable (Notification) -> unit = n -> _ = heard.update(v -> v :+ n)
 
 private val answer = msg('C', cstr("SELECT 0")) ++ ready
 
