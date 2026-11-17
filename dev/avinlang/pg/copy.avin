@@ -166,7 +166,6 @@ impl Connection
   private copyingIn(sql: string, fill: (Out) -> Result[bool, PgError]) -> Result[long, PgError]
     awaiting = true
     owed = 1
-    unsynced = false
     // Whether the server is in COPY's copy-in mode, waiting for data from this end.
     var copying = false
     defer
@@ -196,7 +195,7 @@ impl Connection
           Ok(m) -> more = m
           Err(e) -> aborted = Some(e)
         if out.length > 5 then send(out.close())?
-        while failure.isEmpty && (reader.pending || stream.readable())
+        while failure.isEmpty && (reader.pending || input.readable())
           val m = receive()?
           if m.kind != 'E' then return broke(Protocol(s"unexpected message `${m.kind}` during COPY"))
           failure = Some(Server(diagnosticOf(m)))
@@ -231,7 +230,7 @@ impl Connection
       writing = false
       broken = true
       return
-    _ = stream.setTimeout(DrainLimit)
+    _ = input.setTimeout(DrainLimit)
     val fail = Out().begin('f').cstring("the COPY was cancelled").close()
     if copying && send(fail).isErr then return
     var answered = false
@@ -246,7 +245,7 @@ impl Connection
             _ -> ()
         Err(_) -> broken = true
     owed = 0
-    if stream.setTimeout(Duration(0)).isErr then broken = true
+    if input.setTimeout(Duration(0)).isErr then broken = true
 
   // Runs `sql`, a `COPY … TO STDOUT`, giving `take` each chunk of its data, and answers the rows
   // copied. The first `Err` from `take` asks the server to cancel the COPY; what it still sends is
