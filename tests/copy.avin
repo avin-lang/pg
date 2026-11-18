@@ -596,14 +596,16 @@ toConnection() -> Result[unit, PgError]
   c.execute("insert into copy_conn select g, repeat('z', 50) from generate_series(1, 100000) g")?
   val expected = c.queryValue[int]("select sum(length(n::text) + 52)::int4 from copy_conn")?
   val listener = TcpListener.bind("127.0.0.1", 0).mapErr(e -> Io(e))?
+  // The listener belongs to the peer's thread while it runs, so its port is read beforehand.
+  val port = listener.port()
   val reading = spawn(() -> readToEnd(listener))
-  val out = TcpStream.connect("127.0.0.1", listener.port()).mapErr(e -> Io(e))?
+  val out = TcpStream.connect("127.0.0.1", port).mapErr(e -> Io(e))?
   assertEq(c.copyOut("copy copy_conn to stdout", out)?, long(100000))
   _ = out.close()
   assertEq(reading.join(), Ok(long(expected)))
   // A peer that hangs up after its first read: a later write fails, and the COPY with it.
   val hanging = spawn(() -> hangUp(listener))
-  val doomed = TcpStream.connect("127.0.0.1", listener.port()).mapErr(e -> Io(e))?
+  val doomed = TcpStream.connect("127.0.0.1", port).mapErr(e -> Io(e))?
   val r = c.copyOut("copy copy_conn to stdout", doomed)
   _ = doomed.close()
   _ = hanging.join()
