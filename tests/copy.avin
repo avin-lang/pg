@@ -8,10 +8,14 @@ module tests
 // once on a pool; pgbouncer mode; and tracing.
 
 import avin.io
-import avin.io.{IoError, Reader}
+import avin.fs
+import avin.io.{ByteWriter, IoError, Reader}
+import avin.net.http
+import avin.net.http.{Response, Route, Router}
+import avin.net.{TcpListener, TcpStream}
 import avin.process
-import avin.threads.{Atomic, Channel, scope, sleep, withTimeout}
-import avin.time.{Date, Instant, date, dateTime, millis, seconds, time}
+import avin.threads.{Atomic, Channel, scope, sleep, spawn, withDeadline, withTimeout}
+import avin.time.{Date, Duration, Instant, date, dateTime, millis, now, seconds, time}
 import avin.uuid.Uuid
 import dev.avinlang.json
 import dev.avinlang.pg
@@ -61,6 +65,45 @@ class FailingReader(val data: Array[byte], val good: int): Reader
     val chunk = data.slice(at, end)
     at = end
     Ok(chunk)
+
+// A sink that keeps what is written to it, counting its writes and the largest.
+class Collected: ByteWriter
+  val bytes = Buffer[byte]()
+  var writes = 0
+  var largest = 0
+
+  override write(data: Array[byte]) -> Result[unit, IoError]
+    writes += 1
+    if data.length > largest then largest = data.length
+    bytes.addAll(data)
+    Ok(())
+
+  text -> string = string.fromUtf8Lossy(bytes.toArray())
+
+// A sink whose `failing`th write fails, and every one after it; the bytes before it are counted.
+class FailingWriter(val failing: int): ByteWriter
+  var writes = 0
+  var written: long = 0
+
+  override write(data: Array[byte]) -> Result[unit, IoError]
+    writes += 1
+    if writes >= failing then return Err(IoError(io.ConnectionReset, "write", "out.tsv"))
+    written += long(data.length)
+    Ok(())
+
+// A sink that waits `pause` in every write, as a slow client does, counting its writes, the bytes and
+// the largest write.
+class SlowWriter(val pause: Duration): ByteWriter
+  var writes = 0
+  var written: long = 0
+  var largest = 0
+
+  override write(data: Array[byte]) -> Result[unit, IoError]
+    sleep(pause)
+    writes += 1
+    written += long(data.length)
+    if data.length > largest then largest = data.length
+    Ok(())
 
 // ---- Typed rows in and out, binary ----
 
@@ -356,19 +399,22 @@ emptyCopy() -> Result[unit, PgError]
   assertEq(c.copyFrom("copy_empty", [], none)?, long(0))
   assertEq(c.copyIn("copy copy_empty from stdin", PieceReader(Array.empty[byte](), 10))?, long(0))
   assertEq(c.copyIn("copy copy_empty from stdin (format csv)", PieceReader(Array.empty[byte](), 10))?, long(0))
-  var chunks = 0
-  assertEq(c.copyOut("copy copy_empty to stdout", _ ->
-    chunks += 1
-    Ok(()))?, long(0))
-  assertEq(chunks, 0)
+  // A COPY of no rows writes nothing at all, not even an empty write.
+  val nothing = Collected()
+  assertEq(c.copyOut("copy copy_empty to stdout", nothing)?, long(0))
+  assertEq(nothing.writes, 0)
+  val noCsv = Collected()
+  assertEq(c.copyOut("copy copy_empty to stdout (format csv)", noCsv)?, long(0))
+  assertEq(noCsv.writes, 0)
   assertEq(copied(c, "select * from copy_empty")?.length, 0)
   assertEq(copied(c, "select 1 where false")?.length, 0)
-  // A binary COPY of no rows is still its header and trailer.
-  val bytes = Buffer[byte]()
-  assertEq(c.copyOut("copy copy_empty to stdout (format binary)", b ->
-    bytes.addAll(b)
-    Ok(()))?, long(0))
-  assertEq(bytes.length, 21)
+  // A binary COPY of no rows is still its header and trailer; a CSV one with a header, its header.
+  val binary = Collected()
+  assertEq(c.copyOut("copy copy_empty to stdout (format binary)", binary)?, long(0))
+  assertEq(binary.bytes.length, 21)
+  val header = Collected()
+  assertEq(c.copyOut("copy copy_empty to stdout (format csv, header true)", header)?, long(0))
+  assertEq(header.text, "a,b\n")
   assertEq(countOf(c, "copy_empty")?, long(0))
   Ok(())
 
@@ -396,26 +442,61 @@ rawIn() -> Result[unit, PgError]
   assertEq(countOf(c, "copy_raw")?, long(20002))
   Ok(())
 
-@test("copyOut gives a sink the statement's text, CSV and binary data in order, a chunk at a time")
+@test("copyOut writes the statement's text, CSV and binary data to a ByteWriter, in order")
 rawOut() -> Result[unit, PgError]
   val c = copyTable("copy_rawout", "id int, name text") match
     Some(r) -> r?
     None -> return Ok(())
   c.execute("insert into copy_rawout select g, 'n' || g from generate_series(1, 3) g")?
-  val text = Buffer[byte]()
-  assertEq(c.copyOut("copy copy_rawout to stdout", b ->
-    text.addAll(b)
-    Ok(()))?, long(3))
-  assertEq(string.fromUtf8Lossy(text.toArray()), "1\tn1\n2\tn2\n3\tn3\n")
-  val csv = Buffer[byte]()
-  assertEq(c.copyOut("copy (select * from copy_rawout order by id desc) to stdout (format csv, header true)", b ->
-    csv.addAll(b)
-    Ok(()))?, long(3))
-  assertEq(string.fromUtf8Lossy(csv.toArray()), "id,name\n3,n3\n2,n2\n1,n1\n")
+  val text = Collected()
+  assertEq(c.copyOut("copy copy_rawout to stdout", text)?, long(3))
+  assertEq(text.text, "1\tn1\n2\tn2\n3\tn3\n")
+  val csv = Collected()
+  assertEq(
+    c.copyOut("copy (select * from copy_rawout order by id desc) to stdout (format csv, header true)", csv)?,
+    long(3)
+  )
+  assertEq(csv.text, "id,name\n3,n3\n2,n2\n1,n1\n")
+  val binary = Collected()
+  assertEq(c.copyOut("copy copy_rawout to stdout (format binary)", binary)?, long(3))
+  assertEq(string.fromUtf8Lossy(binary.bytes.toArray().slice(0, 5)), "PGCOP")
   // What copyOut writes, copyIn reads back.
   c.simpleQuery("create temp table copy_rawout2 (like copy_rawout)")?
-  assertEq(c.copyIn("copy copy_rawout2 from stdin (format csv, header true)", PieceReader(csv.toArray(), 5))?, long(3))
+  assertEq(
+    c.copyIn("copy copy_rawout2 from stdin (format csv, header true)", PieceReader(csv.bytes.toArray(), 5))?,
+    long(3)
+  )
   assertEq(countOf(c, "copy_rawout2")?, long(3))
+  c.simpleQuery("create temp table copy_rawout3 (like copy_rawout)")?
+  assertEq(
+    c.copyIn("copy copy_rawout3 from stdin (format binary)", PieceReader(binary.bytes.toArray(), 7))?,
+    long(3)
+  )
+  assertEq(c.queryValue[string]("select string_agg(name, ',' order by id) from copy_rawout3")?, "n1,n2,n3")
+  Ok(())
+
+@test("rows that have already arrived are gathered into writes of about 64 KiB; one row alone is written at once")
+gatheredWrites() -> Result[unit, PgError]
+  val c = copyTable("copy_gather", "n int, pad text") match
+    Some(r) -> r?
+    None -> return Ok(())
+  c.execute("insert into copy_gather select g, repeat('x', 100) from generate_series(1, 100000) g")?
+  val sink = Collected()
+  assertEq(c.copyOut("copy copy_gather to stdout", sink)?, long(100000))
+  // Some 10 MB, each row its own CopyData message: far fewer writes than rows, none much over 64 KiB.
+  assertEq(sink.bytes.length, c.queryValue[int]("select sum(length(n::text) + 102)::int4 from copy_gather")?)
+  assert(sink.writes < 10000)
+  assert(sink.largest < 65536 + 200)
+  assertEq(string.fromUtf8Lossy(sink.bytes.toArray().slice(0, 6)), "1\txxxx")
+  // A single row is written as it is, the moment it arrives.
+  val one = Collected()
+  assertEq(c.copyOut("copy (select 7) to stdout", one)?, long(1))
+  assertEq((one.writes, one.text), (1, "7\n"))
+  // A row larger than a gathered write goes in one write of its own.
+  c.execute("insert into copy_gather values (0, repeat('y', 200000))")?
+  val big = Collected()
+  assertEq(c.copyOut("copy (select pad from copy_gather where n = 0) to stdout", big)?, long(1))
+  assertEq((big.writes, big.largest), (1, 200001))
   Ok(())
 
 @test("a reader that fails stops the COPY with CopyFail and answers Io; nothing is copied")
@@ -430,20 +511,154 @@ readerFails() -> Result[unit, PgError]
   assert(!c.isBroken)
   Ok(())
 
-@test("a sink that fails cancels the COPY: no more chunks, the sink's error answered, the connection usable")
+@test("a writer that fails cancels the COPY: no more writes, its error answered, the connection usable")
 sinkFails() -> Result[unit, PgError]
   val c = copyTable("copy_sinkfail", "n int, pad text") match
     Some(r) -> r?
     None -> return Ok(())
   c.execute("insert into copy_sinkfail select g, repeat('x', 100) from generate_series(1, 200000) g")?
-  var calls = 0
-  val r = c.copyOut("copy copy_sinkfail to stdout", _ ->
-    calls += 1
-    if calls == 3 then Err(IoError(io.ConnectionReset, "write", "out.tsv")) else Ok(()))
+  val sink = FailingWriter(3)
+  val r = c.copyOut("copy copy_sinkfail to stdout", sink)
   assert(r.err is Some(Io(e)) && e.kind == io.ConnectionReset)
-  assertEq(calls, 3)
+  assertEq(sink.writes, 3)
+  assert(0 < sink.written < long(3 * 65536))
   assertEq(c.queryValue[int]("select 3")?, 3)
   assert(!c.isBroken && !c.inTransaction)
+  // The first write failing, and the last: a COPY of one row whose only write fails.
+  val first = FailingWriter(1)
+  assert(c.copyOut("copy copy_sinkfail to stdout", first).err is Some(Io(_)))
+  assertEq((first.writes, first.written), (1, long(0)))
+  val only = FailingWriter(1)
+  assert(c.copyOut("copy (select 1) to stdout", only).err is Some(Io(_)))
+  assertEq(only.writes, 1)
+  assertEq(c.queryValue[int]("select 4")?, 4)
+  // Inside a transaction the failed COPY fails the transaction, which rolls back as any does.
+  c.simpleQuery("begin")?
+  assert(c.copyOut("copy copy_sinkfail to stdout", FailingWriter(2)).isErr)
+  assert(c.inTransaction)
+  c.simpleQuery("rollback")?
+  assert(!c.isBroken && !c.inTransaction)
+  assertEq(countOf(c, "copy_sinkfail")?, long(200000))
+  Ok(())
+
+@test("copyOut to a file: the file holds exactly the COPY's data; a closed file fails the COPY cleanly")
+toFile() -> Result[unit, PgError]
+  val c = copyTable("copy_file", "n int, label text") match
+    Some(r) -> r?
+    None -> return Ok(())
+  c.execute("insert into copy_file select g, 'row ' || g from generate_series(1, 50000) g")?
+  val dir = fs.tempDir("pg-copy-out").mapErr(e -> Io(e))?
+  val name = s"${dir.path}/rows.csv"
+  val file = fs.create(name).mapErr(e -> Io(e))?
+  assertEq(c.copyOut("copy (select * from copy_file order by n) to stdout (format csv)", file)?, long(50000))
+  file.close().mapErr(e -> Io(e))?
+  val text = fs.readText(name).mapErr(e -> Io(e))?
+  assertEq(text.byteLength, c.queryValue[int]("select sum(2 * length(n::text) + 6)::int4 from copy_file")?)
+  assert(text.startsWith("1,row 1\n2,row 2\n") && text.endsWith("50000,row 50000\n"))
+  // Read back from the file through copyIn.
+  c.simpleQuery("create temp table copy_file2 (like copy_file)")?
+  val back = fs.open(name).mapErr(e -> Io(e))?
+  assertEq(c.copyIn("copy copy_file2 from stdin (format csv)", back)?, long(50000))
+  _ = back.close()
+  assertEq(c.queryValue[long]("select sum(n) from copy_file2")?, long(50000) * long(50001) / 2)
+  // A file already closed refuses the first write.
+  val closed = fs.create(s"${dir.path}/closed.csv").mapErr(e -> Io(e))?
+  _ = closed.close()
+  assert(c.copyOut("copy copy_file to stdout", closed).err is Some(Io(_)))
+  assert(!c.isBroken && !c.inTransaction)
+  assertEq(c.queryValue[int]("select 5")?, 5)
+  _ = dir.close()
+  Ok(())
+
+// A peer that takes the next connection, reads it to its end and answers how many bytes came.
+private readToEnd(listener: TcpListener) -> Result[long, IoError]
+  val s = listener.accept()?
+  defer
+    _ = s.close()
+  var n: long = 0
+  while true
+    val got = s.read(65536)?
+    if got.length == 0 then return Ok(n)
+    n += long(got.length)
+  Ok(n)
+
+// A peer that takes the next connection, reads once and hangs up.
+private hangUp(listener: TcpListener) -> Result[unit, IoError]
+  val s = listener.accept()?
+  _ = s.read(1024)?
+  s.close()
+
+@test("copyOut to a TCP connection: the peer reads exactly the data; a peer that hangs up fails the COPY cleanly")
+toConnection() -> Result[unit, PgError]
+  val c = copyTable("copy_conn", "n int, pad text") match
+    Some(r) -> r?
+    None -> return Ok(())
+  c.execute("insert into copy_conn select g, repeat('z', 50) from generate_series(1, 100000) g")?
+  val expected = c.queryValue[int]("select sum(length(n::text) + 52)::int4 from copy_conn")?
+  val listener = TcpListener.bind("127.0.0.1", 0).mapErr(e -> Io(e))?
+  val reading = spawn(() -> readToEnd(listener))
+  val out = TcpStream.connect("127.0.0.1", listener.port()).mapErr(e -> Io(e))?
+  assertEq(c.copyOut("copy copy_conn to stdout", out)?, long(100000))
+  _ = out.close()
+  assertEq(reading.join(), Ok(long(expected)))
+  // A peer that hangs up after its first read: a later write fails, and the COPY with it.
+  val hanging = spawn(() -> hangUp(listener))
+  val doomed = TcpStream.connect("127.0.0.1", listener.port()).mapErr(e -> Io(e))?
+  val r = c.copyOut("copy copy_conn to stdout", doomed)
+  _ = doomed.close()
+  _ = hanging.join()
+  assert(r.err is Some(Io(_)))
+  assert(!c.isBroken && !c.inTransaction)
+  assertEq(c.queryValue[long]("select count(*) from copy_conn")?, long(100000))
+  _ = listener.close()
+  Ok(())
+
+@test("copyOut to a streamed HTTP body: the client receives exactly the COPY's CSV")
+toHttpBody() -> Result[unit, PgError]
+  val c = copyTable("copy_http", "n int, label text") match
+    Some(r) -> r?
+    None -> return Ok(())
+  c.execute("insert into copy_http select g, 'r' || g from generate_series(1, 20000) g")?
+  val expected = Collected()
+  assertEq(c.copyOut("copy (select * from copy_http order by n) to stdout (format csv)", expected)?, long(20000))
+  val router = Router(
+    [
+      Route.get("/export", _ -> Response.stream(200, "text/csv", w ->
+        val db = testConnection().get.ok.get
+        _ = db.copyOut("copy (select * from copy_http order by n) to stdout (format csv)", w)
+        _ = db.close()))
+    ]
+  )
+  val server = http.serve("127.0.0.1", 0, router.handle).mapErr(e -> Io(e))?
+  val got = http.get(s"http://127.0.0.1:${server.port()}/export")
+  server.shutdown()
+  got match
+    Ok(response) ->
+      assertEq(response.status, 200)
+      assertEq(response.header("Transfer-Encoding"), Some("chunked"))
+      assertEq(response.text, expected.text)
+    Err(e) -> fail(s"$e")
+  Ok(())
+
+@test("a slow writer slows the COPY: every row arrives, in writes no larger than one gathered chunk")
+slowWriter() -> Result[unit, PgError]
+  val c = copyTable("copy_slow", "n int, pad text") match
+    Some(r) -> r?
+    None -> return Ok(())
+  c.execute("insert into copy_slow select g, repeat('s', 200) from generate_series(1, 200000) g")?
+  val sink = SlowWriter(millis(2))
+  val before = resident()
+  assertEq(c.copyOut("copy copy_slow to stdout", sink)?, long(200000))
+  // Some 41 MB went through writes of at most 64 KiB and a row; memory grew far less than the data.
+  assertEq(sink.written, long(c.queryValue[int]("select sum(length(n::text) + 202)::int4 from copy_slow")?))
+  assert(sink.largest < 65536 + 300)
+  assert(sink.writes >= int(sink.written / long(65536 + 300)))
+  val grew = resident() - before
+  assert(grew < long(32 * 1024 * 1024))
+  println(
+    s"a slow writer: ${sink.written / 1048576} MB in ${sink.writes} writes, the largest ${sink.largest} bytes, grew ${grew / 1048576} MB"
+  )
+  assert(!c.isBroken)
   Ok(())
 
 @test("a statement that is not the COPY asked for is run and answers Config; a COPY FROM given to copyOut is refused")
@@ -459,14 +674,17 @@ notACopy() -> Result[unit, PgError]
     c.copyIn("copy copy_wrong to stdout", PieceReader(Array.empty[byte](), 1)).err,
     Some(Config("the statement is not a COPY … FROM STDIN"))
   )
-  assertEq(c.copyOut("select 1", _ -> Ok(())).err, Some(Config("the statement is not a COPY … TO STDOUT")))
+  // A query's rows are not COPY data: nothing is written.
+  val unwritten = Collected()
+  assertEq(c.copyOut("select 1", unwritten).err, Some(Config("the statement is not a COPY … TO STDOUT")))
+  assertEq(unwritten.writes, 0)
   // The server's own refusal of the CopyFail sent for a COPY FROM.
-  assertEq(c.copyOut("copy copy_wrong from stdin", _ -> Ok(())).err.flatMap(e -> e.code), Some("57014"))
+  assertEq(c.copyOut("copy copy_wrong from stdin", Collected()).err.flatMap(e -> e.code), Some("57014"))
   // simpleQuery answers a COPY FROM the same way, saying what does run one.
   val refused = c.simpleQuery("copy copy_wrong from stdin").err
   assertEq(refused.flatMap(e -> e.code), Some("57014"))
   assert(refused.map(e -> e.message).getOrElse("").contains("copyIn and copyFrom do"))
-  assertEq(c.copyOut("copy nonesuch to stdout", _ -> Ok(())).err.flatMap(e -> e.code), Some("42P01"))
+  assertEq(c.copyOut("copy nonesuch to stdout", Collected()).err.flatMap(e -> e.code), Some("42P01"))
   assertEq(
     c.copyIn("copy nonesuch from stdin", PieceReader(Array.empty[byte](), 1)).err.flatMap(e -> e.code),
     Some("42P01")
@@ -683,10 +901,15 @@ concurrentPool() -> Result[unit, PgError]
           c.copyTo(s"select n from copy_pool where t = $t", _ ->
             out += 1
             Ok(()))?
-          Ok((copiedIn, out)))))
+          val raw = Collected()
+          val rawRows = c.copyOut(s"copy (select n from copy_pool where t = $t order by n) to stdout", raw)?
+          // Each thread's writer saw its own rows only, in order.
+          val lines = raw.text.split("\n")
+          val own = rawRows == long(each) && lines(0) == "0" && lines(each - 1) == s"${each - 1}"
+          Ok((copiedIn, out, own)))))
     handles.map(h -> h.join()))
   for r in results
-    assertEq(r, Ok((long(each), long(each))))
+    assertEq(r, Ok((long(each), long(each), true)))
   assertEq(db.use(c -> c.queryValue[long]("select count(*) from copy_pool"))?, long(threads * each))
   assert(db.stats().total <= 6)
   db.close()
@@ -704,7 +927,12 @@ bouncerCopy() -> Result[unit, PgError]
   assertEq(c.copyFrom("copy_bouncer", [], rows)?, long(1000))
   assertEq(copied(c, "select * from copy_bouncer")?.length, 1000)
   assertEq(c.copyIn("copy copy_bouncer (n) from stdin", PieceReader("7\n8\n".bytes.toArray(), 10))?, long(2))
-  assertEq(c.copyOut("copy copy_bouncer to stdout", _ -> Ok(()))?, long(1002))
+  val sink = Collected()
+  assertEq(c.copyOut("copy copy_bouncer to stdout", sink)?, long(1002))
+  assert(sink.text.startsWith("0\tt0\t0\n") && sink.text.endsWith("8\t\\N\t\\N\n"))
+  // A writer failing under pgbouncer leaves the connection usable too.
+  assert(c.copyOut("copy copy_bouncer to stdout", FailingWriter(1)).err is Some(Io(_)))
+  assertEq(c.queryValue[int]("select 6")?, 6)
   assertEq(c.queryValue[int]("select count(*)::int4 from pg_prepared_statements")?, 0)
   Ok(())
 
@@ -721,7 +949,7 @@ tracedCopy() -> Result[unit, PgError]
   val prepared = items(r.prepareStarts).length
   assertEq(c.copyFrom("copy_traced", ["n"], [[1], [2], [3]])?, long(3))
   assertEq(c.copyIn("copy copy_traced from stdin", PieceReader("4\n".bytes.toArray(), 10))?, long(1))
-  assertEq(c.copyOut("copy copy_traced to stdout", _ -> Ok(()))?, long(4))
+  assertEq(c.copyOut("copy copy_traced to stdout", Collected())?, long(4))
   assertEq(copied(c, "select n from copy_traced")?.length, 4)
   assert(c.copyFrom("copy_traced", [], [[1]]).isErr)
   val starts = items(r.queryStarts).drop(before).map(s -> s.1.sql)

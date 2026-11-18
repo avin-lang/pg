@@ -360,15 +360,37 @@ val n = db.copyToAs[Reading]("select sensor, value from readings where value is 
 ```
 
 `copyIn` and `copyOut` carry a COPY statement's own data, text, CSV or binary, as it is: `copyIn`
-reads it from any `Reader` (a file, a connection), a chunk at a time, and `copyOut` gives it to a
-function a chunk at a time. Each waits for the other end: the next chunk is read only once the last
-has been sent, or once the function has answered.
+reads it from any `io.Reader` (a file, a connection), 64 KiB at a time, and `copyOut` writes it to
+any `io.ByteWriter` (a file, a connection, a streamed HTTP body). Each waits for the other end: the
+next chunk is read only once the last has been sent, or once the last write has finished, so a slow
+client slows the server rather than filling memory. `copyOut` gathers the rows that have already
+arrived into writes of up to 64 KiB, and writes a row at once when nothing has arrived behind it.
 
 ```avin
 val file = fs.open("readings.csv").mapErr(e -> Io(e))?
 val n = db.copyIn("copy readings from stdin (format csv, header true)", file)?
 val out = fs.create("backup.csv").mapErr(e -> Io(e))?
-db.copyOut("copy readings to stdout (format csv)", chunk -> out.write(chunk))?
+db.copyOut("copy readings to stdout (format csv)", out)?
+_ = out.close()
+```
+
+A handler streams a table to an HTTP client the same way, its `BodyWriter` being a `ByteWriter`:
+
+```avin
+Route.get("/readings.csv", _ -> Response.stream(200, "text/csv", w ->
+  _ = db.copyOut("copy readings to stdout (format csv, header true)", w)))
+```
+
+Anything else is a `ByteWriter` by one method; this one counts the lines it is given:
+
+```avin
+class LineCount: ByteWriter
+  var lines = 0
+
+  override write(bytes: Array[byte]) -> Result[unit, IoError]
+    for b in bytes
+      if b == byte(int('\n')) then lines += 1
+    Ok(())
 ```
 
 A table whose columns include a type the client does not decode (`inet`, an enum, `interval`) is
@@ -379,9 +401,10 @@ When something goes wrong part-way the connection can be used on. A row with the
 values, or a value that cannot be written as its column's type, stops the COPY with CopyFail and
 answers a `Config` error naming the row and column; nothing is copied. A value the server refuses or
 a constraint a row breaks answers the server's error, and the client stops sending as soon as it
-sees it. A reader that fails stops the COPY the same way and answers `Io`. A function given to
-`copyOut` or `copyTo` that answers an `Err` has the server cancel the COPY, and its error is the
-answer. Inside a transaction a failed COPY fails the transaction, as any failed statement does. A
+sees it. A reader that fails stops the COPY the same way and answers `Io`. A write to `copyOut`'s
+writer that fails (the file's disk full, the HTTP client gone) has the server cancel the COPY,
+nothing more is written, and the answer is `Io` with the write's error; a function given to `copyTo`
+that answers an `Err` cancels it the same way, and its error is the answer. Inside a transaction a failed COPY fails the transaction, as any failed statement does. A
 COPY whose thread is cancelled is stopped: CopyFail for one going in, a CancelRequest for one coming
 out. A tracer sees a COPY as one statement, with the rows copied.
 

@@ -591,8 +591,8 @@ Settled on the user's delegation 2026-11-16. Rows are gathered into one CopyData
 holds 64 KiB, then sent, so memory holds one chunk and one row whatever the row count (a million rows
 of three columns grew the process by 8 MB, taking 1.1 to 1.6 s against 6.1 s for the same rows as
 INSERTs in batches of 10,000, three rounds under `marshal run --exclusive`). The source, rows or a `Reader`, is read only after the chunk
-before has been written, and out of COPY the next message is read only once the sink or row
-function has answered, so back-pressure is the socket's in both directions. Between chunks the client
+before has been written, and out of COPY the next message is read only once the writer's write or
+the row function has answered, so back-pressure is the socket's in both directions. Between chunks the client
 reads, without waiting, anything the server has sent: in copy-in mode that can only be the error that
 ended it (the server then drops the rest and sends ReadyForQuery), so a constraint broken early stops
 the sending early rather than after the whole source.
@@ -608,10 +608,36 @@ CopyInResponse is answered with CopyFail. A sink or row function failing coming 
 CancelRequest and drains what the server still sends, as a cancelled statement does, rather than
 closing the connection as pgx does. A statement given to `copyIn` or `copyOut` that is not that kind
 of COPY is run (a COPY FROM given to `copyOut` is answered with CopyFail so it cannot hang) and
-answers `Config`. **Review with the user**: `copyOut`'s sink answers `IoError` (wrapped as `Io`)
-because avin has no `Writer` trait to match `Reader`, so the sink is a function, `chunk ->
-file.write(chunk)`; a `Writer` trait in the standard library would let it take a file or a
-connection directly.
+answers `Config`. `copyOut`'s writer failing answers `Io` with the write's error (see the next
+entry).
+
+## `copyOut` writes to an `io.ByteWriter`; the chunk function is gone
+
+Settled on the user's delegation 2026-11-17. `copyOut(sql, sink: ByteWriter)` takes avin's byte sink,
+so a file, a TCP, Unix or TLS connection, one half of a split connection and a streamed HTTP
+response's `BodyWriter` are all sinks as they are, as `copyIn` already took any `io.Reader`; pgx's
+`CopyTo` takes an `io.Writer` the same way. The earlier form, a function given each chunk, is
+dropped rather than kept beside it: pg is pre-1.0, one form is easier to learn, and a function's
+work is a `ByteWriter` of one method (`class LineCount: ByteWriter` in the README), so nothing that
+could be written before is lost. `copyTo` and `copyToAs` keep their row functions, which take rows,
+not bytes. **Review with the user**: dropping the chunk function costs a caller who only wanted to
+look at the bytes a small class instead of a lambda; an overload taking the function could come
+back if that proves common.
+
+The server sends a CopyData message per row, so writing each as it came would make a write, and a
+chunk of a chunked HTTP body, per row. `copyOut` instead gathers the messages that have already
+arrived into one write of up to 64 KiB (a write is made once the gathered bytes reach 64 KiB, and as
+soon as nothing more is waiting on the connection, so a lone row is not held back); a message of
+64 KiB or more with nothing gathered is written as it is, uncopied. Nothing is read from the server
+while a write is under way, so a slow writer slows the server through the socket's back-pressure and
+memory holds at most one gathered write and one message (a 2 ms-per-write sink took 41 MB through in
+writes of at most 64 KiB and a row). Alternatives weighed: a write per message (simplest, but a
+write per row to a socket); a fixed 64 KiB buffer flushed only when full or at the end (holds a slow
+trickle of rows back from the reader, which a live export should not do). A failed write stops
+everything as a failing function did: nothing more is written, a CancelRequest stops the server and
+what it still sends is drained, and the answer is `Io` with the write's error. The last gathered
+write is made when the server's CopyDone arrives; one failing there answers `Io` too, but sends no
+CancelRequest, since the server has finished and a late cancel could reach the next statement.
 
 ## Deadlines come from the thread's request context and are kept by cancellation
 

@@ -276,11 +276,9 @@ midCopy() -> Result[unit, PgError]
   assert(0 < seen < 100000)
   assert(!c.isBroken && !c.inTransaction)
   // Out, raw, to a sink that is slow.
-  var chunks = 0
-  assert(exceeded(withDeadline(now() + millis(300), _ -> c.copyOut("copy dl_copy to stdout", _ ->
-    chunks += 1
-    sleep(millis(50))
-    Ok(())))))
+  val sink = SlowWriter(millis(100))
+  assert(exceeded(withDeadline(now() + millis(300), _ -> c.copyOut("copy dl_copy to stdout", sink))))
+  assert(0 < sink.writes < 100)
   assert(!c.isBroken && !c.inTransaction)
   assertEq(c.queryValue[long]("select count(*) from dl_copy")?, long(100000))
   c.simpleQuery("drop table dl_copy")?

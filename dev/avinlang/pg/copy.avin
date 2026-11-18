@@ -5,7 +5,7 @@ module dev.avinlang.pg
 // `copyIn` and `copyOut` carry a COPY statement's bytes as they are, text or CSV, to and from the
 // program. Data goes a chunk at a time, so memory stays bounded whatever the number of rows.
 
-import avin.io.{IoError, Reader}
+import avin.io.{ByteWriter, Reader}
 import avin.time.Duration
 
 // How many bytes of COPY data go in one CopyData message: rows are gathered until a chunk holds at
@@ -97,15 +97,31 @@ impl Connection
       out.rawArray(chunk)
       Ok(chunk.length > 0)))
 
-  // Runs `sql`, a `COPY … TO STDOUT` statement, giving `sink` its data a chunk at a time, in order, as
-  // it arrives, and answers how many rows the server copied. The data is as the statement writes it:
-  // text, CSV or binary. The next chunk is read only once `sink` has answered, so a slow sink slows
-  // the server. Where `sink` answers an `Err`, the server is asked to cancel the COPY, what it still
-  // sends is read and dropped, and the answer is `Io` with the sink's error; the connection can be
-  // used on. The configuration's `queryTracer` sees `sql` and the rows copied.
-  copyOut(sql: string, sink: (Array[byte]) -> Result[unit, IoError]) -> Result[long, PgError] = traceCopy(sql, () ->
+  // Runs `sql`, a `COPY … TO STDOUT` statement, writing its data to `sink`, in order, as it arrives,
+  // and answers how many rows the server copied. The data is as the statement writes it: text, CSV or
+  // binary. A file, a connection, a streamed HTTP body or any other `ByteWriter` is a sink. The rows
+  // the server has already sent are gathered into one write of up to 64 KiB, and a row is written as
+  // soon as nothing more has arrived behind it; nothing more is read until a write has finished, so a
+  // slow sink slows the server and no more than one write's worth is held.
+  //
+  // Where a write answers an `Err`, nothing more is written, the server is asked to cancel the COPY,
+  // what it still sends is read and dropped, and the answer is `Io` with the write's error; the
+  // connection can be used on. The configuration's `queryTracer` sees `sql` and the rows copied.
+  copyOut(sql: string, sink: ByteWriter) -> Result[long, PgError] = traceCopy(sql, () ->
     usable()?
-    copyingOut(sql, chunk -> sink(chunk).mapErr(e -> Io(e))))
+    var gathered = Out()
+    val flush: () -> Result[unit, PgError] = () ->
+      if gathered.length == 0 then return Ok(())
+      val bytes = gathered.toArray()
+      gathered = Out()
+      sink.write(bytes).mapErr(e -> Io(e))
+    val take: (Array[byte]) -> Result[unit, PgError] = chunk ->
+      if gathered.length == 0 && (chunk.length >= CopyChunk || !readable())
+        sink.write(chunk).mapErr(e -> Io(e))
+      else
+        gathered.rawArray(chunk)
+        if gathered.length >= CopyChunk || !readable() then flush() else Ok(())
+    copyingOut(sql, take, flush))
 
   // Runs `query` (a `SELECT`, `VALUES`, or `TABLE <name>`, with no parameters) with `COPY (…) TO
   // STDOUT` and gives `each` its rows, each read as `query` would read it, in order, as they arrive;
@@ -130,10 +146,11 @@ impl Connection
     val binary = columns.forall(c -> copiesBinary(c.typeOid))
     val decoder = CopyDecoder(columns, binary)
     val sql = s"COPY ($query) TO STDOUT" + (if binary then " (FORMAT binary)" else "")
-    copyingOut(sql, chunk ->
+    val take: (Array[byte]) -> Result[unit, PgError] = chunk ->
       for row in decoder.rows(chunk)?
         each(row)?
-      Ok(()))
+      Ok(())
+    copyingOut(sql, take, () -> Ok(()))
 
   // `body`, traced as one statement, `sql`, where the configuration has a `queryTracer`.
   private traceCopy(sql: string, body: () -> Result[long, PgError]) -> Result[long, PgError] =
@@ -247,25 +264,31 @@ impl Connection
     owed = 0
     if input.setTimeout(Duration(0)).isErr then broken = true
 
-  // Runs `sql`, a `COPY … TO STDOUT`, giving `take` each chunk of its data, and answers the rows
-  // copied. The first `Err` from `take` asks the server to cancel the COPY; what it still sends is
-  // read and dropped, and that error is the answer. A statement that is not a COPY TO STDOUT is run
-  // (a COPY FROM STDIN is answered with CopyFail) and answers a `Config` error.
-  private copyingOut(sql: string, take: (Array[byte]) -> Result[unit, PgError]) -> Result[long, PgError]
+  // Runs `sql`, a `COPY … TO STDOUT`, giving `take` each chunk of its data and calling `done` once
+  // the data has ended, and answers the rows copied. The first `Err` from `take` or `done` asks the
+  // server to cancel the COPY; what it still sends is read and dropped, and that error is the answer.
+  // A statement that is not a COPY TO STDOUT is run (a COPY FROM STDIN is answered with CopyFail) and
+  // answers a `Config` error.
+  private copyingOut(
+      sql: string,
+      take: (Array[byte]) -> Result[unit, PgError],
+      done: () -> Result[unit, PgError]
+  ) -> Result[long, PgError]
     val out = Out()
     out.begin('Q').cstring(sql).close()
     var tag = ""
     var other = false
     var stopped: Option[PgError] = None
+    val heed = (r: Result[unit, PgError]) ->
+      if r is Err(e)
+        stopped = Some(e)
+        cancelRequest()
     val answer = exchange(out, (m, failed) ->
       m.kind match
-        'H' | 'c' -> ()
-        'd' -> if !failed && stopped.isEmpty
-          take(m.body) match
-            Ok(_) -> ()
-            Err(e) ->
-              stopped = Some(e)
-              cancelRequest()
+        'H' -> ()
+        'd' -> if !failed && stopped.isEmpty then heed(take(m.body))
+        // The server has sent all of its data, so there is nothing left to cancel.
+        'c' -> if !failed && stopped.isEmpty && done() is Err(e) then stopped = Some(e)
         'C' -> tag = In(m.body).cstring()
         'G' ->
           other = true

@@ -1,9 +1,13 @@
 module tests
 
 // The README's COPY examples, against the test server: rows in from a vector and from a producer
-// thread, rows out as a derived type, and CSV in from a file and out to one.
+// thread, rows out as a derived type, CSV in from a file and out to one, and out to a streamed HTTP
+// body and to a ByteWriter of the program's own.
 
 import avin.fs
+import avin.io.{ByteWriter, IoError}
+import avin.net.http
+import avin.net.http.{Response, Route, Router}
 import avin.threads.{Channel, scope}
 import avin.time.Instant
 import dev.avinlang.pg
@@ -52,11 +56,48 @@ readmeCopyFiles() -> Result[unit, PgError]
   val n = db.copyIn("copy readings from stdin (format csv, header true)", file)?
   assertEq(n, long(2))
   val out = fs.create(s"${dir.path}/backup.csv").mapErr(e -> pg.Io(e))?
-  db.copyOut("copy readings to stdout (format csv)", chunk -> out.write(chunk))?
+  db.copyOut("copy readings to stdout (format csv)", out)?
   _ = out.close()
   assertEq(
     fs.readText(s"${dir.path}/backup.csv").ok,
     Some("1,2024-01-01 00:00:00+00,1.5\n2,2024-01-02 00:00:00+00,\n")
   )
   _ = dir.close()
+  db.close()
+
+// The README's writer of its own.
+class LineCount: ByteWriter
+  var lines = 0
+
+  override write(bytes: Array[byte]) -> Result[unit, IoError]
+    for b in bytes
+      if b == byte(int('\n')) then lines += 1
+    Ok(())
+
+@test("the README's COPY: out to a streamed HTTP body, and to a ByteWriter of the program's own")
+readmeCopyWriters() -> Result[unit, PgError]
+  val db = testConnection() match
+    Some(r) -> r?
+    None -> return Ok(())
+  db.simpleQuery(
+    "drop table if exists readme_readings; create table readme_readings (sensor int, value float8);" + " insert into readme_readings select g, g / 2.0 from generate_series(1, 1000) g"
+  )?
+  val counter = LineCount()
+  assertEq(db.copyOut("copy readme_readings to stdout (format csv, header true)", counter)?, long(1000))
+  assertEq(counter.lines, 1001)
+  val router = Router(
+    [
+      Route.get("/readings.csv", _ -> Response.stream(200, "text/csv", w ->
+        val db = testConnection().get.ok.get
+        _ = db.copyOut("copy readme_readings to stdout (format csv, header true)", w)
+        _ = db.close()))
+    ]
+  )
+  val server = http.serve("127.0.0.1", 0, router.handle).mapErr(e -> pg.Io(e))?
+  val got = http.get(s"http://127.0.0.1:${server.port()}/readings.csv")
+  server.shutdown()
+  val text = got.map(r -> r.text).getOrElse("")
+  assert(text.startsWith("sensor,value\n1,0.5\n2,1\n") && text.endsWith("1000,500\n"))
+  assertEq(text.split("\n").filter(l -> l != "").length, 1001)
+  db.simpleQuery("drop table readme_readings")?
   db.close()
