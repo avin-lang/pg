@@ -112,6 +112,7 @@ cacheEviction() -> Result[unit, PgError]
 
 @test("with no cache every statement is prepared unnamed")
 noCache() -> Result[unit, PgError]
+  if testUrl().isEmpty then return Ok(())
   val c = pg.connect(testUrl("sslmode=disable&statement_cache_size=0").get)?
   assertEq(c.queryValue[int]("select $1::int", 3), Ok(3))
   assertEq(c.queryValue[int]("select $1::int", 4), Ok(4))

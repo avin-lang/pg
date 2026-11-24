@@ -179,6 +179,7 @@ overTls() -> Result[unit, PgError]
   val ca = testCa() match
     Some(p) -> p
     None -> return Ok(())
+  if testUrl().isEmpty then return Ok(())
   val c = pg.connect(testUrl(s"sslmode=require&sslrootcert=$ca").get)?
   assert(c.isTls)
   c.simpleQuery("drop table if exists pipe_tls; create table pipe_tls (n int, body text)")?

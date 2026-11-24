@@ -30,6 +30,7 @@ verifyFull() -> Result[unit, PgError]
   val ca = testCa() match
     Some(p) -> p
     None -> return Ok(())
+  if testUrl().isEmpty then return Ok(())
   val c = pg.connect(testUrl(s"sslmode=verify-full&sslrootcert=$ca").get)?
   assert(c.isTls)
   c.close()
@@ -39,6 +40,7 @@ requireUntrusted()
   val ca = testCa() match
     Some(p) -> p
     None -> return
+  if testUrl().isEmpty then return
   val other = ca.replace("ca.pem", "other.pem")
   val r = pg.connect(testUrl(s"sslmode=require&sslrootcert=$other").get)
   r match
@@ -57,6 +59,7 @@ requireByName() -> Result[unit, PgError]
   val ca = testCa() match
     Some(p) -> p
     None -> return Ok(())
+  if testUrl().isEmpty then return Ok(())
   val c = pg.connect(testUrl(s"sslmode=require&sslrootcert=$ca").get.replace("127.0.0.1", "localhost"))?
   assert(c.isTls)
   c.close()
@@ -76,6 +79,7 @@ preferred() -> Result[unit, PgError]
   val ca = testCa() match
     Some(p) -> p
     None -> return Ok(())
+  if testUrl().isEmpty then return Ok(())
   val secured = pg.connect(testUrl(s"sslmode=prefer&sslrootcert=$ca").get)?
   assert(secured.isTls)
   assertEq(serverSaysTls(secured), Ok(true))
