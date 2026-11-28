@@ -16,7 +16,7 @@ dependencies {
 }
 ```
 
-It brings in [json](https://github.com/avin-lang/json) 0.0.2, for `json` and `jsonb` values, and
+It brings in [json](https://github.com/avin-lang/json) 0.0.4, for `json` and `jsonb` values, and
 needs nothing else beyond the standard library.
 
 ```avin
